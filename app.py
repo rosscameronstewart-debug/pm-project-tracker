@@ -1,0 +1,5133 @@
+import cgi
+import hashlib
+import hmac
+import json
+import os
+import re
+import secrets
+import sqlite3
+import sys
+import tempfile
+import traceback
+from datetime import datetime
+from http import cookies
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import BytesIO
+from pathlib import Path
+from urllib.parse import parse_qs, quote, unquote, urlparse
+
+try:
+    import openpyxl
+except Exception:
+    openpyxl = None
+
+try:
+    import pdfplumber
+except Exception:
+    pdfplumber = None
+
+try:
+    import pypdfium2 as pdfium
+except Exception:
+    pdfium = None
+
+try:
+    from rapidocr_onnxruntime import RapidOCR
+except Exception:
+    RapidOCR = None
+
+OCR_ENGINE = None
+
+
+ROOT = Path(__file__).resolve().parent
+DATA_DIR = ROOT / "data"
+UPLOAD_DIR = DATA_DIR / "uploads"
+BRAND_DIR = DATA_DIR / "brand"
+DB_PATH = DATA_DIR / "pm_tracker.sqlite3"
+HOST = "127.0.0.1"
+PORT = 8765
+CO_MATERIAL_MARGIN = 0.35
+CO_MATERIAL_COST_FACTOR = 1 - CO_MATERIAL_MARGIN
+BID_TRACKER_SOURCE = Path(r"C:\Users\rossc\Twin Peaks Electrical\Project Manager WIP - General\Bid Request Management\_Bid Tracker\Bid Tracker.xlsx")
+SERVER_STARTED_AT = datetime.now().isoformat(timespec="seconds")
+REVISION_LABEL = "dev-revision-page"
+SOURCE_PATH_AT_STARTUP = Path(__file__).resolve()
+SOURCE_STAT_AT_STARTUP = SOURCE_PATH_AT_STARTUP.stat()
+LOADED_SOURCE_SHA256 = hashlib.sha256(SOURCE_PATH_AT_STARTUP.read_bytes()).hexdigest()
+LOADED_SOURCE_MODIFIED_AT = datetime.fromtimestamp(SOURCE_STAT_AT_STARTUP.st_mtime).isoformat(timespec="seconds")
+LOADED_SOURCE_SIZE_BYTES = SOURCE_STAT_AT_STARTUP.st_size
+
+
+def html_escape(value):
+    return str(value or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&#39;")
+
+
+def app_revision_info():
+    source = Path(__file__).resolve()
+    stat = source.stat()
+    disk_digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    return {
+        "revision_label": REVISION_LABEL,
+        "server_started_at": SERVER_STARTED_AT,
+        "loaded_source_modified_at": LOADED_SOURCE_MODIFIED_AT,
+        "loaded_source_size_bytes": LOADED_SOURCE_SIZE_BYTES,
+        "loaded_source_sha256": LOADED_SOURCE_SHA256,
+        "loaded_source_sha256_short": LOADED_SOURCE_SHA256[:12],
+        "disk_source_modified_at": datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
+        "disk_source_size_bytes": stat.st_size,
+        "disk_source_sha256": disk_digest,
+        "disk_source_sha256_short": disk_digest[:12],
+        "source_matches_disk": disk_digest == LOADED_SOURCE_SHA256 and stat.st_size == LOADED_SOURCE_SIZE_BYTES,
+        "source_path": str(source),
+        "database_path": str(DB_PATH),
+        "python_version": sys.version.split()[0],
+    }
+
+
+def developer_revision_html(user):
+    info = app_revision_info()
+    rows_html = "".join(
+        f"<tr><th>{html_escape(label)}</th><td>{html_escape(value)}</td></tr>"
+        for label, value in [
+            ("Revision Label", info["revision_label"]),
+            ("Loaded Source Hash", info["loaded_source_sha256_short"]),
+            ("Current Disk Hash", info["disk_source_sha256_short"]),
+            ("Server Matches Disk", "Yes" if info["source_matches_disk"] else "No - restart the app"),
+            ("Server Started", info["server_started_at"]),
+            ("Loaded Source Modified", info["loaded_source_modified_at"]),
+            ("Current Disk Modified", info["disk_source_modified_at"]),
+            ("Loaded Source Size", f"{info['loaded_source_size_bytes']:,} bytes"),
+            ("Current Disk Size", f"{info['disk_source_size_bytes']:,} bytes"),
+            ("Source Path", info["source_path"]),
+            ("Database Path", info["database_path"]),
+            ("Python Version", info["python_version"]),
+            ("Signed In As", f"{user.get('display_name') or user.get('username')} / {user.get('role')}"),
+            ("Loaded Full SHA-256", info["loaded_source_sha256"]),
+            ("Current Disk Full SHA-256", info["disk_source_sha256"]),
+        ]
+    )
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Cache-Control" content="no-store">
+  <title>Developer Revision</title>
+  <style>
+    :root {{ --ink:#17202a; --muted:#607080; --line:#d8dee5; --bg:#f6f8fa; --blue:#2266aa; }}
+    body {{ margin:0; font-family:"Segoe UI", Arial, sans-serif; color:var(--ink); background:var(--bg); }}
+    main {{ max-width:960px; margin:0 auto; padding:28px 24px 48px; }}
+    h1 {{ margin:0 0 6px; font-size:28px; }}
+    p {{ color:var(--muted); margin:0 0 18px; }}
+    .panel {{ background:white; border:1px solid var(--line); border-radius:8px; padding:16px; }}
+    table {{ width:100%; border-collapse:collapse; font-size:14px; }}
+    th, td {{ text-align:left; vertical-align:top; padding:11px 10px; border-bottom:1px solid var(--line); }}
+    th {{ width:210px; color:#34495e; background:#eef2f6; }}
+    td {{ word-break:break-word; }}
+    .hash {{ font-size:32px; font-weight:800; letter-spacing:.04em; margin:14px 0 18px; }}
+    .actions {{ display:flex; gap:8px; flex-wrap:wrap; margin-top:16px; }}
+    a, button {{ border:1px solid var(--line); background:white; color:var(--ink); padding:9px 12px; border-radius:6px; cursor:pointer; font-weight:650; text-decoration:none; font:inherit; }}
+    .primary {{ background:var(--blue); color:white; border-color:var(--blue); }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Developer Revision</h1>
+    <p>Use this page to confirm which app file this server is running and when the server last restarted.</p>
+    <div class="panel">
+      <div>Loaded source hash</div>
+      <div class="hash">{html_escape(info['loaded_source_sha256_short'])}</div>
+      <table>{rows_html}</table>
+      <div class="actions">
+        <button class="primary" type="button" onclick="window.location.reload()">Refresh Revision</button>
+        <a href="/">Back to App</a>
+      </div>
+    </div>
+  </main>
+</body>
+</html>"""
+
+
+def db():
+    DATA_DIR.mkdir(exist_ok=True)
+    UPLOAD_DIR.mkdir(exist_ok=True)
+    BRAND_DIR.mkdir(exist_ok=True)
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA foreign_keys = ON")
+    return con
+
+
+def init_db():
+    with db() as con:
+        con.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS projects (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              project_code TEXT NOT NULL UNIQUE,
+              name TEXT NOT NULL,
+              customer TEXT,
+              location TEXT,
+              customer_po TEXT,
+              description TEXT,
+              rate_set_id INTEGER,
+              contract_value REAL DEFAULT 0,
+              status TEXT DEFAULT 'Active',
+              created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS subprojects (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+              job_number TEXT,
+              code TEXT NOT NULL,
+              name TEXT NOT NULL,
+              pricing_type TEXT DEFAULT 'Fixed',
+              contract_value REAL DEFAULT 0,
+              budget_labor_hours REAL DEFAULT 0,
+              budget_labor REAL DEFAULT 0,
+              budget_material REAL DEFAULT 0,
+              budget_equipment REAL DEFAULT 0,
+              budget_vendor REAL DEFAULT 0,
+              budget_other REAL DEFAULT 0,
+              UNIQUE(project_id, code)
+            );
+
+            CREATE TABLE IF NOT EXISTS change_orders (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+              subproject_id INTEGER REFERENCES subprojects(id) ON DELETE SET NULL,
+              co_number TEXT NOT NULL,
+              job_number TEXT,
+              pricing_type TEXT DEFAULT 'Fixed',
+              title TEXT,
+              status TEXT DEFAULT 'Pending',
+              quoted_value REAL DEFAULT 0,
+              approved_value REAL DEFAULT 0,
+              UNIQUE(project_id, subproject_id, co_number)
+            );
+
+            CREATE TABLE IF NOT EXISTS cost_records (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+              subproject_id INTEGER REFERENCES subprojects(id) ON DELETE SET NULL,
+              change_order_id INTEGER REFERENCES change_orders(id) ON DELETE SET NULL,
+              source TEXT NOT NULL,
+              source_file TEXT,
+              ticket_or_invoice TEXT,
+              record_date TEXT,
+              status TEXT,
+              cost_type TEXT,
+              item TEXT,
+              description TEXT,
+              qty REAL DEFAULT 0,
+              rate REAL DEFAULT 0,
+              amount REAL DEFAULT 0,
+              sales_rate REAL DEFAULT 0,
+              sales_amount REAL DEFAULT 0,
+              raw_rate REAL DEFAULT 0,
+              raw_cost_source TEXT,
+              vendor TEXT,
+              notes TEXT,
+              created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS customer_invoices (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+              subproject_id INTEGER REFERENCES subprojects(id) ON DELETE SET NULL,
+              change_order_id INTEGER REFERENCES change_orders(id) ON DELETE SET NULL,
+              invoice_number TEXT,
+              billing_type TEXT DEFAULT 'Progress',
+              invoice_date TEXT,
+              due_date TEXT,
+              status TEXT DEFAULT 'Draft',
+              amount REAL DEFAULT 0,
+              paid_amount REAL DEFAULT 0,
+              notes TEXT,
+              created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS internal_rates (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              rate_set_id INTEGER,
+              category_type TEXT NOT NULL,
+              category TEXT NOT NULL,
+              raw_rate REAL DEFAULT 0,
+              active INTEGER DEFAULT 1,
+              UNIQUE(rate_set_id, category_type, category)
+            );
+
+            CREATE TABLE IF NOT EXISTS rate_sets (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              name TEXT NOT NULL UNIQUE,
+              effective_date TEXT,
+              active INTEGER DEFAULT 1
+            );
+
+            CREATE TABLE IF NOT EXISTS bid_requests (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              rfq_no TEXT NOT NULL UNIQUE,
+              date_received TEXT,
+              customer TEXT,
+              project_name TEXT,
+              estimator TEXT,
+              stage TEXT,
+              bid_due_date TEXT,
+              go_no_go TEXT,
+              estimated_cost REAL DEFAULT 0,
+              target_margin REAL DEFAULT 0,
+              bid_price REAL DEFAULT 0,
+              probability REAL DEFAULT 0,
+              weighted_value REAL DEFAULT 0,
+              submission_status TEXT,
+              outcome TEXT DEFAULT 'Pending',
+              notes TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS bid_risks (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              risk_id TEXT,
+              rfq_no TEXT,
+              risk_description TEXT,
+              probability INTEGER DEFAULT 0,
+              impact INTEGER DEFAULT 0,
+              risk_rating INTEGER DEFAULT 0,
+              pricing_action TEXT,
+              mitigation TEXT,
+              owner TEXT,
+              status TEXT,
+              created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS bid_win_loss (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              rfq_no TEXT,
+              customer TEXT,
+              outcome TEXT,
+              bid_value REAL DEFAULT 0,
+              known_competitor TEXT,
+              primary_reason TEXT,
+              pricing_position TEXT,
+              lesson_learned TEXT,
+              next_action TEXT,
+              created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS users (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              username TEXT NOT NULL UNIQUE,
+              display_name TEXT,
+              password_hash TEXT NOT NULL,
+              role TEXT DEFAULT 'User',
+              active INTEGER DEFAULT 1,
+              created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS user_sessions (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+              session_token TEXT NOT NULL UNIQUE,
+              created_at TEXT NOT NULL,
+              expires_at TEXT NOT NULL
+            );
+            """
+        )
+        existing_cols = [r["name"] for r in con.execute("PRAGMA table_info(subprojects)").fetchall()]
+        if "job_number" not in existing_cols:
+            con.execute("ALTER TABLE subprojects ADD COLUMN job_number TEXT")
+        if "budget_labor_hours" not in existing_cols:
+            con.execute("ALTER TABLE subprojects ADD COLUMN budget_labor_hours REAL DEFAULT 0")
+        if "budget_equipment" not in existing_cols:
+            con.execute("ALTER TABLE subprojects ADD COLUMN budget_equipment REAL DEFAULT 0")
+        if "pricing_type" not in existing_cols:
+            con.execute("ALTER TABLE subprojects ADD COLUMN pricing_type TEXT DEFAULT 'Fixed'")
+        if "contract_value" not in existing_cols:
+            con.execute("ALTER TABLE subprojects ADD COLUMN contract_value REAL DEFAULT 0")
+        bid_cols = [r["name"] for r in con.execute("PRAGMA table_info(bid_requests)").fetchall()]
+        if "updated_at" not in bid_cols:
+            con.execute("ALTER TABLE bid_requests ADD COLUMN updated_at TEXT")
+        con.execute("UPDATE bid_requests SET updated_at = COALESCE(updated_at, created_at)")
+        project_cols = [r["name"] for r in con.execute("PRAGMA table_info(projects)").fetchall()]
+        if "customer_po" not in project_cols:
+            con.execute("ALTER TABLE projects ADD COLUMN customer_po TEXT")
+        if "description" not in project_cols:
+            con.execute("ALTER TABLE projects ADD COLUMN description TEXT")
+        co_cols = [r["name"] for r in con.execute("PRAGMA table_info(change_orders)").fetchall()]
+        if "job_number" not in co_cols:
+            con.execute("ALTER TABLE change_orders ADD COLUMN job_number TEXT")
+        if "pricing_type" not in co_cols:
+            con.execute("ALTER TABLE change_orders ADD COLUMN pricing_type TEXT DEFAULT 'Fixed'")
+        co_schema = con.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'change_orders'").fetchone()
+        if co_schema and "UNIQUE(project_id, co_number)" in (co_schema["sql"] or ""):
+            con.execute("PRAGMA foreign_keys = OFF")
+            con.executescript(
+                """
+                CREATE TABLE change_orders_new (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                  subproject_id INTEGER REFERENCES subprojects(id) ON DELETE SET NULL,
+                  co_number TEXT NOT NULL,
+                  job_number TEXT,
+                  pricing_type TEXT DEFAULT 'Fixed',
+                  title TEXT,
+                  status TEXT DEFAULT 'Pending',
+                  quoted_value REAL DEFAULT 0,
+                  approved_value REAL DEFAULT 0,
+                  UNIQUE(project_id, subproject_id, co_number)
+                );
+                INSERT INTO change_orders_new (
+                  id, project_id, subproject_id, co_number, job_number, pricing_type, title, status, quoted_value, approved_value
+                )
+                SELECT
+                  id, project_id, subproject_id, co_number, job_number, COALESCE(pricing_type, 'Fixed'), title, status, quoted_value, approved_value
+                FROM change_orders;
+                DROP TABLE change_orders;
+                ALTER TABLE change_orders_new RENAME TO change_orders;
+                """
+            )
+            con.execute("PRAGMA foreign_keys = ON")
+        if "rate_set_id" not in project_cols:
+            con.execute("ALTER TABLE projects ADD COLUMN rate_set_id INTEGER")
+        cost_cols = [r["name"] for r in con.execute("PRAGMA table_info(cost_records)").fetchall()]
+        if "sales_rate" not in cost_cols:
+            con.execute("ALTER TABLE cost_records ADD COLUMN sales_rate REAL DEFAULT 0")
+        if "sales_amount" not in cost_cols:
+            con.execute("ALTER TABLE cost_records ADD COLUMN sales_amount REAL DEFAULT 0")
+        if "raw_rate" not in cost_cols:
+            con.execute("ALTER TABLE cost_records ADD COLUMN raw_rate REAL DEFAULT 0")
+        if "raw_cost_source" not in cost_cols:
+            con.execute("ALTER TABLE cost_records ADD COLUMN raw_cost_source TEXT")
+        con.execute(
+            """
+            UPDATE cost_records
+            SET amount = CASE
+                  WHEN change_order_id IS NOT NULL OR COALESCE((SELECT pricing_type FROM subprojects WHERE id = cost_records.subproject_id), 'Fixed') = 'T&M'
+                    THEN COALESCE(sales_amount, 0) * ?
+                  ELSE 0
+                END,
+                raw_rate = CASE
+                  WHEN change_order_id IS NOT NULL OR COALESCE((SELECT pricing_type FROM subprojects WHERE id = cost_records.subproject_id), 'Fixed') = 'T&M'
+                    THEN COALESCE(sales_rate, rate, 0) * ?
+                  ELSE 0
+                END,
+                raw_cost_source = CASE
+                  WHEN change_order_id IS NOT NULL THEN 'CO T&M material estimate at 35% margin'
+                  WHEN COALESCE((SELECT pricing_type FROM subprojects WHERE id = cost_records.subproject_id), 'Fixed') = 'T&M' THEN 'Subproject T&M material estimate at 35% margin'
+                  ELSE 'Usage only - not budget cost'
+                END
+            WHERE cost_type = 'Field Ticket Material'
+            """,
+            (CO_MATERIAL_COST_FACTOR, CO_MATERIAL_COST_FACTOR),
+        )
+        rate_cols = [r["name"] for r in con.execute("PRAGMA table_info(internal_rates)").fetchall()]
+        if "rate_set_id" not in rate_cols:
+            con.execute("ALTER TABLE internal_rates ADD COLUMN rate_set_id INTEGER")
+        default_rate_set = con.execute("SELECT id FROM rate_sets WHERE name = 'Current'").fetchone()
+        if not default_rate_set:
+            cur = con.execute("INSERT INTO rate_sets (name, effective_date, active) VALUES ('Current', '', 1)")
+            default_rate_set_id = cur.lastrowid
+        else:
+            default_rate_set_id = default_rate_set["id"]
+        con.execute("UPDATE internal_rates SET rate_set_id = ? WHERE rate_set_id IS NULL", (default_rate_set_id,))
+        con.execute("UPDATE projects SET rate_set_id = ? WHERE rate_set_id IS NULL", (default_rate_set_id,))
+        user_count = con.execute("SELECT COUNT(*) count FROM users").fetchone()["count"]
+        if not user_count:
+            con.execute(
+                "INSERT INTO users (username, display_name, password_hash, role, active, created_at) VALUES (?, ?, ?, 'Admin', 1, ?)",
+                ("admin", "Administrator", hash_password("ChangeMe123!"), datetime.now().isoformat(timespec="seconds")),
+            )
+    seed_bid_tracker_from_workbook()
+
+
+def rows(sql, params=()):
+    with db() as con:
+        return [dict(r) for r in con.execute(sql, params).fetchall()]
+
+
+def one(sql, params=()):
+    with db() as con:
+        r = con.execute(sql, params).fetchone()
+        return dict(r) if r else None
+
+
+def execute(sql, params=()):
+    with db() as con:
+        cur = con.execute(sql, params)
+        return cur.lastrowid
+
+
+def date_text(value):
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(text, fmt).date().isoformat()
+        except ValueError:
+            pass
+    return text
+
+
+def bid_price_value(estimated_cost, target_margin, explicit_bid_price=0):
+    if explicit_bid_price:
+        return money(explicit_bid_price)
+    cost = money(estimated_cost)
+    margin = money(target_margin)
+    return cost / (1 - margin) if cost and margin < 1 else 0
+
+
+def weighted_bid_value(outcome, bid_price, probability):
+    outcome = str(outcome or "Pending")
+    if outcome == "Won":
+        return money(bid_price)
+    if outcome == "Lost":
+        return 0
+    return money(bid_price) * money(probability)
+
+
+def hash_password(password, salt=None):
+    salt = salt or secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", str(password).encode("utf-8"), salt.encode("utf-8"), 200000)
+    return f"pbkdf2_sha256$200000${salt}${digest.hex()}"
+
+
+def verify_password(password, password_hash):
+    try:
+        algorithm, rounds, salt, digest = str(password_hash).split("$", 3)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        test = hashlib.pbkdf2_hmac("sha256", str(password).encode("utf-8"), salt.encode("utf-8"), int(rounds)).hex()
+        return hmac.compare_digest(test, digest)
+    except Exception:
+        return False
+
+
+def create_session(user_id):
+    token = secrets.token_urlsafe(32)
+    now = datetime.now()
+    expires = now.replace(year=now.year + 1)
+    execute(
+        "INSERT INTO user_sessions (user_id, session_token, created_at, expires_at) VALUES (?, ?, ?, ?)",
+        (user_id, token, now.isoformat(timespec="seconds"), expires.isoformat(timespec="seconds")),
+    )
+    return token
+
+
+def parse_cookie_header(header):
+    jar = cookies.SimpleCookie()
+    if header:
+        try:
+            jar.load(header)
+        except cookies.CookieError:
+            return {}
+    return {key: morsel.value for key, morsel in jar.items()}
+
+
+def current_user(handler):
+    token = parse_cookie_header(handler.headers.get("Cookie")).get("pm_session")
+    if not token:
+        return None
+    user = one(
+        """
+        SELECT users.id, users.username, users.display_name, users.role, users.active
+        FROM user_sessions
+        JOIN users ON users.id = user_sessions.user_id
+        WHERE user_sessions.session_token = ?
+          AND users.active = 1
+          AND user_sessions.expires_at > ?
+        """,
+        (token, datetime.now().isoformat(timespec="seconds")),
+    )
+    return user
+
+
+def require_admin(handler):
+    user = current_user(handler)
+    return user if user and user.get("role") == "Admin" else None
+
+
+def require_editor(handler):
+    user = current_user(handler)
+    return user if user and user.get("role") in ("Admin", "User") else None
+
+
+def clean_role(role):
+    role = str(role or "User").strip()
+    return role if role in ("Admin", "User", "Read Only") else "User"
+
+
+def seed_bid_tracker_from_workbook():
+    if openpyxl is None or not BID_TRACKER_SOURCE.exists():
+        return
+    existing = one("SELECT COUNT(*) count FROM bid_requests")
+    if existing and existing["count"]:
+        return
+    wb = openpyxl.load_workbook(BID_TRACKER_SOURCE, data_only=True, read_only=True)
+    now = datetime.now().isoformat(timespec="seconds")
+    with db() as con:
+        if "Bid Tracker" in wb.sheetnames:
+            ws = wb["Bid Tracker"]
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                if not row or not row[0]:
+                    continue
+                rfq_no = str(row[0] or "").strip()
+                estimated_cost = money(row[8] if len(row) > 8 else 0)
+                target_margin = money(row[9] if len(row) > 9 else 0)
+                bid_price = bid_price_value(estimated_cost, target_margin, money(row[10] if len(row) > 10 else 0))
+                probability = money(row[11] if len(row) > 11 else 0)
+                outcome = str(row[14] if len(row) > 14 and row[14] else "Pending")
+                weighted = weighted_bid_value(outcome, bid_price, probability)
+                con.execute(
+                    """
+                    INSERT OR IGNORE INTO bid_requests (
+                      rfq_no, date_received, customer, project_name, estimator, stage, bid_due_date,
+                      go_no_go, estimated_cost, target_margin, bid_price, probability, weighted_value,
+                      submission_status, outcome, notes, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        rfq_no,
+                        date_text(row[1] if len(row) > 1 else ""),
+                        str(row[2] or "") if len(row) > 2 else "",
+                        str(row[3] or "") if len(row) > 3 else "",
+                        str(row[4] or "") if len(row) > 4 and row[4] else "",
+                        str(row[5] or "") if len(row) > 5 else "",
+                        date_text(row[6] if len(row) > 6 else ""),
+                        str(row[7] or "") if len(row) > 7 else "",
+                        estimated_cost,
+                        target_margin,
+                        bid_price,
+                        probability,
+                        weighted,
+                        str(row[13] or "") if len(row) > 13 else "",
+                        outcome,
+                        str(row[15] or "") if len(row) > 15 else "",
+                        now,
+                        now,
+                    ),
+                )
+        if "Risk_Register" in wb.sheetnames:
+            ws = wb["Risk_Register"]
+            for row in ws.iter_rows(min_row=4, values_only=True):
+                if not row or not row[0]:
+                    continue
+                con.execute(
+                    """
+                    INSERT INTO bid_risks (risk_id, rfq_no, risk_description, probability, impact, risk_rating, pricing_action, mitigation, owner, status, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(row[0] or ""),
+                        str(row[1] or ""),
+                        str(row[2] or ""),
+                        int(money(row[3])),
+                        int(money(row[4])),
+                        int(money(row[5])),
+                        str(row[6] or ""),
+                        str(row[7] or ""),
+                        str(row[8] or ""),
+                        str(row[9] or ""),
+                        now,
+                    ),
+                )
+        if "Win_Loss_Analysis" in wb.sheetnames:
+            ws = wb["Win_Loss_Analysis"]
+            for row in ws.iter_rows(min_row=4, values_only=True):
+                if not row or not row[0]:
+                    continue
+                con.execute(
+                    """
+                    INSERT INTO bid_win_loss (rfq_no, customer, outcome, bid_value, known_competitor, primary_reason, pricing_position, lesson_learned, next_action, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(row[0] or ""),
+                        str(row[1] or ""),
+                        str(row[2] or ""),
+                        money(row[3]),
+                        str(row[4] or ""),
+                        str(row[5] or ""),
+                        str(row[6] or ""),
+                        str(row[7] or ""),
+                        str(row[8] or ""),
+                        now,
+                    ),
+                )
+    wb.close()
+
+
+def money(value):
+    try:
+        return float(value or 0)
+    except Exception:
+        return 0.0
+
+
+def parse_money_text(value):
+    if value is None:
+        return 0.0
+    cleaned = re.sub(r"[^0-9.\-]", "", str(value))
+    return money(cleaned)
+
+
+def first_regex(patterns, text, flags=re.IGNORECASE):
+    for pattern in patterns:
+        match = re.search(pattern, text, flags)
+        if match:
+            return match.group(1).strip()
+    return ""
+
+
+def extract_pdf_text(path):
+    pages = []
+    with pdfplumber.open(path) as pdf:
+        for page in pdf.pages:
+            pages.append(page.extract_text() or "")
+    text = "\n".join(pages).strip()
+    if text:
+        return text
+    if pdfium is None or RapidOCR is None:
+        return ""
+
+    global OCR_ENGINE
+    if OCR_ENGINE is None:
+        OCR_ENGINE = RapidOCR()
+
+    ocr_pages = []
+    pdf = pdfium.PdfDocument(str(path))
+    for i in range(len(pdf)):
+        page = pdf[i]
+        image = page.render(scale=2).to_pil()
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                tmp_path = tmp.name
+            image.save(tmp_path)
+            result, _ = OCR_ENGINE(tmp_path)
+            if result:
+                ocr_pages.append("\n".join(line[1] for line in result))
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+    return "\n".join(ocr_pages).strip()
+
+
+def extract_pdf_ocr_pages(path):
+    if pdfium is None or RapidOCR is None:
+        return []
+
+    global OCR_ENGINE
+    if OCR_ENGINE is None:
+        OCR_ENGINE = RapidOCR()
+
+    pages = []
+    pdf = pdfium.PdfDocument(str(path))
+    for i in range(len(pdf)):
+        page = pdf[i]
+        image = page.render(scale=2).to_pil()
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                tmp_path = tmp.name
+            image.save(tmp_path)
+            result, _ = OCR_ENGINE(tmp_path)
+            page_lines = []
+            for box, text, score in result or []:
+                xs = [p[0] for p in box]
+                ys = [p[1] for p in box]
+                page_lines.append({
+                    "text": str(text).strip(),
+                    "x1": min(xs),
+                    "y1": min(ys),
+                    "x2": max(xs),
+                    "y2": max(ys),
+                })
+            pages.append(sorted(page_lines, key=lambda r: (r["y1"], r["x1"])))
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+    return pages
+
+
+def parse_dsg_online_invoice_ocr(path):
+    item_lines = []
+    def pick_product_line(info):
+        meaningful = [txt for txt in info if not re.search(r"^(MFG|DSG|UPC)", txt, flags=re.IGNORECASE)]
+        if not meaningful:
+            return info[0] if info else ""
+        if len(meaningful) > 1 and len(meaningful[0]) < 35:
+            return meaningful[1]
+        return meaningful[0]
+
+    for page_lines in extract_pdf_ocr_pages(path):
+        qty_labels = [
+            line for line in page_lines
+            if line["x1"] > 900 and re.sub(r"\s+", "", line["text"].lower()) == "qtyinvoiced"
+        ]
+        qty_labels.sort(key=lambda r: r["y1"])
+        used_subtotal_ys = []
+        for idx, label in enumerate(qty_labels):
+            top = max(0, label["y1"] - 45)
+            bottom = qty_labels[idx + 1]["y1"] - 20 if idx + 1 < len(qty_labels) else label["y1"] + 180
+            block = [line for line in page_lines if top <= line["y1"] < bottom]
+            left = [line for line in block if line["x1"] < 850]
+            right = [line for line in block if line["x1"] > 900]
+
+            qty = 0
+            for line in sorted(right, key=lambda r: r["y1"]):
+                txt = line["text"].replace(",", "")
+                if line["y1"] > label["y1"] and re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", txt):
+                    qty = money(txt)
+                    break
+
+            amount = 0
+            subtotal_seen = False
+            subtotal_y = None
+            for line in sorted(right, key=lambda r: r["y1"]):
+                if "subtotal" in line["text"].lower():
+                    subtotal_seen = True
+                    subtotal_y = line["y1"]
+                    continue
+                if subtotal_seen and "$" in line["text"]:
+                    amount = parse_money_text(line["text"])
+                    break
+
+            rate = 0
+            info = []
+            for line in sorted(left, key=lambda r: (r["y1"], r["x1"])):
+                txt = line["text"].strip()
+                if not txt:
+                    continue
+                if txt.lower().startswith(("invoice", "billing", "delivery", "order summary")):
+                    continue
+                if "$" in txt and "/" in txt and not rate:
+                    rate = parse_money_text(txt)
+                    continue
+                info.append(txt)
+
+            if not info or not amount:
+                continue
+            if subtotal_y is not None:
+                used_subtotal_ys.append(subtotal_y)
+            if not qty and rate:
+                qty = round(amount / rate, 4)
+            product_line = pick_product_line(info)
+            product_code = product_line.split()[0] if product_line.split() else info[0]
+            item_lines.append({
+                "product_code": product_code,
+                "description": " ".join(info),
+                "qty": qty,
+                "unit_price": rate if rate else (amount / qty if qty else 0),
+                "amount": amount,
+            })
+        subtotal_lines = [
+            line for line in page_lines
+            if line["x1"] > 900 and "subtotal" in line["text"].lower()
+        ]
+        for subtotal in sorted(subtotal_lines, key=lambda r: r["y1"]):
+            if any(abs(subtotal["y1"] - used_y) < 25 for used_y in used_subtotal_ys):
+                continue
+            top = max(0, subtotal["y1"] - 160)
+            bottom = subtotal["y1"] + 70
+            block = [line for line in page_lines if top <= line["y1"] < bottom]
+            left = [line for line in block if line["x1"] < 850]
+            right = [line for line in block if line["x1"] > 900]
+
+            amount = 0
+            for line in sorted(right, key=lambda r: r["y1"]):
+                if line["y1"] > subtotal["y1"] and "$" in line["text"]:
+                    amount = parse_money_text(line["text"])
+                    break
+            if not amount:
+                continue
+
+            qty = 0
+            for line in sorted(right, key=lambda r: r["y1"], reverse=True):
+                txt = line["text"].replace(",", "")
+                if line["y1"] < subtotal["y1"] and re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", txt):
+                    qty = money(txt)
+                    break
+
+            rate = 0
+            info = []
+            for line in sorted(left, key=lambda r: (r["y1"], r["x1"])):
+                txt = line["text"].strip()
+                if not txt:
+                    continue
+                if txt.lower().startswith(("invoice", "billing", "delivery", "order summary")):
+                    continue
+                if "$" in txt and "/" in txt and not rate:
+                    rate = parse_money_text(txt)
+                    continue
+                info.append(txt)
+            if not info:
+                continue
+            if not qty and rate:
+                qty = round(amount / rate, 4)
+            product_line = pick_product_line(info)
+            product_code = product_line.split()[0] if product_line.split() else info[0]
+            item_lines.append({
+                "product_code": product_code,
+                "description": " ".join(info),
+                "qty": qty,
+                "unit_price": rate if rate else (amount / qty if qty else 0),
+                "amount": amount,
+            })
+    return item_lines
+
+
+def labor_category(item):
+    parts = [p.strip() for p in str(item or "").split(" - ") if p.strip()]
+    if len(parts) >= 2:
+        category = " ".join(parts[1:])
+    else:
+        category = str(item or "").strip()
+    category = category.replace(" Reg", " ST").replace(" - ", " ")
+    return re.sub(r"\s+", " ", category).strip()
+
+
+def equipment_category(item):
+    category = re.sub(r"\s+", " ", str(item or "").strip())
+    aliases = {
+        "Service Trucks": "Service Truck",
+        "Work Truck": "Service Truck",
+        "Work Truck 01": "Service Truck",
+        "Bobcat": "Skid Steer/Bobcat",
+        "Skid Steer": "Skid Steer/Bobcat",
+        "Trailer (Daily Rate)": "Trailer",
+        "Transport Trailer": "Transport Truck & Trailer",
+        "Compactor": "Trench Compactor",
+    }
+    return aliases.get(category, category)
+
+
+def is_equipment_item(item):
+    category = equipment_category(item)
+    known = {
+        "Service Truck",
+        "Trencher Summer",
+        "Trencher Winter",
+        "Transport Truck & Trailer",
+        "Trench Compactor",
+        "Reel Trailer",
+        "Mini Excavator",
+        "Skid Steer/Bobcat",
+        "Trailer",
+    }
+    return category in known
+
+
+def raw_rate_for(cost_type, item, project_id=None):
+    if cost_type == "Labor":
+        category = labor_category(item)
+    elif cost_type == "Equipment":
+        category = equipment_category(item)
+    else:
+        return {"category": "", "raw_rate": 0.0, "source": "No internal rate needed"}
+    project_rate_set_id = None
+    if project_id:
+        project = one("SELECT rate_set_id FROM projects WHERE id = ?", (project_id,))
+        project_rate_set_id = project["rate_set_id"] if project else None
+    rate = one(
+        """
+        SELECT raw_rate FROM internal_rates
+        WHERE category_type = ?
+          AND category = ?
+          AND active = 1
+          AND (rate_set_id = ? OR (? IS NULL AND rate_set_id IS NULL))
+        """,
+        (cost_type, category, project_rate_set_id, project_rate_set_id),
+    )
+    if rate:
+        return {"category": category, "raw_rate": money(rate["raw_rate"]), "source": "Project rate set"}
+    return {"category": category, "raw_rate": 0.0, "source": "Missing project rate"}
+
+
+def apply_internal_rate(category_type, category, raw_rate, rate_set_id=None):
+    if category_type not in ("Labor", "Equipment"):
+        return 0
+    updated = 0
+    candidates = rows(
+        """
+        SELECT cost_records.id, cost_records.item, cost_records.qty
+        FROM cost_records
+        JOIN projects p ON p.id = cost_records.project_id
+        WHERE cost_records.cost_type = ?
+          AND source IN ('Field Wise', 'Field Wise PDF')
+          AND p.rate_set_id = ?
+        """,
+        (category_type, rate_set_id),
+    )
+    with db() as con:
+        for record in candidates:
+            record_category = labor_category(record["item"]) if category_type == "Labor" else equipment_category(record["item"])
+            if record_category != category:
+                continue
+            con.execute(
+                "UPDATE cost_records SET raw_rate = ?, rate = ?, amount = ?, raw_cost_source = 'Project rate set' WHERE id = ?",
+                (money(raw_rate), money(raw_rate), money(record["qty"]) * money(raw_rate), record["id"]),
+            )
+            updated += 1
+    return updated
+
+
+def json_response(handler, payload, status=200):
+    body = json.dumps(payload, default=str).encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json")
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def text_response(handler, body, content_type="text/html; charset=utf-8", status=200):
+    data = body.encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", content_type)
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("Content-Length", str(len(data)))
+    handler.end_headers()
+    handler.wfile.write(data)
+
+
+def file_response(handler, path, content_type="application/octet-stream", status=200):
+    data = path.read_bytes()
+    handler.send_response(status)
+    handler.send_header("Content-Type", content_type)
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("Content-Length", str(len(data)))
+    handler.end_headers()
+    handler.wfile.write(data)
+
+
+def redirect_response(handler, location):
+    handler.send_response(302)
+    handler.send_header("Location", location)
+    handler.end_headers()
+
+
+def login_success_response(handler, token):
+    body = b'{"ok": true}'
+    handler.send_response(200)
+    handler.send_header("Content-Type", "application/json")
+    handler.send_header("Set-Cookie", f"pm_session={token}; Path=/; HttpOnly; SameSite=Lax")
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def logout_response(handler):
+    body = b'{"ok": true}'
+    handler.send_response(200)
+    handler.send_header("Content-Type", "application/json")
+    handler.send_header("Set-Cookie", "pm_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def bytes_response(handler, data, content_type="application/octet-stream", status=200):
+    handler.send_response(status)
+    handler.send_header("Content-Type", content_type)
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("Content-Length", str(len(data)))
+    handler.end_headers()
+    handler.wfile.write(data)
+
+
+def upload_pdf_path(file_name):
+    safe_name = Path(unquote(file_name)).name
+    path = (UPLOAD_DIR / safe_name).resolve()
+    upload_root = UPLOAD_DIR.resolve()
+    if upload_root not in path.parents or not path.exists() or path.suffix.lower() != ".pdf":
+        return None
+    return path
+
+
+def pdf_viewer_html(file_name):
+    path = upload_pdf_path(file_name)
+    if not path:
+        return None
+    if pdfium is None:
+        direct = f"/uploads/{path.name}"
+        return f"""<!doctype html><html><head><title>{path.name}</title></head><body>
+        <p>PDF preview is unavailable in this runtime.</p>
+        <p><a href="{direct}" target="_blank" rel="noopener">Open PDF directly</a></p>
+        </body></html>"""
+    pdf = pdfium.PdfDocument(str(path))
+    encoded = quote(path.name)
+    pages = "\n".join(
+        f'<img class="pdf-page" src="/pdf-page/{encoded}/{idx}.png" alt="Page {idx + 1}">'
+        for idx in range(len(pdf))
+    )
+    direct = f"/uploads/{encoded}"
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{path.name}</title>
+  <style>
+    body {{ margin: 0; font-family: "Segoe UI", Arial, sans-serif; background: #eef2f6; color: #17202a; }}
+    header {{ position: sticky; top: 0; z-index: 2; display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 12px 18px; background: #152332; color: white; border-bottom: 4px solid #ffc20e; }}
+    h1 {{ margin: 0; font-size: 16px; }}
+    a {{ color: #ffffff; font-weight: 700; }}
+    main {{ max-width: 980px; margin: 18px auto; padding: 0 16px 30px; }}
+    .pdf-page {{ display: block; width: 100%; height: auto; background: white; margin: 0 0 16px; border: 1px solid #d8dee5; box-shadow: 0 8px 24px rgba(0,0,0,.12); }}
+  </style>
+</head>
+<body>
+  <header><h1>{path.name}</h1><a href="{direct}" target="_blank" rel="noopener">Open Original PDF</a></header>
+  <main>{pages}</main>
+</body>
+</html>"""
+
+
+def render_pdf_page_png(file_name, page_index):
+    path = upload_pdf_path(file_name)
+    if not path or pdfium is None:
+        return None
+    pdf = pdfium.PdfDocument(str(path))
+    idx = int(page_index)
+    if idx < 0 or idx >= len(pdf):
+        return None
+    page = pdf[idx]
+    bitmap = page.render(scale=1.8)
+    image = bitmap.to_pil()
+    out = BytesIO()
+    image.save(out, format="PNG")
+    return out.getvalue()
+
+
+def parse_json(handler):
+    length = int(handler.headers.get("Content-Length", "0"))
+    if not length:
+        return {}
+    return json.loads(handler.rfile.read(length).decode("utf-8"))
+
+
+def project_summary(project_id):
+    project = one("SELECT * FROM projects WHERE id = ?", (project_id,))
+    if not project:
+        return None
+
+    totals = one(
+        """
+        SELECT
+          COALESCE(SUM(amount), 0) actual_cost,
+          COALESCE(SUM(CASE WHEN subproject_id IS NULL OR cost_type IS NULL OR cost_type = 'Uncoded' OR raw_cost_source IN ('Missing project rate', 'Missing internal rate') THEN amount ELSE 0 END), 0) uncoded_cost,
+          COUNT(*) record_count,
+          SUM(CASE WHEN subproject_id IS NULL OR cost_type IS NULL OR cost_type = 'Uncoded' OR raw_cost_source IN ('Missing project rate', 'Missing internal rate') THEN 1 ELSE 0 END) uncoded_count
+        FROM cost_records
+        WHERE project_id = ?
+        """,
+        (project_id,),
+    )
+    cos = one(
+        """
+        SELECT
+          COALESCE(SUM(
+            CASE WHEN status IN ('Approved', 'Billed') THEN
+              CASE WHEN pricing_type = 'T&M' THEN
+                COALESCE((SELECT SUM(cr.sales_amount) FROM cost_records cr WHERE cr.change_order_id = change_orders.id AND cr.source IN ('Field Wise', 'Field Wise PDF')), 0)
+              ELSE approved_value END
+            ELSE 0 END
+          ), 0) approved_co_value,
+          COALESCE(SUM(
+            CASE WHEN status NOT IN ('Approved', 'Billed') THEN
+              CASE WHEN pricing_type = 'T&M' THEN
+                COALESCE((SELECT SUM(cr.sales_amount) FROM cost_records cr WHERE cr.change_order_id = change_orders.id AND cr.source IN ('Field Wise', 'Field Wise PDF')), 0)
+              ELSE quoted_value END
+            ELSE 0 END
+          ), 0) pending_co_value
+        FROM change_orders
+        WHERE project_id = ?
+        """,
+        (project_id,),
+    )
+    subproject_contract = one(
+        """
+        SELECT COALESCE(SUM(
+          CASE WHEN COALESCE(sp.pricing_type, 'Fixed') = 'T&M' THEN COALESCE(fw.fieldwise_sales, 0)
+          ELSE sp.contract_value END
+        ), 0) base_contract_value
+        FROM subprojects sp
+        LEFT JOIN (
+          SELECT subproject_id, COALESCE(SUM(sales_amount), 0) fieldwise_sales
+          FROM cost_records
+          WHERE project_id = ?
+            AND change_order_id IS NULL
+            AND source IN ('Field Wise', 'Field Wise PDF')
+          GROUP BY subproject_id
+        ) fw ON fw.subproject_id = sp.id
+        WHERE sp.project_id = ?
+        """,
+        (project_id, project_id),
+    )
+    base_contract_value = money(subproject_contract["base_contract_value"])
+    contract = base_contract_value + money(cos["approved_co_value"])
+    actual = money(totals["actual_cost"])
+    profit = contract - actual
+    margin = profit / contract if contract else 0
+
+    subprojects = rows(
+        """
+        SELECT
+          sp.id,
+          sp.job_number,
+          sp.code,
+          sp.name,
+          COALESCE(sp.pricing_type, 'Fixed') pricing_type,
+          sp.contract_value,
+          sp.budget_labor_hours,
+          sp.budget_labor + sp.budget_material + COALESCE(sp.budget_equipment, 0) AS budget_total,
+          COALESCE(SUM(CASE WHEN cr.change_order_id IS NULL THEN cr.amount ELSE 0 END), 0) actual_cost,
+          COALESCE(SUM(CASE WHEN cr.cost_type = 'Labor' AND cr.change_order_id IS NULL THEN cr.qty ELSE 0 END), 0) labor_hours_used,
+          COALESCE(SUM(CASE WHEN cr.change_order_id IS NULL AND cr.source IN ('Field Wise', 'Field Wise PDF') THEN cr.sales_amount ELSE 0 END), 0) fieldwise_sales,
+          CASE WHEN COALESCE(sp.pricing_type, 'Fixed') = 'T&M' THEN
+            COALESCE(SUM(CASE WHEN cr.change_order_id IS NULL AND cr.source IN ('Field Wise', 'Field Wise PDF') THEN cr.sales_amount ELSE 0 END), 0)
+          ELSE sp.contract_value END sales_value,
+          COUNT(CASE WHEN cr.change_order_id IS NULL THEN 1 END) record_count
+        FROM subprojects sp
+        LEFT JOIN cost_records cr ON cr.subproject_id = sp.id
+        WHERE sp.project_id = ?
+        GROUP BY sp.id
+        ORDER BY sp.job_number, sp.code
+        """,
+        (project_id,),
+    )
+
+    change_orders = rows(
+        """
+        SELECT
+          co.id,
+          co.co_number,
+          co.job_number,
+          co.title,
+          co.status,
+          COALESCE(co.pricing_type, 'Fixed') pricing_type,
+          co.approved_value,
+          co.quoted_value,
+          co.subproject_id,
+          sp.code AS subproject_code,
+          COALESCE(SUM(cr.amount), 0) actual_cost,
+          COALESCE(SUM(CASE WHEN cr.cost_type = 'Labor' THEN cr.qty ELSE 0 END), 0) labor_hours_used,
+          COALESCE(SUM(CASE WHEN cr.source IN ('Field Wise', 'Field Wise PDF') THEN cr.sales_amount ELSE 0 END), 0) fieldwise_sales,
+          CASE WHEN COALESCE(co.pricing_type, 'Fixed') = 'T&M' THEN
+            COALESCE(SUM(CASE WHEN cr.source IN ('Field Wise', 'Field Wise PDF') THEN cr.sales_amount ELSE 0 END), 0)
+          ELSE
+            CASE WHEN co.status IN ('Approved', 'Billed') THEN co.approved_value ELSE co.quoted_value END
+          END sales_value
+        FROM change_orders co
+        LEFT JOIN subprojects sp ON sp.id = co.subproject_id
+        LEFT JOIN cost_records cr ON cr.change_order_id = co.id
+        WHERE co.project_id = ?
+        GROUP BY co.id
+        ORDER BY co.co_number
+        """,
+        (project_id,),
+    )
+
+    by_type = rows(
+        """
+        SELECT
+          COALESCE(cost_type, 'Uncoded') label,
+          COALESCE(SUM(CASE WHEN cost_type = 'Field Ticket Material' THEN sales_amount ELSE amount END), 0) amount
+        FROM cost_records
+        WHERE project_id = ?
+        GROUP BY COALESCE(cost_type, 'Uncoded')
+        ORDER BY amount DESC
+        """,
+        (project_id,),
+    )
+    material_compare = one(
+        """
+        SELECT
+          COALESCE(SUM(CASE WHEN cost_type = 'Field Ticket Material' THEN sales_amount ELSE 0 END), 0) field_ticket_material,
+          COALESCE(SUM(CASE WHEN source = 'Vendor Invoice' AND cost_type = 'Material' THEN amount ELSE 0 END), 0) vendor_material
+        FROM cost_records
+        WHERE project_id = ?
+        """,
+        (project_id,),
+    )
+    billing = one(
+        """
+        SELECT
+          COALESCE(SUM(CASE WHEN status != 'Void' THEN amount ELSE 0 END), 0) billed_amount,
+          COALESCE(SUM(CASE WHEN status != 'Void' THEN paid_amount ELSE 0 END), 0) paid_amount,
+          COALESCE(SUM(CASE WHEN status = 'Draft' THEN amount ELSE 0 END), 0) draft_amount,
+          COALESCE(SUM(CASE WHEN status NOT IN ('Draft', 'Paid', 'Void') THEN amount - paid_amount ELSE 0 END), 0) open_amount,
+          COUNT(CASE WHEN status != 'Void' THEN 1 END) invoice_count
+        FROM customer_invoices
+        WHERE project_id = ?
+        """,
+        (project_id,),
+    )
+    customer_invoices = rows(
+        """
+        SELECT *
+        FROM customer_invoices
+        WHERE project_id = ?
+        ORDER BY invoice_date DESC, id DESC
+        """,
+        (project_id,),
+    )
+    billed_amount = money(billing["billed_amount"])
+    paid_amount = money(billing["paid_amount"])
+    open_amount = money(billing["open_amount"])
+    remaining_to_bill = contract - billed_amount
+    if remaining_to_bill < 0:
+        remaining_to_bill = 0
+    billing_stage = "Not billed"
+    if contract and paid_amount >= contract:
+        billing_stage = "Paid in full"
+    elif contract and billed_amount >= contract:
+        billing_stage = "Fully billed"
+    elif billed_amount:
+        billing_stage = "Partially billed"
+
+    return {
+        "project": project,
+        "contract_value": contract,
+        "base_contract_value": base_contract_value,
+        "actual_cost": actual,
+        "profit": profit,
+        "margin": margin,
+        "record_count": totals["record_count"] or 0,
+        "uncoded_count": totals["uncoded_count"] or 0,
+        "uncoded_cost": money(totals["uncoded_cost"]),
+        "approved_co_value": money(cos["approved_co_value"]),
+        "pending_co_value": money(cos["pending_co_value"]),
+        "subprojects": subprojects,
+        "change_orders": change_orders,
+        "by_type": by_type,
+        "material_compare": material_compare,
+        "billing": {
+            "billed_amount": billed_amount,
+            "paid_amount": paid_amount,
+            "open_amount": open_amount,
+            "draft_amount": money(billing["draft_amount"]),
+            "remaining_to_bill": remaining_to_bill,
+            "invoice_count": billing["invoice_count"] or 0,
+            "stage": billing_stage,
+        },
+        "customer_invoices": customer_invoices,
+    }
+
+
+def subproject_detail(subproject_id, change_order_id=None):
+    subproject = one(
+        """
+        SELECT sp.*, p.name AS project_name
+        FROM subprojects sp
+        JOIN projects p ON p.id = sp.project_id
+        WHERE sp.id = ?
+        """,
+        (subproject_id,),
+    )
+    if not subproject:
+        return None
+    selected_co = None
+    scope_label = "Base Contract"
+    cost_scope_sql = "subproject_id = ? AND change_order_id IS NULL"
+    cost_scope_params = [subproject_id]
+    if change_order_id:
+        selected_co = one(
+            """
+            SELECT
+              co.*,
+              CASE WHEN COALESCE(co.pricing_type, 'Fixed') = 'T&M' THEN
+                COALESCE((SELECT SUM(cr.sales_amount) FROM cost_records cr WHERE cr.change_order_id = co.id AND cr.source IN ('Field Wise', 'Field Wise PDF')), 0)
+              ELSE
+                CASE WHEN co.status IN ('Approved', 'Billed') THEN co.approved_value ELSE co.quoted_value END
+              END sales_value
+            FROM change_orders co
+            WHERE co.id = ? AND co.subproject_id = ?
+            """,
+            (change_order_id, subproject_id),
+        )
+        if selected_co:
+            scope_label = f"CO {selected_co.get('co_number') or ''}"
+            if selected_co.get("job_number"):
+                scope_label += f" / {selected_co.get('job_number')}"
+            cost_scope_sql = "subproject_id = ? AND change_order_id = ?"
+            cost_scope_params = [subproject_id, change_order_id]
+    totals = one(
+        f"""
+        SELECT
+          COALESCE(SUM(amount), 0) raw_actual,
+          COALESCE(SUM(CASE WHEN cost_type = 'Labor' THEN qty ELSE 0 END), 0) labor_hours_used,
+          COALESCE(SUM(CASE WHEN cost_type = 'Field Ticket Material' THEN sales_amount ELSE 0 END), 0) field_ticket_material,
+          COALESCE(SUM(CASE WHEN source = 'Vendor Invoice' AND cost_type = 'Material' THEN amount ELSE 0 END), 0) vendor_material,
+          COALESCE(SUM(sales_amount), 0) fieldwise_sales
+        FROM cost_records
+        WHERE {cost_scope_sql}
+        """,
+        tuple(cost_scope_params),
+    )
+    by_type = rows(
+        f"""
+        SELECT
+          COALESCE(cost_type, 'Uncoded') label,
+          COALESCE(SUM(CASE WHEN cost_type = 'Field Ticket Material' THEN sales_amount ELSE amount END), 0) amount
+        FROM cost_records
+        WHERE {cost_scope_sql}
+        GROUP BY COALESCE(cost_type, 'Uncoded')
+        ORDER BY amount DESC
+        """,
+        tuple(cost_scope_params),
+    )
+    records = rows(
+        f"""
+        SELECT *
+        FROM cost_records
+        WHERE {cost_scope_sql}
+        ORDER BY record_date DESC, ticket_or_invoice, id
+        """,
+        tuple(cost_scope_params),
+    )
+    budget_total = money(subproject["budget_labor"]) + money(subproject["budget_material"]) + money(subproject.get("budget_equipment"))
+    contract = money(selected_co["sales_value"]) if selected_co else (
+        money(totals["fieldwise_sales"]) if (subproject.get("pricing_type") or "Fixed") == "T&M" else money(subproject["contract_value"])
+    )
+    raw_actual = money(totals["raw_actual"])
+    profit = contract - raw_actual
+    margin = profit / contract if contract else 0
+    budget_used = raw_actual / budget_total if budget_total else 0
+    labor_budget = money(subproject["budget_labor_hours"])
+    labor_used = money(totals["labor_hours_used"])
+    labor_used_pct = labor_used / labor_budget if labor_budget else 0
+    return {
+        "subproject": subproject,
+        "scope_label": scope_label,
+        "selected_change_order": selected_co,
+        "contract_value": contract,
+        "budget_total": budget_total,
+        "raw_actual": raw_actual,
+        "profit": profit,
+        "margin": margin,
+        "budget_used": budget_used,
+        "labor_hours_budget": labor_budget,
+        "labor_hours_used": labor_used,
+        "labor_hours_used_pct": labor_used_pct,
+        "field_ticket_material": money(totals["field_ticket_material"]),
+        "vendor_material": money(totals["vendor_material"]),
+        "fieldwise_sales": money(totals["fieldwise_sales"]),
+        "by_type": by_type,
+        "records": records,
+    }
+
+
+def master_project_detail(project_id):
+    summary = project_summary(project_id)
+    if not summary:
+        return None
+    project = summary["project"]
+    labor = one(
+        """
+        SELECT
+          COALESCE((SELECT SUM(budget_labor_hours) FROM subprojects WHERE project_id = ?), 0) labor_hours_budget,
+          COALESCE((SELECT SUM(qty) FROM cost_records WHERE project_id = ? AND cost_type = 'Labor' AND change_order_id IS NULL), 0) labor_hours_used
+        """,
+        (project_id, project_id),
+    )
+    budget = one(
+        """
+        SELECT COALESCE(SUM(budget_labor + budget_material + COALESCE(budget_equipment, 0)), 0) budget_total
+        FROM subprojects
+        WHERE project_id = ?
+        """,
+        (project_id,),
+    )
+    records = rows(
+        """
+        SELECT cr.*, sp.job_number, sp.code AS subproject_code
+        FROM cost_records cr
+        LEFT JOIN subprojects sp ON sp.id = cr.subproject_id
+        WHERE cr.project_id = ?
+        ORDER BY cr.record_date DESC, cr.ticket_or_invoice, cr.id
+        """,
+        (project_id,),
+    )
+    labor_budget = money(labor["labor_hours_budget"])
+    labor_used = money(labor["labor_hours_used"])
+    budget_total = money(budget["budget_total"])
+    return {
+        "project": project,
+        "contract_value": summary["contract_value"],
+        "base_contract_value": summary["base_contract_value"],
+        "approved_co_value": summary["approved_co_value"],
+        "pending_co_value": summary["pending_co_value"],
+        "budget_total": budget_total,
+        "raw_actual": summary["actual_cost"],
+        "profit": summary["profit"],
+        "margin": summary["margin"],
+        "budget_used": summary["actual_cost"] / budget_total if budget_total else 0,
+        "labor_hours_budget": labor_budget,
+        "labor_hours_used": labor_used,
+        "labor_hours_used_pct": labor_used / labor_budget if labor_budget else 0,
+        "field_ticket_material": money(summary["material_compare"]["field_ticket_material"]),
+        "vendor_material": money(summary["material_compare"]["vendor_material"]),
+        "by_type": summary["by_type"],
+        "subprojects": summary["subprojects"],
+        "records": records,
+    }
+
+
+def bid_summary():
+    bids = rows("SELECT * FROM bid_requests ORDER BY bid_due_date, rfq_no")
+    open_bids = [b for b in bids if b.get("outcome") not in ("Won", "Lost") and b.get("go_no_go") != "No Go"]
+    won = [b for b in bids if b.get("outcome") == "Won"]
+    lost = [b for b in bids if b.get("outcome") == "Lost"]
+    open_pipeline = sum(money(b.get("bid_price")) for b in open_bids)
+    weighted_forecast = sum(money(b.get("weighted_value")) for b in bids)
+    margins = [money(b.get("target_margin")) for b in bids if money(b.get("target_margin")) > 0]
+    stage = {}
+    estimator = {}
+    for b in bids:
+        stage_name = b.get("stage") or "Unstaged"
+        stage.setdefault(stage_name, {"stage": stage_name, "count": 0, "value": 0})
+        stage[stage_name]["count"] += 1
+        stage[stage_name]["value"] += money(b.get("bid_price"))
+        name = b.get("estimator") or "Unassigned"
+        estimator.setdefault(name, {"estimator": name, "open_rfqs": 0, "open_value": 0})
+        if b in open_bids:
+            estimator[name]["open_rfqs"] += 1
+            estimator[name]["open_value"] += money(b.get("bid_price"))
+    return {
+        "bids": bids,
+        "open_pipeline": open_pipeline,
+        "weighted_forecast": weighted_forecast,
+        "win_rate": len(won) / (len(won) + len(lost)) if (won or lost) else 0,
+        "avg_target_margin": sum(margins) / len(margins) if margins else 0,
+        "open_count": len(open_bids),
+        "stage": list(stage.values()),
+        "estimator": list(estimator.values()),
+        "risks": rows("SELECT * FROM bid_risks ORDER BY id DESC"),
+        "win_loss": rows("SELECT * FROM bid_win_loss ORDER BY id DESC"),
+    }
+
+
+def import_fieldwise_xlsx(path, project_id):
+    if openpyxl is None:
+        raise RuntimeError("openpyxl is not installed. Run this app with the bundled Codex Python or install openpyxl.")
+
+    wb = openpyxl.load_workbook(path, data_only=True)
+    header = {}
+    if "Header" in wb.sheetnames:
+        ws = wb["Header"]
+        for row in ws.iter_rows(values_only=True):
+            if row and row[0]:
+                header[str(row[0]).strip()] = row[1] if len(row) > 1 else None
+
+    if "Line Items" not in wb.sheetnames:
+        raise RuntimeError("Expected a 'Line Items' sheet in the Field Wise export.")
+
+    order_number = str(header.get("Order #") or "").strip()
+    matched_subproject = None
+    matched_change_order = None
+    if order_number:
+        matched_change_order = one(
+            "SELECT id, subproject_id FROM change_orders WHERE project_id = ? AND job_number = ? ORDER BY id LIMIT 1",
+            (project_id, order_number),
+        )
+        matched_subproject = one(
+            "SELECT id FROM subprojects WHERE project_id = ? AND job_number = ?",
+            (project_id, order_number),
+        )
+        if not matched_subproject:
+            matched_subproject = one(
+                """
+                SELECT id FROM subprojects
+                WHERE project_id = ?
+                  AND code <> ''
+                  AND instr(upper(?), upper(code)) > 0
+                ORDER BY length(code) DESC
+                LIMIT 1
+                """,
+                (project_id, order_number),
+            )
+    matched_subproject_id = matched_subproject["id"] if matched_subproject else None
+    matched_change_order_id = matched_change_order["id"] if matched_change_order else None
+    if matched_change_order and matched_change_order["subproject_id"]:
+        matched_subproject_id = matched_change_order["subproject_id"]
+    matched_subproject_is_tm = False
+    if matched_subproject_id:
+        sp_rate_row = one("SELECT COALESCE(pricing_type, 'Fixed') pricing_type FROM subprojects WHERE id = ?", (matched_subproject_id,))
+        matched_subproject_is_tm = bool(sp_rate_row and sp_rate_row["pricing_type"] == "T&M")
+
+    ws = wb["Line Items"]
+    headers = [str(c.value).strip() if c.value else "" for c in ws[1]]
+    index = {name: i for i, name in enumerate(headers)}
+    required = ["Ticket", "Date", "Status", "Type", "Item", "Description", "Qty", "Rate", "Total"]
+    missing = [h for h in required if h not in index]
+    if missing:
+        raise RuntimeError("Missing Field Wise columns: " + ", ".join(missing))
+
+    source_file = Path(path).name
+    count = 0
+    skipped = 0
+    with db() as con:
+        if matched_subproject_id:
+            sp_rate_row = con.execute("SELECT COALESCE(pricing_type, 'Fixed') pricing_type FROM subprojects WHERE id = ?", (matched_subproject_id,)).fetchone()
+            matched_subproject_is_tm = bool(sp_rate_row and sp_rate_row["pricing_type"] == "T&M")
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            if not any(row):
+                continue
+            date_value = row[index["Date"]]
+            if isinstance(date_value, datetime):
+                record_date = date_value.date().isoformat()
+            else:
+                record_date = str(date_value or "")
+            type_value = str(row[index["Type"]] or "").strip()
+            cost_type = "Labor" if "time" in type_value.lower() else "Field Ticket Material" if "material" in type_value.lower() else "Equipment" if "equipment" in type_value.lower() else type_value
+            ticket = str(row[index["Ticket"]] or "")
+            item = str(row[index["Item"]] or "")
+            description = str(row[index["Description"]] or "")
+            qty = money(row[index["Qty"]])
+            sales_rate = money(row[index["Rate"]])
+            sales_amount = money(row[index["Total"]])
+            rate_info = raw_rate_for(cost_type, item, project_id)
+            raw_rate = rate_info["raw_rate"]
+            if cost_type == "Field Ticket Material":
+                accrue_material = bool(matched_change_order_id or matched_subproject_is_tm)
+                raw_rate = sales_rate * CO_MATERIAL_COST_FACTOR if accrue_material else 0
+                amount = sales_amount * CO_MATERIAL_COST_FACTOR if accrue_material else 0
+                rate_info = {
+                    "source": "CO T&M material estimate at 35% margin" if matched_change_order_id else
+                    "Subproject T&M material estimate at 35% margin" if matched_subproject_is_tm else
+                    "Usage only - not budget cost"
+                }
+            else:
+                amount = qty * raw_rate if raw_rate else sales_amount
+            duplicate = con.execute(
+                """
+                SELECT id FROM cost_records
+                WHERE project_id = ?
+                  AND source = 'Field Wise'
+                  AND ticket_or_invoice = ?
+                  AND record_date = ?
+                  AND cost_type = ?
+                  AND item = ?
+                  AND description = ?
+                  AND sales_amount = ?
+                LIMIT 1
+                """,
+                (project_id, ticket, record_date, cost_type, item, description, sales_amount),
+            ).fetchone()
+            if duplicate:
+                skipped += 1
+                continue
+            con.execute(
+                """
+                INSERT INTO cost_records (
+                  project_id, source, source_file, ticket_or_invoice, record_date, status,
+                  subproject_id, change_order_id, cost_type, item, description, qty, rate, amount, sales_rate, sales_amount, raw_rate, raw_cost_source, notes, created_at
+                )
+                VALUES (?, 'Field Wise', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    project_id,
+                    source_file,
+                    ticket,
+                    record_date,
+                    str(row[index["Status"]] or ""),
+                    matched_subproject_id,
+                    matched_change_order_id,
+                    cost_type,
+                    item,
+                    description,
+                    qty,
+                    raw_rate if raw_rate else sales_rate,
+                    amount,
+                    sales_rate,
+                    sales_amount,
+                    raw_rate,
+                    rate_info["source"],
+                    json.dumps(header, default=str),
+                    datetime.now().isoformat(timespec="seconds"),
+                ),
+            )
+            count += 1
+    wb.close()
+    return {"count": count, "skipped": skipped, "order_number": order_number, "matched_subproject_id": matched_subproject_id, "matched_change_order_id": matched_change_order_id}
+
+
+def import_fieldwise_pdf(path, project_id):
+    if pdfplumber is None:
+        raise RuntimeError("PDF import needs pdfplumber, but it is not available in this Python runtime.")
+
+    pages = []
+    tables = []
+    with pdfplumber.open(path) as pdf:
+        for page in pdf.pages:
+            pages.append(page.extract_text() or "")
+            tables.extend(page.extract_tables() or [])
+    text = "\n".join(pages).strip()
+    if not text:
+        raise RuntimeError("No readable text was found in this PDF. It may be a scanned image PDF.")
+
+    def table_value(label):
+        for table in tables:
+            for row in table:
+                if row and len(row) > 1 and str(row[0] or "").strip().lower() == label.lower():
+                    return str(row[1] or "").strip()
+        return ""
+
+    job_text = table_value("Job #") or first_regex([r"Job\s*#\s+(.+)"], text)
+    order_number = first_regex([r"^([A-Za-z0-9\-]+)"], job_text, flags=0)
+    ticket_number = first_regex([r"Field\s*Ticket\s*#\s*([A-Za-z0-9\-]+)"], text)
+    record_date = table_value("Ticket Date") or first_regex([r"Ticket\s*Date\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4})"], text)
+    status = "Imported"
+
+    work_description = first_regex([r"Work\s*Description\s*\n(.+?)\nLabor"], text, flags=re.IGNORECASE | re.DOTALL)
+    work_description = re.sub(r"\s+", " ", work_description).strip()
+    if not work_description:
+        work_description = "Imported Field Wise PDF ticket"
+
+    matched_subproject = None
+    matched_change_order = None
+    if order_number:
+        matched_change_order = one(
+            "SELECT id, subproject_id FROM change_orders WHERE project_id = ? AND job_number = ? ORDER BY id LIMIT 1",
+            (project_id, order_number),
+        )
+        matched_subproject = one(
+            "SELECT id FROM subprojects WHERE project_id = ? AND job_number = ?",
+            (project_id, order_number),
+        )
+        if not matched_subproject:
+            matched_subproject = one(
+                """
+                SELECT id FROM subprojects
+                WHERE project_id = ?
+                  AND code <> ''
+                  AND instr(upper(?), upper(code)) > 0
+                ORDER BY length(code) DESC
+                LIMIT 1
+                """,
+                (project_id, order_number),
+            )
+    matched_subproject_id = matched_subproject["id"] if matched_subproject else None
+    matched_change_order_id = matched_change_order["id"] if matched_change_order else None
+    if matched_change_order and matched_change_order["subproject_id"]:
+        matched_subproject_id = matched_change_order["subproject_id"]
+    matched_subproject_is_tm = False
+    if matched_subproject_id:
+        sp_rate_row = one("SELECT COALESCE(pricing_type, 'Fixed') pricing_type FROM subprojects WHERE id = ?", (matched_subproject_id,))
+        matched_subproject_is_tm = bool(sp_rate_row and sp_rate_row["pricing_type"] == "T&M")
+
+    source_file = Path(path).name
+    records = []
+    def add_fieldwise_item_row(row):
+        if len(row) < 5 or not row[0]:
+            return
+        qty = money(row[2] if len(row) > 2 else 0)
+        rate = parse_money_text(row[3] if len(row) > 3 else 0)
+        amount = parse_money_text(row[4] if len(row) > 4 else 0)
+        price_text = f"{row[3] if len(row) > 3 else ''} {row[4] if len(row) > 4 else ''}"
+        if "$" not in price_text and not amount:
+            return
+        if not qty and not rate and not amount:
+            return
+        item_name = str(row[0] or "").strip()
+        is_equipment = is_equipment_item(item_name)
+        records.append(
+            {
+                "cost_type": "Equipment" if is_equipment else "Field Ticket Material",
+                "item": item_name,
+                "description": str(row[1] or work_description).strip(),
+                "qty": qty,
+                "rate": rate,
+                "amount": amount,
+            }
+        )
+
+    for table in tables:
+        if not table:
+            continue
+        header = [str(c or "").strip().lower() for c in table[0]]
+        if header == ["work type / comp item", "qty", "rate", "total"]:
+            for row in table[1:]:
+                if not row or not row[0]:
+                    continue
+                records.append(
+                    {
+                        "cost_type": "Labor",
+                        "item": str(row[0] or "").strip(),
+                        "description": work_description,
+                        "qty": money(row[1] if len(row) > 1 else 0),
+                        "rate": parse_money_text(row[2] if len(row) > 2 else 0),
+                        "amount": parse_money_text(row[3] if len(row) > 3 else 0),
+                    }
+                )
+        elif header[:5] == ["item", "item description", "qty", "rate", "amount"]:
+            for row in table[1:]:
+                add_fieldwise_item_row(row)
+        else:
+            for row in table:
+                add_fieldwise_item_row(row)
+
+    if not records:
+        amount_text = first_regex([r"TOTAL\s*\$?\s*([0-9,]+\.[0-9]{2})"], text)
+        records.append(
+            {
+                "cost_type": "Uncoded",
+                "item": "PDF Field Ticket",
+                "description": work_description,
+                "qty": 1,
+                "rate": parse_money_text(amount_text),
+                "amount": parse_money_text(amount_text),
+            }
+        )
+
+    count = 0
+    skipped = 0
+    seen_record_counts = {}
+    for record in records:
+        rate_info = raw_rate_for(record["cost_type"], record["item"], project_id)
+        sales_rate = money(record["rate"])
+        sales_amount = money(record["amount"])
+        raw_rate = rate_info["raw_rate"]
+        if record["cost_type"] == "Field Ticket Material":
+            accrue_material = bool(matched_change_order_id or matched_subproject_is_tm)
+            raw_rate = sales_rate * CO_MATERIAL_COST_FACTOR if accrue_material else 0
+            raw_amount = sales_amount * CO_MATERIAL_COST_FACTOR if accrue_material else 0
+            rate_info = {
+                "category": "",
+                "raw_rate": raw_rate,
+                "source": "CO T&M material estimate at 35% margin" if matched_change_order_id else
+                "Subproject T&M material estimate at 35% margin" if matched_subproject_is_tm else
+                "Usage only - not budget cost",
+            }
+        else:
+            raw_amount = record["qty"] * raw_rate if raw_rate else sales_amount
+        duplicate_key = (
+            ticket_number,
+            record["cost_type"],
+            record["item"],
+            record["description"][:500],
+            record["qty"],
+            sales_rate,
+            sales_amount,
+        )
+        seen_record_counts[duplicate_key] = seen_record_counts.get(duplicate_key, 0) + 1
+        existing_count = one(
+            """
+            SELECT COUNT(*) AS existing_count FROM cost_records
+            WHERE project_id = ?
+              AND source = 'Field Wise PDF'
+              AND ticket_or_invoice = ?
+              AND cost_type = ?
+              AND item = ?
+              AND description = ?
+              AND qty = ?
+              AND sales_rate = ?
+              AND sales_amount = ?
+            """,
+            (project_id, ticket_number, record["cost_type"], record["item"], record["description"][:500], record["qty"], sales_rate, sales_amount),
+        )
+        if existing_count and existing_count["existing_count"] >= seen_record_counts[duplicate_key]:
+            skipped += 1
+            continue
+        execute(
+            """
+            INSERT INTO cost_records (
+              project_id, subproject_id, change_order_id, source, source_file, ticket_or_invoice, record_date, status,
+              cost_type, item, description, qty, rate, amount, sales_rate, sales_amount, raw_rate, raw_cost_source, notes, created_at
+            )
+            VALUES (?, ?, ?, 'Field Wise PDF', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                project_id,
+                matched_subproject_id,
+                matched_change_order_id,
+                source_file,
+                ticket_number,
+                record_date,
+                status,
+                record["cost_type"],
+                record["item"],
+                record["description"][:500],
+                record["qty"],
+                raw_rate if raw_rate else sales_rate,
+                raw_amount,
+                sales_rate,
+                sales_amount,
+                raw_rate,
+                rate_info["source"],
+                json.dumps({"job_text": job_text, "rate_category": rate_info["category"], "extracted_text": text[:12000]}, default=str),
+                datetime.now().isoformat(timespec="seconds"),
+            ),
+        )
+        count += 1
+    return {"count": count, "skipped": skipped, "order_number": order_number, "matched_subproject_id": matched_subproject_id, "matched_change_order_id": matched_change_order_id}
+
+
+def import_vendor_invoice_pdf(path, project_id):
+    if pdfplumber is None:
+        raise RuntimeError("Vendor invoice PDF import needs pdfplumber, but it is not available.")
+    text = extract_pdf_text(path)
+    if not text:
+        raise RuntimeError("No readable text was found in this vendor invoice PDF. It may need OCR or manual entry.")
+
+    source_file = Path(path).name
+    lower = text.lower()
+    if "dsgsupply" in lower or "dakota supply group" in lower or "dsg truck delivery" in lower or "dsg#" in lower:
+        vendor = "Dakota Supply Group"
+        item_lines = []
+        compact_lower = re.sub(r"\s+", "", lower)
+        if ("invoicesummary" in compact_lower or "invoice summary" in lower) and "qty" in lower and "subtotal" in lower:
+            invoice_number = first_regex([r"Invoice#\s*:?\s*([A-Za-z0-9.\-]+)"], text)
+            invoice_date = first_regex([r"Invoice Date\s*:?\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4})"], text)
+            order_number = first_regex([r"PO number\s*:?\s*([A-Za-z0-9\-]+)"], text)
+            total_due = parse_money_text(first_regex([r"Total\s*\n?\s*\$?([0-9,]+\.[0-9]{2})"], text))
+            item_lines = parse_dsg_online_invoice_ocr(path)
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            i = 0
+            while not item_lines and i < len(lines):
+                if i + 7 < len(lines) and re.search(r"QTY\s*Invoiced", lines[i + 2], flags=re.IGNORECASE):
+                    manufacturer = lines[i]
+                    description = lines[i + 1]
+                    qty = first_regex([r"^([0-9.]+)$"], lines[i + 3], flags=0)
+                    detail_parts = []
+                    j = i + 4
+                    while j < len(lines) and not re.match(r"^\$?[0-9,.]+/[A-Za-z]+$", lines[j]) and lines[j].lower() != "subtotal":
+                        detail_parts.append(lines[j])
+                        j += 1
+                    if j + 2 < len(lines):
+                        unit_price = parse_money_text(lines[j])
+                        amount = parse_money_text(lines[j + 2])
+                        item_lines.append({
+                            "product_code": description.split()[0] if description.split() else manufacturer,
+                            "description": " ".join([description] + detail_parts).strip(),
+                            "qty": qty,
+                            "unit_price": unit_price,
+                            "amount": amount,
+                        })
+                        i = j + 3
+                        continue
+                i += 1
+        else:
+            header = re.search(r"INVOICE DATE\s+INVOICE NUMBER\s*\n([0-9]{1,2}/[0-9]{1,2}/[0-9]{4})\s+([A-Za-z0-9.\-]+)", text)
+            invoice_date = header.group(1).strip() if header else ""
+            invoice_number = header.group(2).strip() if header else ""
+            order_number = first_regex([r"CUSTOMER NUMBER\s+CUSTOMER PO NUMBER.*?\n[0-9]+\s+([0-9]{3,})\s+"], text, flags=re.IGNORECASE | re.DOTALL)
+            total_due = parse_money_text(first_regex([r"Amount Due\s+\$?([0-9,]+\.[0-9]{2})"], text))
+            block_match = re.search(r"ORDER QTY\s+SHIP QTY\s+DESCRIPTION\s+UNIT PRICE\s+EXT PRICE\s*\n(.+?)\nONLINE BILLPAY", text, flags=re.IGNORECASE | re.DOTALL)
+            if block_match:
+                current = None
+                for raw_line in block_match.group(1).splitlines():
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    match = re.match(r"^([0-9.]+)\s*([A-Za-z]+)\s+([0-9.]+)\s*([A-Za-z]+)\s+(.+?)\s+([0-9,]+\.[0-9]+/[A-Za-z]+)\s+([0-9,]+\.[0-9]{2})$", line)
+                    if match:
+                        if current:
+                            item_lines.append(current)
+                        ordered_qty, ordered_unit, shipped_qty, shipped_unit, description, unit_text, extension = match.groups()
+                        current = {
+                            "ordered_qty": ordered_qty,
+                            "ordered_unit": ordered_unit,
+                            "shipped_qty": shipped_qty,
+                            "shipped_unit": shipped_unit,
+                            "product_code": description.split()[0] if description.split() else description,
+                            "description": description,
+                            "unit_text": unit_text,
+                            "extension": extension,
+                        }
+                    elif current:
+                        current["description"] += " " + line
+                if current:
+                    item_lines.append(current)
+    elif "vega americas" in lower:
+        vendor = "VEGA Americas"
+        invoice_number = first_regex([r"Invoice\s+No\.\s*([A-Za-z0-9\-]+)"], text, flags=re.IGNORECASE)
+        invoice_date = first_regex([r"\bDate:\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4})"], text, flags=re.IGNORECASE)
+        order_number = first_regex([r"Purchase Order:\s*(.+)"], text, flags=re.IGNORECASE)
+        total_due = parse_money_text(first_regex([r"Sales Total USD\s+([0-9,]+\.[0-9]{2})"], text))
+        item_lines = []
+        current = None
+        stop_prefixes = (
+            "Unit Price", "Pos.", "Carried over", "Sales Total", "Shipping cost",
+            "Tariff Surcharge", "Transaction Information", "Order No.", "Packing List",
+            "Net Due Date", "Payment Terms", "Ship Date", "Incoterm", "Ship To Address",
+            "Contact Information", "ORIGINAL", "- Page", "VEGA Americas"
+        )
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            match = re.match(r"^([0-9]+)\s+([0-9.]+)\s+(.+?)\s+([0-9,]+\.[0-9]{2})\s+([0-9,]+\.[0-9]{2})$", line)
+            if match:
+                if current:
+                    item_lines.append(current)
+                position, qty, description, unit_price, extension = match.groups()
+                current = {
+                    "product_code": description.split()[0] if description.split() else description,
+                    "description": description,
+                    "qty": qty,
+                    "unit_price": unit_price,
+                    "amount": extension,
+                }
+                continue
+            if current:
+                if line.startswith(stop_prefixes):
+                    item_lines.append(current)
+                    current = None
+                elif not re.search(r"^(Serial Number|Order Position|Packing List Position)", line, flags=re.IGNORECASE):
+                    current["description"] += " " + line
+        if current:
+            item_lines.append(current)
+        shipping = parse_money_text(first_regex([r"Shipping cost USD:\s*([0-9,]+\.[0-9]{2})"], text, flags=re.IGNORECASE))
+        tariff = parse_money_text(first_regex([r"Tariff Surcharge USD:\s*([0-9,]+\.[0-9]{2})"], text, flags=re.IGNORECASE))
+        if shipping:
+            item_lines.append({"product_code": "Shipping", "description": "Shipping cost", "qty": 1, "unit_price": shipping, "amount": shipping})
+        if tariff:
+            item_lines.append({"product_code": "Tariff", "description": "Tariff surcharge", "qty": 1, "unit_price": tariff, "amount": tariff})
+    elif "primec controls" in lower:
+        vendor = "Prime Controls LLC"
+        invoice_number = first_regex([r"INVOICE\s+PAGE:\s*[0-9]+\s*\n\s*([A-Za-z0-9\-]+)\s*\n\s*Invoice#"], text, flags=re.IGNORECASE)
+        invoice_date = first_regex([r"Invoice#\s*\n\s*([0-9]{1,2}-[0-9]{1,2}-[0-9]{2,4})\s*\n\s*InvoiceDate"], text, flags=re.IGNORECASE)
+        order_number = first_regex([r"SALESPERSON\s+.+?\s+PO\s+(.+)", r"\bFACILITY\s+(.+)"], text, flags=re.IGNORECASE)
+        total_due = parse_money_text(first_regex([r"SUBTOTAL\s+([0-9,]+\.[0-9]{2})", r"INVOICETOTAL\s*\n\s*([0-9,]+\.[0-9]{2})"], text, flags=re.IGNORECASE))
+        item_lines = []
+        current = None
+        block_match = re.search(r"Item\s+Description\s+Ordered\s+Shipped\s+UM\s+UnitPrice\s+Extension\s*\n(.+?)\nLast Page", text, flags=re.IGNORECASE | re.DOTALL)
+        if block_match:
+            for raw_line in block_match.group(1).splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                match = re.match(r"^([A-Za-z0-9\-]+)\s+(.+?)\s+([0-9.]+)\s+([0-9.]+)\s+([A-Za-z]+)\s+([0-9,]+\.[0-9]{2})\s+([0-9,]+\.[0-9]{2})$", line)
+                if match:
+                    if current:
+                        item_lines.append(current)
+                    product_code, description, ordered_qty, shipped_qty, unit, unit_price, extension = match.groups()
+                    current = {
+                        "product_code": product_code,
+                        "description": f"{product_code} {description}",
+                        "qty": shipped_qty or ordered_qty,
+                        "unit_price": unit_price,
+                        "amount": extension,
+                    }
+                elif current:
+                    current["description"] += " " + line
+            if current:
+                item_lines.append(current)
+    elif "ced williston" in lower:
+        vendor = "CED Williston"
+        invoice_header = re.search(r"([0-9]{3,}\s*-\s*[0-9]{3,})\s+([0-9]{2}/[0-9]{2}/[0-9]{2})", text)
+        invoice_number = invoice_header.group(1).strip() if invoice_header else ""
+        invoice_date = invoice_header.group(2).strip() if invoice_header else ""
+        order_number = first_regex([r"CUSTOMER\s*\nORDER\s*\n.*?([0-9]{3,})\s*\nSALES PERSON", r"\bORDER\s*\n.*?([0-9]{3,})"], text, flags=re.IGNORECASE | re.DOTALL)
+        total_due = parse_money_text(first_regex([r"TOTAL DUE\s+([0-9,]+\.[0-9]{2})"], text))
+        item_lines = []
+        current = None
+        stop_re = re.compile(r"^(TITLE TO|AT POINT|MERCHANDISE|A SERVICE|THIS SALE|CODE:|B -|C -|SALES TAX|SHIPPING CHARGE|TOTAL DUE)\b", re.IGNORECASE)
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            match = re.match(
+                r"^T\s+([0-9.]+)\s+(.+?)\s+([0-9.]+)\s+([0-9,]+\.[0-9]{2})\s+([A-Za-z])\s+([0-9,]+\.[0-9]{2})$",
+                line,
+            )
+            if match:
+                if current:
+                    item_lines.append(current)
+                ordered_qty, product_description, shipped_qty, quoted_price, price_code, extension = match.groups()
+                price_code = price_code.upper()
+                parts = product_description.split()
+                product_code = " ".join(parts[:2]) if len(parts) > 1 else product_description
+                current = {
+                    "product_code": product_code,
+                    "description": product_description,
+                    "qty": shipped_qty or ordered_qty,
+                    "unit_price": (parse_money_text(extension) / money(shipped_qty or ordered_qty)) if money(shipped_qty or ordered_qty) else 0,
+                    "amount": extension,
+                    "ced_price_code": price_code,
+                    "ced_quoted_price": quoted_price,
+                }
+                continue
+            if current and stop_re.search(line):
+                item_lines.append(current)
+                current = None
+                break
+            if current and not stop_re.search(line) and not re.search(r"^(INVOICE|QUANTITY|PRODUCT CODE|ORDERED|SOLD TO|SHIP TO|ACCOUNT NO\.|SALES PERSON)\b", line, flags=re.IGNORECASE):
+                current["description"] += " " + line
+        if current:
+            item_lines.append(current)
+    elif "border states" in lower:
+        vendor = "Border States"
+        invoice_number = first_regex([r"Invoice:\s*([A-Za-z0-9\-]+)"], text, flags=re.IGNORECASE)
+        invoice_date = first_regex([r"Invoice:\s*[A-Za-z0-9\-]+\s+Date:\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{4})"], text, flags=re.IGNORECASE)
+        order_number = first_regex([r"P\.O\.#:\s*(.+)"], text, flags=re.IGNORECASE)
+        total_due = parse_money_text(first_regex([r"Net Invoice Amount\s+\$\s*([0-9,]+\.[0-9]{2})", r"Total\s+\$\s*([0-9,]+\.[0-9]{2})"], text, flags=re.IGNORECASE))
+        item_lines = []
+        current = None
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            start = re.match(r"^([0-9]{6})\s+([A-Za-z0-9\-]+)\s+([0-9,]+(?:\.[0-9]+)?)$", line)
+            if start:
+                if current:
+                    item_lines.append(current)
+                line_no, material, ordered_qty = start.groups()
+                current = {
+                    "product_code": material,
+                    "description": material,
+                    "ordered_qty": ordered_qty,
+                    "qty": ordered_qty,
+                    "unit_price": 0,
+                    "amount": 0,
+                }
+                continue
+            if not current:
+                continue
+            batch = re.match(
+                r"^Batch Total:\s*([0-9,]+(?:\.[0-9]+)?)\s+([A-Za-z]+)\s+([0-9,]+(?:\.[0-9]+)?)\s+([0-9,]+\.[0-9]{2})\s*/\s*([0-9,]+(?:\.[0-9]+)?)\s+([A-Za-z]+)\s+([0-9,]+\.[0-9]{2})$",
+                line,
+                flags=re.IGNORECASE,
+            )
+            if batch:
+                batch_qty, batch_uom, ship_qty, quoted_price, price_per_qty, price_per_uom, extension = batch.groups()
+                qty = parse_money_text(ship_qty or batch_qty or current.get("ordered_qty"))
+                amount = parse_money_text(extension)
+                current["qty"] = qty
+                current["unit_price"] = amount / qty if qty else parse_money_text(quoted_price)
+                current["amount"] = amount
+                current["description"] = re.sub(r"\s+", " ", current["description"]).strip()
+                item_lines.append(current)
+                current = None
+                continue
+            if re.search(r"^(Cust Material #|Batch:|OD |Williston stocked)\b", line, flags=re.IGNORECASE):
+                current["description"] += " " + line
+            elif not re.search(r"^(INVOICE|Page |Invoice:|Cust Acct|Cash discount|Total due|Shipping and Handling|State Tax|County Tax|Local Tax|Other Tax|Tax Subtotal|Net Invoice Amount|ORIGINAL REPRINT)\b", line, flags=re.IGNORECASE):
+                current["description"] += " " + line
+        if current and parse_money_text(current.get("amount")):
+            item_lines.append(current)
+    else:
+        vendor = first_regex([r"^([A-Z][A-Za-z0-9 &.\-]+)\s*\n"], text, flags=re.MULTILINE) or "Vendor"
+        invoice_number = first_regex([r"Invoice\s*(?:No\.?|#)\s*:?\s*([A-Za-z0-9\-]+)"], text)
+        invoice_date = first_regex([r"Invoice\s*Date\s*:?\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4})"], text)
+        order_number = first_regex([r"(?:PO|Purchase Order|Customer PO)(?:\s*number|\s*#)?\s*:?\s*([A-Za-z0-9\-]+)"], text)
+        total_due = parse_money_text(first_regex([r"(?:Total|Amount Due)\s*:?\s*\$?\s*([0-9,]+\.[0-9]{2})"], text))
+        item_lines = []
+
+    matched_subproject = None
+    if order_number:
+        matched_subproject = one(
+            "SELECT id FROM subprojects WHERE project_id = ? AND job_number = ?",
+            (project_id, order_number),
+        )
+        if not matched_subproject:
+            matched_subproject = one(
+                """
+                SELECT id FROM subprojects
+                WHERE project_id = ?
+                  AND code <> ''
+                  AND instr(upper(?), upper(code)) > 0
+                ORDER BY length(code) DESC
+                LIMIT 1
+                """,
+                (project_id, order_number),
+            )
+    matched_subproject_id = matched_subproject["id"] if matched_subproject else None
+
+    duplicate_invoice = None
+    if invoice_number:
+        duplicate_invoice = one(
+            """
+            SELECT COUNT(*) AS line_count, COALESCE(SUM(amount), 0) AS total_amount, MAX(source_file) AS source_file
+            FROM cost_records
+            WHERE project_id = ?
+              AND source = 'Vendor Invoice'
+              AND ticket_or_invoice = ?
+              AND (? = '' OR vendor = ?)
+            """,
+            (project_id, invoice_number, vendor or "", vendor or ""),
+        )
+        if duplicate_invoice and duplicate_invoice["line_count"]:
+            return {
+                "count": 0,
+                "skipped": duplicate_invoice["line_count"],
+                "order_number": order_number,
+                "matched_subproject_id": matched_subproject_id,
+                "vendor": vendor,
+                "invoice_number": invoice_number,
+                "duplicate": True,
+                "existing_line_count": duplicate_invoice["line_count"],
+                "existing_total": duplicate_invoice["total_amount"],
+                "existing_source_file": duplicate_invoice["source_file"],
+            }
+
+    count = 0
+    skipped = 0
+    if item_lines:
+        for line in item_lines:
+            if isinstance(line, dict):
+                product_code = line["product_code"]
+                description = line["description"]
+                if "qty" in line:
+                    qty = money(line["qty"])
+                    amount = parse_money_text(line["amount"])
+                    unit_price = parse_money_text(line.get("unit_price")) if line.get("unit_price") is not None else (amount / qty if qty else 0)
+                else:
+                    qty = money(line["shipped_qty"] or line["ordered_qty"])
+                    amount = parse_money_text(line["extension"])
+                    unit_price = amount / qty if qty else 0
+            elif len(line) == 6:
+                ordered_qty, product_code, description, shipped_qty, per_hundred_price, extension = line
+                qty = money(shipped_qty or ordered_qty)
+                amount = parse_money_text(extension)
+                unit_price = amount / qty if qty else 0
+            else:
+                ordered_qty, product_description, shipped_qty, per_hundred_price, extension = line
+                parts = product_description.split()
+                product_code = " ".join(parts[:2]) if len(parts) > 1 else product_description
+                description = " ".join(parts[2:]) if len(parts) > 2 else product_description
+                qty = money(shipped_qty or ordered_qty)
+                amount = parse_money_text(extension)
+                unit_price = amount / qty if qty else 0
+            execute(
+                """
+                INSERT INTO cost_records (
+                  project_id, subproject_id, source, source_file, ticket_or_invoice, record_date, status,
+                  cost_type, item, description, qty, rate, amount, sales_rate, sales_amount, raw_rate, raw_cost_source,
+                  vendor, notes, created_at
+                )
+                VALUES (?, ?, 'Vendor Invoice', ?, ?, ?, 'Imported', 'Material', ?, ?, ?, ?, ?, 0, 0, ?, 'Vendor invoice actual material cost', ?, ?, ?)
+                """,
+                (
+                    project_id,
+                    matched_subproject_id,
+                    source_file,
+                    invoice_number,
+                    invoice_date,
+                    product_code,
+                    description.strip(),
+                    qty,
+                    unit_price,
+                    amount,
+                    unit_price,
+                    vendor,
+                    json.dumps({"order_number": order_number, "text": text[:12000]}, default=str),
+                    datetime.now().isoformat(timespec="seconds"),
+                ),
+            )
+            count += 1
+    else:
+        if not total_due:
+            raise RuntimeError("Could not find invoice line items or total due in this vendor invoice.")
+        duplicate = one(
+            "SELECT id FROM cost_records WHERE project_id = ? AND source = 'Vendor Invoice' AND source_file = ? AND ticket_or_invoice = ? LIMIT 1",
+            (project_id, source_file, invoice_number),
+        )
+        if duplicate:
+            skipped += 1
+        else:
+            execute(
+                """
+                INSERT INTO cost_records (
+                  project_id, subproject_id, source, source_file, ticket_or_invoice, record_date, status,
+                  cost_type, item, description, qty, rate, amount, raw_rate, raw_cost_source, vendor, notes, created_at
+                )
+                VALUES (?, ?, 'Vendor Invoice', ?, ?, ?, 'Imported', 'Material', 'Vendor Invoice Total', ?, 1, ?, ?, ?, 'Vendor invoice actual material cost', ?, ?, ?)
+                """,
+                (
+                    project_id,
+                    matched_subproject_id,
+                    source_file,
+                    invoice_number,
+                    invoice_date,
+                    f"{vendor} invoice total",
+                    total_due,
+                    total_due,
+                    total_due,
+                    vendor,
+                    json.dumps({"order_number": order_number, "text": text[:12000]}, default=str),
+                    datetime.now().isoformat(timespec="seconds"),
+                ),
+            )
+            count += 1
+    return {"count": count, "skipped": skipped, "order_number": order_number, "matched_subproject_id": matched_subproject_id, "vendor": vendor, "invoice_number": invoice_number, "duplicate": False}
+
+
+LOGIN_HTML = r"""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Twin Peaks Login</title>
+  <style>
+    :root { --blue:#2f69b1; --ink:#17202a; --muted:#5b6b7f; --line:#d5dde6; --yellow:#ffc20e; }
+    * { box-sizing: border-box; }
+    body { margin:0; min-height:100vh; display:grid; place-items:center; background:#f3f6f9; color:var(--ink); font-family:"Segoe UI", Arial, sans-serif; }
+    .login { width:min(420px, calc(100vw - 32px)); background:white; border:1px solid var(--line); border-radius:8px; padding:26px; box-shadow:0 16px 40px rgba(23,32,42,.12); }
+    .brand { display:flex; align-items:center; gap:14px; margin-bottom:22px; }
+    .brand img { width:82px; max-height:52px; object-fit:contain; }
+    h1 { margin:0; font-size:24px; }
+    .subtitle { color:var(--muted); font-weight:650; margin-top:3px; }
+    label { display:block; color:#31445a; font-size:13px; font-weight:750; margin:14px 0 6px; }
+    input { width:100%; border:1px solid var(--line); border-radius:7px; padding:12px; font-size:15px; }
+    button { width:100%; margin-top:18px; border:0; border-radius:7px; padding:12px 14px; font-weight:800; color:white; background:var(--blue); cursor:pointer; }
+    .error { min-height:20px; color:#b42318; font-weight:700; margin-top:12px; }
+    .hint { color:var(--muted); font-size:13px; margin-top:14px; line-height:1.4; }
+  </style>
+</head>
+<body>
+  <form class="login" id="loginForm">
+    <div class="brand">
+      <img src="/brand/twin-peaks-logo.png" alt="Twin Peaks Electrical">
+      <div><h1>Project Dashboard</h1><div class="subtitle">Twin Peaks Electrical</div></div>
+    </div>
+    <label>Username</label><input name="username" autocomplete="username" required autofocus>
+    <label>Password</label><input name="password" type="password" autocomplete="current-password" required>
+    <button type="submit">Log In</button>
+    <div class="error" id="loginError"></div>
+    <div class="hint">Default first login: admin / ChangeMe123!. Change this after creating your real admin users.</div>
+  </form>
+  <script>
+    document.getElementById('loginForm').onsubmit = async event => {
+      event.preventDefault();
+      const data = Object.fromEntries(new FormData(event.target).entries());
+      const error = document.getElementById('loginError');
+      error.textContent = '';
+      const res = await fetch('/api/login', { method:'POST', body: JSON.stringify(data) });
+      if (res.ok) window.location.href = '/';
+      else error.textContent = 'Login failed. Check username and password.';
+    };
+  </script>
+</body>
+</html>
+"""
+
+
+HTML = r"""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Twin Peaks Project Dashboard</title>
+  <style>
+    :root {
+      --ink: #17202a;
+      --muted: #607080;
+      --line: #d8dee5;
+      --bg: #f6f8fa;
+      --panel: #ffffff;
+      --blue: #2266aa;
+      --green: #138a5b;
+      --red: #b42318;
+      --gold: #9a6700;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: "Segoe UI", Arial, sans-serif; color: var(--ink); background: var(--bg); }
+    header { background: #152332; color: white; padding: 14px 24px; display: flex; align-items: center; justify-content: space-between; gap: 20px; border-bottom: 4px solid #ffc20e; }
+    .brand-lockup { display: flex; align-items: center; gap: 14px; min-width: 280px; }
+    .brand-logo { display: flex; align-items: center; justify-content: center; background: white; border-radius: 8px; padding: 8px 10px; border: 1px solid rgba(255,255,255,.3); box-shadow: 0 6px 18px rgba(0,0,0,.18); cursor: pointer; }
+    .brand-logo img { display: block; height: 46px; width: auto; }
+    .system-menu-wrap { position: relative; }
+    .system-menu-btn { width: 34px; height: 34px; border-radius: 6px; border: 1px solid rgba(255,255,255,.35); background: rgba(255,255,255,.12); color: white; cursor: pointer; font-size: 20px; font-weight: 800; line-height: 1; }
+    .system-menu { position: absolute; top: 40px; left: 0; z-index: 40; width: 160px; padding: 6px; background: white; border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 12px 32px rgba(0,0,0,.2); }
+    .system-menu button { display: block; width: 100%; border: 0; background: white; color: var(--ink); text-align: left; padding: 9px 10px; border-radius: 6px; cursor: pointer; font-weight: 650; }
+    .system-menu button:hover { background: #eef2f6; }
+    .brand-title h1 { margin: 0; font-size: 21px; font-weight: 750; }
+    .brand-title .subtitle { color: #d8e6f3; font-size: 12px; font-weight: 650; margin-top: 2px; text-transform: uppercase; letter-spacing: .04em; }
+    header select { min-width: 360px; padding: 10px 12px; border-radius: 6px; border: 1px solid #8aa0b5; font-weight: 650; }
+    .project-switcher { display: flex; align-items: center; gap: 10px; }
+    .project-switcher label { color: #d8e6f3; margin: 0; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+    main { padding: 20px 24px 36px; max-width: 1500px; margin: 0 auto; }
+    nav { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+    nav button, .btn { border: 1px solid var(--line); background: white; color: var(--ink); padding: 9px 12px; border-radius: 6px; cursor: pointer; font-weight: 600; transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease, background-color .15s ease; }
+    nav button:hover, nav button:focus-visible, .btn:hover, .btn:focus-visible { border-color: var(--blue); box-shadow: 0 8px 24px rgba(25, 99, 176, .12); outline: none; transform: translateY(-1px); }
+    nav button.active, .btn.primary { background: var(--blue); color: white; border-color: var(--blue); }
+    .grid { display: grid; gap: 14px; }
+    .grid.cols-4 { grid-template-columns: repeat(4, minmax(180px, 1fr)); }
+    .grid.cols-2 { grid-template-columns: repeat(2, minmax(260px, 1fr)); }
+    .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px; min-width: 0; }
+    .home-card { cursor: pointer; transition: border-color .15s ease, box-shadow .15s ease; }
+    .home-card:hover { border-color: var(--blue); box-shadow: 0 8px 24px rgba(25, 99, 176, .12); }
+    .kpi { min-height: 98px; }
+    .kpi.clickable { cursor: pointer; transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease; }
+    .kpi.clickable:hover, .kpi.clickable:focus { border-color: var(--blue); box-shadow: 0 8px 24px rgba(25, 99, 176, .12); outline: none; transform: translateY(-1px); }
+    .kpi .label { color: var(--muted); font-size: 13px; font-weight: 650; text-transform: uppercase; }
+    .kpi .value { font-size: 28px; font-weight: 750; margin-top: 10px; }
+    .kpi .hint { color: var(--muted); font-size: 13px; margin-top: 6px; }
+    h2 { font-size: 18px; margin: 0 0 12px; }
+    h3 { font-size: 15px; margin: 16px 0 8px; }
+    label { display: block; font-size: 13px; color: var(--muted); font-weight: 650; margin: 10px 0 5px; }
+    input, select, textarea { width: 100%; border: 1px solid var(--line); border-radius: 6px; padding: 9px 10px; font: inherit; background: white; }
+    textarea { min-height: 76px; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; background: white; }
+    th, td { padding: 9px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { color: #34495e; font-size: 12px; text-transform: uppercase; background: #eef2f6; position: sticky; top: 0; }
+    .table-wrap { max-height: 520px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; }
+    #bidTable { min-width: 1780px; table-layout: fixed; }
+    #bidTable th, #bidTable td { white-space: nowrap; }
+    #bidTable input, #bidTable select { min-width: 0; padding: 8px 9px; }
+    #bidTable th:nth-child(1), #bidTable td:nth-child(1) { width: 120px; }
+    #bidTable th:nth-child(2), #bidTable td:nth-child(2) { width: 160px; }
+    #bidTable th:nth-child(3), #bidTable td:nth-child(3) { width: 135px; }
+    #bidTable th:nth-child(4), #bidTable td:nth-child(4) { width: 160px; }
+    #bidTable th:nth-child(5), #bidTable td:nth-child(5) { width: 120px; }
+    #bidTable th:nth-child(6), #bidTable td:nth-child(6) { width: 155px; }
+    #bidTable th:nth-child(7), #bidTable td:nth-child(7) { width: 160px; }
+    #bidTable th:nth-child(8), #bidTable td:nth-child(8) { width: 110px; }
+    #bidTable th:nth-child(9), #bidTable td:nth-child(9) { width: 120px; }
+    #bidTable th:nth-child(10), #bidTable td:nth-child(10) { width: 105px; }
+    #bidTable th:nth-child(11), #bidTable td:nth-child(11) { width: 125px; }
+    #bidTable th:nth-child(12), #bidTable td:nth-child(12) { width: 100px; }
+    #bidTable th:nth-child(13), #bidTable td:nth-child(13) { width: 130px; }
+    #bidTable th:nth-child(14), #bidTable td:nth-child(14) { width: 125px; }
+    #bidTable th:nth-child(15), #bidTable td:nth-child(15) { width: 190px; }
+    #bidTable th:nth-child(16), #bidTable td:nth-child(16) { width: 80px; }
+    #bidTable tr.bid-stale td { background: #fff1f0; }
+    #bidTable tr.bid-stale td:first-child { box-shadow: inset 4px 0 0 var(--red); }
+    #bidTable tr.bid-stale input, #bidTable tr.bid-stale select { background: #fff8f7; border-color: #f0b8b5; }
+    #bidTable tr.bid-dirty td { background: #fff8e1; }
+    #bidTable tr.bid-dirty td:first-child { box-shadow: inset 4px 0 0 var(--gold); }
+    #bidTable tr.bid-dirty input, #bidTable tr.bid-dirty select { background: #fffdf3; border-color: #d6a700; }
+    #bidTable tr.bid-dirty [data-save-bid] { background: var(--gold); color: white; border-color: var(--gold); }
+    .dashboard-split { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; margin-top: 14px; }
+    .dashboard-table-wrap { overflow: auto; max-height: 360px; }
+    .dashboard-table-wrap table { min-width: 760px; }
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+    .muted { color: var(--muted); }
+    .good { color: var(--green); }
+    .bad { color: var(--red); }
+    .warn { color: var(--gold); }
+    .hidden { display: none; }
+    body.read-only form input, body.read-only form select, body.read-only form textarea { pointer-events: none; background: #f6f8fa; color: #607080; }
+    body.read-only form .actions,
+    body.read-only [data-save],
+    body.read-only [data-save-sp],
+    body.read-only [data-save-rate],
+    body.read-only [data-save-cost-group],
+    body.read-only [data-save-bid],
+    body.read-only [data-delete-import],
+    body.read-only [data-reset-user],
+    body.read-only [data-toggle-user],
+    body.read-only [data-save-invoice-subproject],
+    body.read-only [data-save-customer-invoice],
+    body.read-only #addRate,
+    body.read-only #importVendorInvoice { display: none !important; }
+    .bar { height: 12px; background: #e8edf2; border-radius: 999px; overflow: hidden; }
+    .bar span { display: block; height: 100%; background: var(--blue); }
+    .invoice-summary { background: #fbfcfd; cursor: pointer; }
+    .invoice-summary td { font-weight: 650; }
+    .selectable-row { cursor: pointer; }
+    .selectable-row.selected { background: #eef5ff; }
+    .selectable-row.selected td { font-weight: 700; }
+    .invoice-detail { background: #ffffff; }
+    .invoice-detail td:first-child { padding-left: 34px; }
+    .invoice-toggle { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; margin-right: 8px; border: 1px solid var(--line); border-radius: 6px; background: white; color: var(--blue); font-weight: 800; }
+    .invoice-line-count { color: var(--muted); font-weight: 600; }
+    .pdf-link { color: var(--blue); font-weight: 700; text-decoration: none; }
+    .pdf-link:hover { text-decoration: underline; }
+    .cost-filter-bar { display: grid; grid-template-columns: minmax(220px, 1.4fr) repeat(3, minmax(150px, .7fr)) auto; gap: 8px; align-items: end; margin-bottom: 10px; }
+    .cost-filter-bar label { margin-top: 0; }
+    .cost-filter-count { color: var(--muted); font-size: 13px; font-weight: 650; margin: 0 0 10px; }
+    .filter-summary { display: flex; gap: 10px; flex-wrap: wrap; margin: 0 0 10px; }
+    .filter-summary .summary-pill { border: 1px solid var(--line); background: #fbfcfd; border-radius: 8px; padding: 9px 12px; min-width: 160px; }
+    .filter-summary .summary-label { color: var(--muted); font-size: 11px; font-weight: 750; text-transform: uppercase; letter-spacing: .04em; }
+    .filter-summary .summary-value { color: var(--ink); font-size: 18px; font-weight: 800; margin-top: 3px; }
+    .filter-summary .summary-value.amount { color: var(--green); }
+    .project-banner { display: grid; grid-template-columns: 1.4fr repeat(3, minmax(130px, .45fr)); gap: 12px; align-items: stretch; margin-bottom: 14px; }
+    .project-title { background: #ffffff; border: 1px solid var(--line); border-left: 5px solid var(--blue); border-radius: 8px; padding: 14px 16px; }
+    .project-title.clickable, .job-chip.clickable { cursor: pointer; transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease; }
+    .project-title.clickable:hover, .project-title.clickable:focus, .job-chip.clickable:hover, .job-chip.clickable:focus { border-color: var(--blue); box-shadow: 0 8px 24px rgba(25, 99, 176, .12); outline: none; transform: translateY(-1px); }
+    .project-title .eyebrow { color: var(--muted); font-size: 12px; font-weight: 750; text-transform: uppercase; }
+    .project-title .name { font-size: 24px; font-weight: 780; margin-top: 4px; }
+    .job-chip { background: #ffffff; border: 1px solid var(--line); border-radius: 8px; padding: 12px; }
+    .job-chip .job { font-size: 20px; font-weight: 780; }
+    .job-chip .label { color: var(--muted); font-size: 13px; margin-top: 4px; }
+    .modal-backdrop { position: fixed; inset: 0; background: rgba(15, 23, 42, .44); display: flex; align-items: center; justify-content: center; z-index: 50; padding: 20px; }
+    .modal-backdrop.hidden { display: none; }
+    .modal { background: white; border-radius: 8px; border: 1px solid var(--line); width: min(460px, 100%); padding: 18px; box-shadow: 0 18px 50px rgba(0,0,0,.22); }
+    .modal h2 { margin-bottom: 8px; }
+    .modal p { color: var(--muted); margin: 0; line-height: 1.45; }
+    details { border: 1px solid var(--line); border-radius: 8px; margin-top: 14px; overflow: hidden; background: white; }
+    summary { cursor: pointer; font-weight: 750; padding: 12px 14px; background: #eef2f6; }
+    details .detail-body { padding: 12px; }
+    @media (max-width: 1250px) {
+      .dashboard-split { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 900px) {
+      header { align-items: flex-start; flex-direction: column; }
+      .brand-logo img { height: 38px; }
+      .brand-lockup { min-width: 0; }
+      header select { min-width: 0; width: 100%; }
+      .project-switcher { width: 100%; align-items: stretch; flex-direction: column; }
+      .grid.cols-4, .grid.cols-2 { grid-template-columns: 1fr; }
+      .project-banner { grid-template-columns: 1fr; }
+      .cost-filter-bar { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand-lockup">
+      <button class="brand-logo" id="homeLogo" type="button" title="Home"><img src="/brand/twin-peaks-logo.png" alt="Twin Peaks Electrical"></button>
+      <div class="system-menu-wrap">
+        <button class="system-menu-btn" id="systemMenuButton" type="button" title="System settings">...</button>
+        <div class="system-menu hidden" id="systemMenu">
+          <button id="systemAdminBtn" type="button" class="hidden">Admin</button>
+          <button id="systemRevisionBtn" type="button" class="hidden">Developer Revision</button>
+          <button id="systemLogoutBtn" type="button">Logout</button>
+        </div>
+      </div>
+      <div class="brand-title">
+        <h1>Project Dashboard</h1>
+        <div class="subtitle">Twin Peaks Electrical</div>
+      </div>
+    </div>
+    <div class="project-switcher">
+      <label for="projectSelect">Master Project</label>
+      <select id="projectSelect"></select>
+      <div style="margin-top:8px;display:flex;gap:8px;align-items:center;justify-content:flex-end">
+        <span class="muted" id="currentUser"></span>
+      </div>
+    </div>
+  </header>
+  <main>
+    <nav>
+      <button data-tab="home" data-nav-area="home" class="active">Home</button>
+      <button data-tab="dashboard" data-nav-area="project" class="hidden">Project Dashboard</button>
+      <button data-tab="setup" data-nav-area="project" class="hidden">Setup</button>
+      <button data-tab="import" data-nav-area="project" class="hidden">Field Wise</button>
+      <button data-tab="review" data-nav-area="project" class="hidden">Review Exceptions</button>
+      <button data-tab="invoices" data-nav-area="project" class="hidden">Vendor Invoices</button>
+      <button data-tab="billing" data-nav-area="project" class="hidden">Customer Billing</button>
+    </nav>
+
+    <section id="home" class="tab">
+      <div class="grid cols-2">
+        <div class="panel home-card" data-open-tab="dashboard" role="button" tabindex="0">
+          <h2>Project Dashboard</h2>
+          <p class="muted">Track master projects, subprojects, change orders, Field Wise tickets, vendor invoices, and profitability.</p>
+          <div class="actions"><button class="btn primary" data-open-tab="dashboard" type="button">Open Project Dashboard</button></div>
+        </div>
+        <div class="panel home-card" data-open-tab="bids" role="button" tabindex="0">
+          <h2>Bid Tracking</h2>
+          <p class="muted">Track RFQs, due dates, estimators, bid stages, weighted forecast, win/loss, and risk notes.</p>
+          <div class="actions"><button class="btn primary" data-open-tab="bids" type="button">Open Bid Tracking</button></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="dashboard" class="tab hidden">
+      <div id="projectBanner"></div>
+      <div class="actions" style="margin-bottom:14px"><button class="btn primary" id="openMasterDetail" type="button">Open Master Project Detail</button></div>
+      <div class="panel hidden" style="margin-bottom:14px" id="masterDetailPanel">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px">
+          <h2 id="masterDetailTitle">Master Project Detail</h2>
+          <button class="btn" id="closeMasterDetail" type="button">Close</button>
+        </div>
+        <div id="masterDetail"></div>
+      </div>
+      <div class="grid cols-4" id="kpis"></div>
+      <div class="panel" style="margin-top:14px">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px">
+          <h2>Invoicing</h2>
+          <button class="btn" id="openBillingFromDashboard" type="button">Open Customer Billing</button>
+        </div>
+        <div id="billingSummary"></div>
+      </div>
+      <div class="dashboard-split">
+        <div class="panel"><h2>Subprojects</h2><div class="dashboard-table-wrap" id="subprojectSummary"></div></div>
+        <div class="panel">
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:10px">
+            <h2 id="coSummaryTitle">Change Orders</h2>
+            <button class="btn hidden" id="showAllCos" type="button">Show All</button>
+          </div>
+          <div class="dashboard-table-wrap" id="coSummary"></div>
+        </div>
+      </div>
+      <div class="panel hidden" style="margin-top:14px" id="subprojectDetailPanel">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px">
+          <h2 id="subprojectDetailTitle">Subproject Detail</h2>
+          <button class="btn" id="closeSubprojectDetail" type="button">Close</button>
+        </div>
+        <div id="subprojectDetail"></div>
+      </div>
+      <div class="panel" style="margin-top:14px"><h2>Material Comparison</h2><div id="materialComparison"></div></div>
+      <div class="panel" style="margin-top:14px"><h2>Cost By Type</h2><div id="typeSummary"></div></div>
+    </section>
+
+    <section id="setup" class="tab hidden">
+      <div class="grid cols-2">
+        <form class="panel" id="projectForm">
+          <h2>Master Project</h2>
+          <label>Project Code</label><input name="project_code" placeholder="Oakland 17-20" required>
+          <label>Project Name</label><input name="name" placeholder="Oakland 17-20" required>
+          <label>Customer</label><input name="customer" placeholder="Hunt Oil">
+          <label>Location</label><input name="location" placeholder="Oakland 17-20">
+          <label>Customer Provided PO #</label><input name="customer_po" placeholder="PO number">
+          <label>Base Contract Value</label><input name="contract_value" type="number" step="0.01" value="0" readonly>
+          <label>Description</label><textarea name="description" placeholder="Scope notes, project summary, or contract description"></textarea>
+          <label>Project Rate Set</label><select name="rate_set_id" id="projectRateSet"></select>
+          <div class="actions">
+            <button class="btn primary" id="saveProjectBtn" type="submit">Save Project</button>
+            <button class="btn" id="newProjectBtn" type="button">New Master Project</button>
+            <button class="btn hidden" id="cancelNewProjectBtn" type="button">Cancel New</button>
+          </div>
+        </form>
+        <form class="panel" id="subprojectForm">
+          <h2>Subproject</h2>
+          <label>Job / Order #</label><input name="job_number" placeholder="304">
+          <label>Code</label><input name="code" placeholder="FC">
+          <label>Name</label><input name="name" placeholder="Flow Computer">
+          <label>Pricing Method</label><select name="pricing_type"><option>Fixed</option><option>T&M</option></select>
+          <label>Contract Value</label><input name="contract_value" type="number" step="0.01" value="0">
+          <label>Labor Hours Budget</label><input name="budget_labor_hours" type="number" step="0.01" value="0">
+          <label>Budget Labor</label><input name="budget_labor" type="number" step="0.01" value="0">
+          <label>Budget Material</label><input name="budget_material" type="number" step="0.01" value="0">
+          <label>Budget Equipment</label><input name="budget_equipment" type="number" step="0.01" value="0">
+          <div class="actions"><button class="btn primary" type="submit">Add Subproject</button></div>
+        </form>
+      </div>
+      <form class="panel" id="coForm" style="margin-top:14px">
+        <h2>Change Order</h2>
+        <div class="grid cols-4">
+          <div><label>Subproject</label><select name="subproject_id" id="coSubproject"></select></div>
+          <div><label>CO Number</label><input name="co_number" placeholder="CO-001"></div>
+          <div><label>Job / Order #</label><input name="job_number" placeholder="304-CO1"></div>
+          <div><label>Pricing Method</label><select name="pricing_type" id="coPricingType"><option>Fixed</option><option>T&M</option></select></div>
+        </div>
+        <div class="grid cols-4">
+          <div><label>Status</label><select name="status"><option>Pending</option><option>Approved</option><option>Rejected</option><option>Billed</option></select></div>
+          <div><label>Approved Value</label><input name="approved_value" id="coApprovedValue" type="number" step="0.01" value="0"></div>
+        </div>
+        <label>Title</label><input name="title" placeholder="Added instruments / wiring">
+        <label>Quoted Value</label><input name="quoted_value" type="number" step="0.01" value="0">
+        <div class="actions"><button class="btn primary" type="submit">Add Change Order</button></div>
+      </form>
+      <div class="panel" style="margin-top:14px">
+        <h2>Edit Subprojects</h2>
+        <div class="table-wrap"><table id="subprojectEditTable"></table></div>
+      </div>
+      <div class="panel" style="margin-top:14px">
+        <h2>Internal Raw Rates</h2>
+        <div class="grid cols-4">
+          <div><label>Rate Set</label><select id="rateSetSelect"></select></div>
+          <div><label>Type</label><select id="rateType"><option>Labor</option><option>Equipment</option></select></div>
+          <div><label>Category</label><input id="rateCategory" placeholder="Foreman ST"></div>
+          <div><label>Raw Rate</label><input id="rateRaw" type="number" step="0.01" value="0"></div>
+        </div>
+        <div class="actions"><button class="btn primary" id="addRate" type="button">Add Rate</button></div>
+        <div class="table-wrap" style="margin-top:12px"><table id="rateEditTable"></table></div>
+      </div>
+    </section>
+
+    <section id="import" class="tab hidden">
+      <form class="panel" id="importForm">
+        <h2>Import Field Wise</h2>
+        <p class="muted">Upload one or more Field Wise job summary Excel files or Field Wise field ticket PDFs. Imported records go into Review Costs until coded.</p>
+        <label>Field Wise Files</label><input type="file" name="file" accept=".xlsx,.pdf" multiple required>
+        <div class="actions"><button class="btn primary" type="submit">Import</button></div>
+        <p id="importResult" class="muted"></p>
+      </form>
+      <div class="panel" style="margin-top:14px">
+        <h2>Imported Files</h2>
+        <div class="table-wrap"><table id="importHistoryTable"></table></div>
+      </div>
+      <div class="panel" style="margin-top:14px">
+        <h2>Field Ticket Lines</h2>
+        <p class="muted">Expand a ticket to correct individual labor, equipment, or material lines when the ticket was written against the wrong job.</p>
+        <div id="fieldTicketLineFilters"></div>
+        <div class="table-wrap"><table id="fieldTicketLinesTable"></table></div>
+      </div>
+    </section>
+
+    <section id="review" class="tab hidden">
+      <div class="panel">
+        <h2>Review Exceptions</h2>
+        <p class="muted">Only records that need attention show here: missing subproject, missing internal rate, or uncoded cost type.</p>
+        <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px"><input id="showAllCosts" type="checkbox" style="width:auto"> Show all cost records</label>
+        <div class="table-wrap"><table id="costTable"></table></div>
+      </div>
+    </section>
+
+    <section id="invoices" class="tab hidden">
+      <form class="panel" id="invoiceForm">
+        <h2>Vendor Invoice</h2>
+        <p class="muted">Upload a readable vendor invoice PDF, or enter an invoice manually below.</p>
+        <label>Vendor Invoice PDFs</label><input type="file" id="vendorInvoiceFile" accept=".pdf" multiple>
+        <div class="actions"><button class="btn primary" id="importVendorInvoice" type="button">Import Vendor PDF(s)</button></div>
+        <p id="vendorImportResult" class="muted"></p>
+        <div class="grid cols-4">
+          <div><label>Subproject</label><select name="subproject_id" id="invoiceSubproject"></select></div>
+          <div><label>Change Order</label><select name="change_order_id" id="invoiceCo"></select></div>
+          <div><label>Vendor</label><input name="vendor" placeholder="Graybar"></div>
+          <div><label>Invoice #</label><input name="ticket_or_invoice"></div>
+        </div>
+        <div class="grid cols-4">
+          <div><label>Date</label><input name="record_date" type="date"></div>
+          <div><label>Cost Type</label><select name="cost_type"><option>Material</option><option>Rental</option><option>Equipment</option><option>Labor</option><option>Other</option></select></div>
+          <div><label>Amount</label><input name="amount" type="number" step="0.01" value="0"></div>
+          <div><label>Status</label><select name="status"><option>Pending</option><option>Approved</option><option>Paid</option><option>Disputed</option></select></div>
+        </div>
+        <label>Description</label><textarea name="description"></textarea>
+        <div class="actions"><button class="btn primary" type="submit">Save Invoice</button></div>
+      </form>
+      <div class="panel" style="margin-top:14px">
+        <h2>Vendor Invoice Lines</h2>
+        <div id="vendorInvoiceLineFilters"></div>
+        <div class="table-wrap"><table id="vendorInvoiceLinesTable"></table></div>
+      </div>
+    </section>
+
+    <section id="billing" class="tab hidden">
+      <form class="panel" id="customerInvoiceForm">
+        <h2>Customer Invoice</h2>
+        <div class="grid cols-4">
+          <div><label>Subproject</label><select name="subproject_id" id="billingSubproject"></select></div>
+          <div><label>Change Order</label><select name="change_order_id" id="billingCo"></select></div>
+          <div><label>Invoice #</label><input name="invoice_number" placeholder="INV-1001"></div>
+          <div><label>Billing Type</label><select name="billing_type"><option>Progress</option><option>Base Contract</option><option>Change Order</option><option>T&M</option><option>Retainage</option><option>Final</option></select></div>
+        </div>
+        <div class="grid cols-4">
+          <div><label>Invoice Date</label><input name="invoice_date" type="date"></div>
+          <div><label>Due Date</label><input name="due_date" type="date"></div>
+          <div><label>Status</label><select name="status"><option>Draft</option><option>Sent</option><option>Partial</option><option>Paid</option><option>Overdue</option><option>Void</option></select></div>
+          <div><label>Invoice Amount</label><input name="amount" type="number" step="0.01" value="0"></div>
+        </div>
+        <div class="grid cols-4">
+          <div><label>Paid Amount</label><input name="paid_amount" type="number" step="0.01" value="0"></div>
+        </div>
+        <label>Notes</label><textarea name="notes" placeholder="Billing notes, customer comments, payment reference"></textarea>
+        <div class="actions"><button class="btn primary" type="submit">Add Customer Invoice</button></div>
+      </form>
+      <div class="panel" style="margin-top:14px">
+        <h2>Customer Invoice Tracking</h2>
+        <div id="customerInvoiceSummary"></div>
+        <div class="table-wrap" style="margin-top:12px"><table id="customerInvoiceTable"></table></div>
+      </div>
+    </section>
+
+    <section id="bids" class="tab hidden">
+      <div class="panel">
+        <h2>Bid Tracking</h2>
+        <div class="grid cols-4" id="bidKpis"></div>
+      </div>
+      <div class="grid cols-2" style="margin-top:14px">
+        <div class="panel"><h2>Pipeline By Stage</h2><div id="bidStageSummary"></div></div>
+        <div class="panel"><h2>Estimator Workload</h2><div id="bidEstimatorSummary"></div></div>
+      </div>
+      <form class="panel" id="bidForm" style="margin-top:14px">
+        <h2>Add Bid / RFQ</h2>
+        <div class="grid cols-4">
+          <div><label>RFQ No.</label><input name="rfq_no" placeholder="RFQ-1012" required></div>
+          <div><label>Date Received</label><input name="date_received" type="date"></div>
+          <div><label>Customer</label><input name="customer"></div>
+          <div><label>Project Name</label><input name="project_name" required></div>
+        </div>
+        <div class="grid cols-4">
+          <div><label>Estimator</label><input name="estimator" placeholder="Ross Stewart"></div>
+          <div><label>Stage</label><select name="stage"><option>New RFQ</option><option>Go/No-Go</option><option>Estimating</option><option>Submitted</option><option>Award Pending</option><option>Closed</option></select></div>
+          <div><label>Bid Due Date</label><input name="bid_due_date" type="date"></div>
+          <div><label>Go / No-Go</label><select name="go_no_go"><option>Go</option><option>No Go</option><option>Review</option></select></div>
+        </div>
+        <div class="grid cols-4">
+          <div><label>Estimated Cost</label><input name="estimated_cost" type="number" step="0.01" value="0"></div>
+          <div><label>Target Margin</label><input name="target_margin" type="number" step="0.01" value="0.25"></div>
+          <div><label>Probability</label><input name="probability" type="number" step="0.01" value="0.25"></div>
+          <div><label>Outcome</label><select name="outcome"><option>Pending</option><option>Won</option><option>Lost</option></select></div>
+        </div>
+        <label>Notes</label><textarea name="notes"></textarea>
+        <div class="actions"><button class="btn primary" type="submit">Add Bid</button></div>
+      </form>
+      <div class="panel" style="margin-top:14px">
+        <h2>Bid List</h2>
+        <div id="bidFilters"></div>
+        <div class="table-wrap"><table id="bidTable"></table></div>
+      </div>
+    </section>
+
+    <section id="admin" class="tab hidden">
+      <div class="grid cols-2">
+        <form class="panel" id="userForm">
+          <h2>Add User</h2>
+          <label>Username</label><input name="username" required>
+          <label>Display Name</label><input name="display_name">
+          <label>Password</label><input name="password" type="password" required>
+          <label>Role</label><select name="role"><option>User</option><option>Read Only</option><option>Admin</option></select>
+          <div class="actions"><button class="btn primary" type="submit">Add User</button></div>
+        </form>
+        <div class="panel">
+          <h2>Users</h2>
+          <div class="table-wrap"><table id="usersTable"></table></div>
+        </div>
+      </div>
+    </section>
+  </main>
+  <div class="modal-backdrop hidden" id="unsavedModal">
+    <div class="modal">
+      <h2>Unsaved changes</h2>
+      <p>You have changes that have not been saved. Save them before leaving, or discard the changes and continue.</p>
+      <div class="actions">
+        <button class="btn primary" id="stayOnPage" type="button">Stay Here</button>
+        <button class="btn" id="discardChanges" type="button">Discard Changes</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let state = { projects: [], projectId: null, subprojects: [], changeOrders: [], internalRates: [], rateSets: [], currentUser: null };
+    let openSubprojectDetailId = null;
+    let masterDetailIsOpen = false;
+    let hasUnsavedChanges = false;
+    let projectCreateMode = false;
+    let selectedDashboardSubprojectId = null;
+    let selectedDashboardChangeOrderId = null;
+    let invoiceGroupSeq = 0;
+    let costFilterSeq = 0;
+    const money = v => Number(v || 0).toLocaleString(undefined, { style: 'currency', currency: 'USD' });
+    const pct = v => `${(Number(v || 0) * 100).toFixed(1)}%`;
+    const htmlEscape = v => String(v ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+    const api = async (url, opts={}) => {
+      const res = await fetch(url, opts);
+      if (res.status === 401) {
+        window.location.href = '/login';
+        throw new Error('Login required');
+      }
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Request failed');
+      return data;
+    };
+    const formDataObj = form => Object.fromEntries(new FormData(form).entries());
+    const markSaved = () => { hasUnsavedChanges = false; };
+    const setProjectCreateMode = enabled => {
+      projectCreateMode = enabled;
+      const form = document.getElementById('projectForm');
+      const saveBtn = document.getElementById('saveProjectBtn');
+      const cancelBtn = document.getElementById('cancelNewProjectBtn');
+      if (saveBtn) saveBtn.textContent = enabled ? 'Create Project' : 'Save Project';
+      if (cancelBtn) cancelBtn.classList.toggle('hidden', !enabled);
+      if (form && enabled) {
+        form.reset();
+        const rateSelect = document.getElementById('projectRateSet');
+        if (rateSelect && state.projects.length) {
+          const current = state.projects.find(p => p.id === state.projectId);
+          if (current?.rate_set_id) rateSelect.value = current.rate_set_id;
+        }
+        const contract = form.querySelector('[name="contract_value"]');
+        if (contract) contract.value = '0';
+      }
+    };
+    const isTemporaryViewControl = target => {
+      return target.closest('.cost-filter') || target.id === 'showAllCosts';
+    };
+    const markUnsaved = event => {
+      if (isTemporaryViewControl(event.target)) return;
+      if (event.target.matches('input, textarea, select') && event.target.type !== 'file' && event.target.id !== 'projectSelect') {
+        hasUnsavedChanges = true;
+      }
+    };
+    const confirmDiscard = () => {
+      if (!hasUnsavedChanges) return Promise.resolve(true);
+      const modal = document.getElementById('unsavedModal');
+      modal.classList.remove('hidden');
+      return new Promise(resolve => {
+        document.getElementById('stayOnPage').onclick = () => {
+          modal.classList.add('hidden');
+          resolve(false);
+        };
+        document.getElementById('discardChanges').onclick = async () => {
+          modal.classList.add('hidden');
+          markSaved();
+          document.querySelectorAll('form').forEach(form => form.reset());
+          await refresh();
+          resolve(true);
+        };
+      });
+    };
+    window.addEventListener('beforeunload', event => {
+      if (!hasUnsavedChanges) return;
+      event.preventDefault();
+      event.returnValue = '';
+    });
+    document.addEventListener('input', markUnsaved);
+    document.addEventListener('change', markUnsaved);
+
+    document.querySelectorAll('nav button').forEach(btn => btn.addEventListener('click', async () => {
+      if (!(await confirmDiscard())) return;
+      openTab(btn.dataset.tab);
+    }));
+
+    function updateNavForTab(tabName) {
+      const projectTabs = ['dashboard','setup','import','review','invoices','billing'];
+      const inProjectArea = projectTabs.includes(tabName);
+      document.querySelectorAll('nav button').forEach(btn => {
+        const area = btn.dataset.navArea || '';
+        btn.classList.toggle('hidden', area === 'project' && !inProjectArea);
+      });
+    }
+
+    async function openTab(tabName) {
+      markSaved();
+      updateNavForTab(tabName);
+      document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.tab').forEach(t => t.classList.add('hidden'));
+      const navButton = document.querySelector(`nav button[data-tab="${tabName}"]`);
+      if (navButton) navButton.classList.add('active');
+      document.getElementById(tabName).classList.remove('hidden');
+      if (tabName === 'dashboard') refreshOpenDetails();
+      if (tabName === 'review') loadCosts();
+      if (tabName === 'import') { loadImportHistory(); loadFieldTicketLines(); }
+      if (tabName === 'invoices') loadVendorInvoiceLines();
+      if (tabName === 'billing') loadCustomerInvoices();
+      if (tabName === 'bids') loadBidDashboard();
+      if (tabName === 'admin') loadUsers();
+    }
+
+    document.querySelectorAll('[data-open-tab]').forEach(btn => btn.onclick = async () => {
+      if (!(await confirmDiscard())) return;
+      openTab(btn.dataset.openTab);
+    });
+    document.querySelectorAll('.home-card[data-open-tab]').forEach(card => card.onkeydown = async event => {
+      if (!['Enter', ' '].includes(event.key)) return;
+      event.preventDefault();
+      if (!(await confirmDiscard())) return;
+      openTab(card.dataset.openTab);
+    });
+    document.getElementById('homeLogo').onclick = async () => {
+      if (!(await confirmDiscard())) return;
+      openTab('home');
+    };
+    document.getElementById('systemMenuButton').onclick = event => {
+      event.stopPropagation();
+      document.getElementById('systemMenu').classList.toggle('hidden');
+    };
+    document.addEventListener('click', event => {
+      if (!event.target.closest('.system-menu-wrap')) {
+        document.getElementById('systemMenu').classList.add('hidden');
+      }
+    });
+    document.getElementById('systemAdminBtn').onclick = async () => {
+      document.getElementById('systemMenu').classList.add('hidden');
+      if (!(await confirmDiscard())) return;
+      openTab('admin');
+    };
+    document.getElementById('systemRevisionBtn').onclick = async () => {
+      document.getElementById('systemMenu').classList.add('hidden');
+      if (!(await confirmDiscard())) return;
+      window.location.href = '/developer-revision';
+    };
+    document.getElementById('systemLogoutBtn').onclick = async () => {
+      await fetch('/api/logout', { method:'POST' });
+      window.location.href = '/login';
+    };
+
+    async function loadProjects() {
+      state.projects = await api('/api/projects');
+      const sel = document.getElementById('projectSelect');
+      sel.innerHTML = state.projects.map(p => `<option value="${p.id}">${p.name}</option>`).join('');
+      const savedProjectId = Number(localStorage.getItem('selectedProjectId') || 0);
+      if (!state.projectId && savedProjectId && state.projects.some(p => p.id === savedProjectId)) state.projectId = savedProjectId;
+      if (!state.projectId && state.projects[0]) state.projectId = state.projects[0].id;
+      if (state.projectId) sel.value = state.projectId;
+      sel.onchange = async () => {
+        if (!(await confirmDiscard())) {
+          sel.value = state.projectId;
+          return;
+        }
+        markSaved();
+        setProjectCreateMode(false);
+        selectedDashboardSubprojectId = null;
+        state.projectId = Number(sel.value);
+        localStorage.setItem('selectedProjectId', state.projectId);
+        refresh();
+      };
+      await refresh();
+    }
+
+    async function refresh() {
+      if (!state.projectId) {
+        document.getElementById('kpis').innerHTML = '<div class="panel">Create a master project to begin.</div>';
+        return;
+      }
+      state.subprojects = await api(`/api/subprojects?project_id=${state.projectId}`);
+      state.changeOrders = await api(`/api/change-orders?project_id=${state.projectId}`);
+      state.rateSets = await api('/api/rate-sets');
+      state.internalRates = await api('/api/internal-rates');
+      fillSelects();
+      await loadDashboard();
+      loadSubprojectEditor();
+      loadInternalRateEditor();
+      loadImportHistory();
+      loadFieldTicketLines();
+      loadVendorInvoiceLines();
+      loadCustomerInvoices();
+      refreshOpenDetails();
+    }
+
+    function fillSelects() {
+      const spOpts = '<option value="">Unassigned</option>' + state.subprojects.map(s => `<option value="${s.id}">${s.job_number || ''} ${s.code} - ${s.name}</option>`).join('');
+      ['coSubproject','invoiceSubproject','billingSubproject'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.innerHTML = spOpts;
+      });
+      const coOpts = '<option value="">Base Contract</option>' + state.changeOrders.map(c => `<option value="${c.id}">${[c.co_number, c.job_number].filter(Boolean).join(' / ')} - ${c.title || ''}</option>`).join('');
+      ['invoiceCo','billingCo'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.innerHTML = coOpts;
+      });
+      const project = state.projects.find(p => p.id === state.projectId);
+      const rateSetOptions = state.rateSets.map(r => `<option value="${r.id}">${r.name}${r.effective_date ? ' - ' + r.effective_date : ''}</option>`).join('');
+      ['projectRateSet','rateSetSelect'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.innerHTML = rateSetOptions;
+      });
+      if (project && document.getElementById('projectRateSet')) document.getElementById('projectRateSet').value = project.rate_set_id || '';
+      if (project && document.getElementById('rateSetSelect')) document.getElementById('rateSetSelect').value = project.rate_set_id || '';
+      if (project && !projectCreateMode) {
+        const projectForm = document.getElementById('projectForm');
+        if (projectForm) {
+          ['project_code','name','customer','location','customer_po','description'].forEach(field => {
+            const input = projectForm.querySelector(`[name="${field}"]`);
+            if (input) input.value = project[field] || '';
+          });
+        }
+      }
+    }
+
+    async function loadDashboard() {
+      const s = await api(`/api/summary?project_id=${state.projectId}`);
+      const marginClass = s.margin >= .2 ? 'good' : s.margin >= .1 ? 'warn' : 'bad';
+      document.getElementById('projectBanner').innerHTML = `
+        <div class="project-banner">
+          <div class="project-title clickable" id="masterProjectBannerCard" role="button" tabindex="0">
+            <div class="eyebrow">Master Project</div>
+            <div class="name">${s.project.name}</div>
+            <div class="muted">${s.project.customer || ''} ${s.project.location ? ' / ' + s.project.location : ''}</div>
+            <div class="muted">${s.project.customer_po ? 'PO # ' + s.project.customer_po : ''}</div>
+            <div class="muted">${s.project.description || ''}</div>
+          </div>
+          ${s.subprojects.map(x => `<div class="job-chip clickable" data-banner-subproject="${x.id}" role="button" tabindex="0"><div class="job">${[x.job_number, x.code].filter(Boolean).join(' ')}</div><div class="label">${x.name}</div><div class="label">${money(x.actual_cost)} actual</div></div>`).join('')}
+        </div>`;
+      const masterProjectBannerCard = document.getElementById('masterProjectBannerCard');
+      if (masterProjectBannerCard) {
+        masterProjectBannerCard.onclick = () => loadMasterDetail();
+        masterProjectBannerCard.onkeydown = event => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            masterProjectBannerCard.click();
+          }
+        };
+      }
+      document.querySelectorAll('[data-banner-subproject]').forEach(card => {
+        card.onclick = () => {
+          selectedDashboardSubprojectId = card.dataset.bannerSubproject;
+          selectedDashboardChangeOrderId = null;
+          renderSubprojectSummary(s);
+          renderChangeOrders(s);
+          renderBillingSummary(s);
+          loadSubprojectDetail(card.dataset.bannerSubproject);
+        };
+        card.onkeydown = event => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            card.click();
+          }
+        };
+      });
+      const baseContractInput = document.querySelector('#projectForm input[name="contract_value"]');
+      if (baseContractInput) baseContractInput.value = Number(s.base_contract_value || 0).toFixed(2);
+      document.getElementById('kpis').innerHTML = `
+        <div class="panel kpi"><div class="label">Contract + Approved COs</div><div class="value">${money(s.contract_value)}</div><div class="hint">Base: ${money(s.base_contract_value)} / Approved COs: ${money(s.approved_co_value)}</div></div>
+        <div class="panel kpi"><div class="label">Raw Actual Cost</div><div class="value">${money(s.actual_cost)}</div><div class="hint">${s.record_count} cost records</div></div>
+        <div class="panel kpi"><div class="label">Projected Profit</div><div class="value ${s.profit >= 0 ? 'good' : 'bad'}">${money(s.profit)}</div><div class="hint ${marginClass}">Margin ${pct(s.margin)}</div></div>
+        <div class="panel kpi clickable" id="needsCodingKpi" role="button" tabindex="0"><div class="label">Needs Coding</div><div class="value ${s.uncoded_count ? 'warn' : 'good'}">${s.uncoded_count}</div><div class="hint">${money(s.uncoded_cost)}</div></div>`;
+      const needsCodingKpi = document.getElementById('needsCodingKpi');
+      if (needsCodingKpi) {
+        needsCodingKpi.onclick = async () => {
+          if (!(await confirmDiscard())) return;
+          openTab('review');
+        };
+        needsCodingKpi.onkeydown = event => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            needsCodingKpi.click();
+          }
+        };
+      }
+      if (selectedDashboardSubprojectId && !s.subprojects.some(x => String(x.id) === String(selectedDashboardSubprojectId))) {
+        selectedDashboardSubprojectId = null;
+      }
+      if (selectedDashboardChangeOrderId && !s.change_orders.some(x => String(x.id) === String(selectedDashboardChangeOrderId))) {
+        selectedDashboardChangeOrderId = null;
+      }
+      renderSubprojectSummary(s);
+      const showAllCos = document.getElementById('showAllCos');
+      if (showAllCos) showAllCos.onclick = () => {
+        selectedDashboardSubprojectId = null;
+        selectedDashboardChangeOrderId = null;
+        renderChangeOrders(s);
+        renderSubprojectSummary(s);
+        renderBillingSummary(s);
+      };
+      renderChangeOrders(s);
+      renderBillingSummary(s);
+      const fieldMat = Number(s.material_compare?.field_ticket_material || 0);
+      const vendorMat = Number(s.material_compare?.vendor_material || 0);
+      document.getElementById('materialComparison').innerHTML = table(
+        ['Metric','Amount'],
+        [
+          ['Field ticket material listed', money(fieldMat)],
+          ['Vendor invoice material purchased', money(vendorMat)],
+          ['Difference', money(vendorMat - fieldMat)]
+        ]
+      );
+      document.getElementById('typeSummary').innerHTML = table(['Cost Type','Amount'], s.by_type.map(x => [x.label, money(x.amount)]));
+    }
+
+    function billingForDashboardScope(summary) {
+      const selectedCo = selectedDashboardChangeOrderId ? summary.change_orders.find(x => String(x.id) === String(selectedDashboardChangeOrderId)) : null;
+      const selectedSubproject = selectedDashboardSubprojectId ? summary.subprojects.find(x => String(x.id) === String(selectedDashboardSubprojectId)) : null;
+      let label = 'Master Project';
+      let contractValue = Number(summary.contract_value || 0);
+      let invoices = summary.customer_invoices || [];
+      if (selectedCo) {
+        label = `CO ${selectedCo.co_number || ''}${selectedCo.job_number ? ' / ' + selectedCo.job_number : ''}`;
+        contractValue = Number(selectedCo.sales_value || 0);
+        invoices = invoices.filter(i => String(i.change_order_id || '') === String(selectedCo.id));
+      } else if (selectedSubproject) {
+        label = `${selectedSubproject.job_number || ''} ${selectedSubproject.code || ''}`;
+        contractValue = Number(selectedSubproject.contract_value || 0);
+        const subprojectCoIds = summary.change_orders
+          .filter(co => String(co.subproject_id || '') === String(selectedSubproject.id))
+          .map(co => String(co.id));
+        invoices = invoices.filter(i =>
+          String(i.subproject_id || '') === String(selectedSubproject.id) ||
+          subprojectCoIds.includes(String(i.change_order_id || ''))
+        );
+      }
+      const active = invoices.filter(i => i.status !== 'Void');
+      const billed = active.reduce((sum, i) => sum + Number(i.amount || 0), 0);
+      const paid = active.reduce((sum, i) => sum + Number(i.paid_amount || 0), 0);
+      const open = active
+        .filter(i => !['Draft','Paid'].includes(i.status || ''))
+        .reduce((sum, i) => sum + Math.max(0, Number(i.amount || 0) - Number(i.paid_amount || 0)), 0);
+      const remaining = Math.max(0, contractValue - billed);
+      let stage = 'Not billed';
+      if (contractValue && paid >= contractValue) stage = 'Paid in full';
+      else if (contractValue && billed >= contractValue) stage = 'Fully billed';
+      else if (billed) stage = 'Partially billed';
+      return { label, contractValue, billed, paid, open, remaining, invoiceCount: active.length, stage };
+    }
+
+    function renderBillingSummary(summary) {
+      const billing = billingForDashboardScope(summary);
+      const billingSummaryEl = document.getElementById('billingSummary');
+      if (!billingSummaryEl) return;
+      const billedPct = billing.contractValue ? billing.billed / billing.contractValue : 0;
+      const paidPct = billing.contractValue ? billing.paid / billing.contractValue : 0;
+      billingSummaryEl.innerHTML = `
+        <div class="muted" style="margin-bottom:8px">Showing invoicing for ${htmlEscape(billing.label)}</div>
+        <div class="grid cols-4" style="margin-top:8px">
+          <div class="kpi"><div class="label">Billing Stage</div><div class="value" style="font-size:22px">${billing.stage}</div><div class="hint">${billing.invoiceCount} customer invoice(s)</div></div>
+          <div class="kpi"><div class="label">Invoiced Amount</div><div class="value">${money(billing.billed)}</div><div class="hint">${pct(billedPct)} of selected value</div><div class="bar"><span style="width:${Math.min(100, billedPct * 100)}%"></span></div></div>
+          <div class="kpi"><div class="label">Paid Amount</div><div class="value">${money(billing.paid)}</div><div class="hint">${pct(paidPct)} of selected value</div><div class="bar"><span style="width:${Math.min(100, paidPct * 100)}%"></span></div></div>
+          <div class="kpi"><div class="label">Open AR</div><div class="value ${Number(billing.open || 0) ? 'warn' : 'good'}">${money(billing.open)}</div><div class="hint">Remaining to bill ${money(billing.remaining)}</div></div>
+        </div>`;
+      const billingBtn = document.getElementById('openBillingFromDashboard');
+      if (billingBtn) billingBtn.onclick = async () => {
+        if (!(await confirmDiscard())) return;
+        openTab('billing');
+      };
+    }
+
+    function renderSubprojectSummary(summary) {
+      document.getElementById('subprojectSummary').innerHTML = subprojectTable(summary.subprojects, selectedDashboardSubprojectId);
+      document.querySelectorAll('#subprojectSummary [data-open-subproject]').forEach(btn => btn.onclick = () => {
+        selectedDashboardSubprojectId = btn.dataset.openSubproject;
+        selectedDashboardChangeOrderId = null;
+        renderSubprojectSummary(summary);
+        renderChangeOrders(summary);
+        renderBillingSummary(summary);
+        loadSubprojectDetail(btn.dataset.openSubproject);
+      });
+      document.querySelectorAll('#subprojectSummary [data-select-subproject]').forEach(row => row.onclick = event => {
+        if (event.target.closest('button')) return;
+        selectedDashboardSubprojectId = row.dataset.selectSubproject;
+        selectedDashboardChangeOrderId = null;
+        renderSubprojectSummary(summary);
+        renderChangeOrders(summary);
+        renderBillingSummary(summary);
+      });
+    }
+
+    function renderChangeOrders(summary) {
+      const selected = selectedDashboardSubprojectId ? summary.subprojects.find(x => String(x.id) === String(selectedDashboardSubprojectId)) : null;
+      const orders = selected ? summary.change_orders.filter(x => String(x.subproject_id || '') === String(selected.id)) : summary.change_orders;
+      const title = document.getElementById('coSummaryTitle');
+      const showAll = document.getElementById('showAllCos');
+      if (title) title.textContent = selected ? `Change Orders - ${selected.job_number || ''} ${selected.code}` : 'Change Orders';
+      if (showAll) showAll.classList.toggle('hidden', !selected);
+      document.getElementById('coSummary').innerHTML = orders.length
+        ? `<table><thead><tr><th>CO</th><th>Job / Order #</th><th>Pricing</th><th>Subproject</th><th>Status</th><th>Labor Hrs</th><th>Sales Value</th><th>Raw Actual</th><th>Profit</th></tr></thead><tbody>${orders.map(x => {
+            const isSelected = String(selectedDashboardChangeOrderId || '') === String(x.id);
+            return `<tr class="selectable-row ${isSelected ? 'selected' : ''}" data-select-co="${x.id}">
+              <td>${x.co_number || ''}</td>
+              <td>${x.job_number || ''}</td>
+              <td>${x.pricing_type || 'Fixed'}</td>
+              <td>${x.subproject_code || ''}</td>
+              <td>${x.status || ''}</td>
+              <td>${Number(x.labor_hours_used || 0).toFixed(2)}</td>
+              <td>${money(x.sales_value)}</td>
+              <td>${money(x.actual_cost)}</td>
+              <td>${money(Number(x.sales_value || 0) - Number(x.actual_cost || 0))}</td>
+            </tr>`;
+          }).join('')}</tbody></table>`
+        : '<table><tbody><tr><td>No change orders for this subproject.</td></tr></tbody></table>';
+      document.querySelectorAll('#coSummary [data-select-co]').forEach(row => row.onclick = () => {
+        selectedDashboardChangeOrderId = row.dataset.selectCo;
+        const selectedCo = summary.change_orders.find(x => String(x.id) === String(selectedDashboardChangeOrderId));
+        if (selectedCo?.subproject_id) selectedDashboardSubprojectId = String(selectedCo.subproject_id);
+        renderSubprojectSummary(summary);
+        renderChangeOrders(summary);
+        renderBillingSummary(summary);
+        if (selectedCo?.subproject_id) loadSubprojectDetail(selectedCo.subproject_id, true, selectedCo.id);
+      });
+    }
+
+    function table(headers, data) {
+      return `<table><thead><tr>${headers.map(h => `<th>${h}</th>`).join('')}</tr></thead><tbody>${data.map(r => `<tr>${r.map(c => `<td>${c}</td>`).join('')}</tr>`).join('')}</tbody></table>`;
+    }
+
+    function invoiceKey(row) {
+      return [row.source_file || '', row.ticket_or_invoice || '', row.vendor || '', row.record_date || ''].join('|');
+    }
+
+    function fieldWiseKey(row) {
+      return [row.source_file || '', row.ticket_or_invoice || '', row.record_date || ''].join('|');
+    }
+
+    function costRecordGroups(rows) {
+      const groups = [];
+      const byKey = {};
+      rows.forEach(row => {
+        let key = '';
+        let type = '';
+        if (row.source === 'Vendor Invoice') {
+          key = `vendor|${invoiceKey(row)}`;
+          type = 'invoice';
+        } else if (row.source === 'Field Wise' || row.source === 'Field Wise PDF') {
+          key = `fieldwise|${fieldWiseKey(row)}`;
+          type = 'fieldwise';
+        } else {
+          groups.push({ type: 'single', rows: [row] });
+          return;
+        }
+        if (!byKey[key]) {
+          byKey[key] = { type, key, id: `invoiceGroup${++invoiceGroupSeq}`, rows: [] };
+          groups.push(byKey[key]);
+        }
+        byKey[key].rows.push(row);
+      });
+      return groups;
+    }
+
+    function vendorInvoiceGroups(rows) {
+      const groups = [];
+      const byKey = {};
+      rows.forEach(row => {
+        if (row.source !== 'Vendor Invoice') {
+          groups.push({ type: 'single', rows: [row] });
+          return;
+        }
+        const key = invoiceKey(row);
+        if (!byKey[key]) {
+          byKey[key] = { type: 'invoice', key, id: `invoiceGroup${++invoiceGroupSeq}`, rows: [] };
+          groups.push(byKey[key]);
+        }
+        byKey[key].rows.push(row);
+      });
+      return groups;
+    }
+
+    function invoiceSubprojectLabel(rows) {
+      const labels = [...new Set(rows.map(r => [r.job_number, r.subproject_code].filter(Boolean).join(' ')).filter(Boolean))];
+      if (!labels.length) return '';
+      return labels.length === 1 ? labels[0] : 'Multiple';
+    }
+
+    function invoiceSummaryButton(group, label) {
+      return `<span class="invoice-toggle" data-toggle-icon="${group.id}">+</span>${label}`;
+    }
+
+    function invoiceSubprojectSelect(group) {
+      const first = group.rows[0] || {};
+      const options = '<option value="">Unassigned</option>' + state.subprojects.map(s => `<option value="${s.id}" ${String(first.subproject_id || '') === String(s.id) ? 'selected' : ''}>${s.job_number || ''} ${s.code} - ${s.name}</option>`).join('');
+      return `<div style="display:flex;gap:6px;align-items:center;min-width:220px" onclick="event.stopPropagation()">
+        <select data-invoice-subproject="${group.id}" style="min-width:160px">${options}</select>
+        <button class="btn" style="padding:7px 9px" type="button" data-save-invoice-subproject="${group.id}" data-source-file="${first.source_file || ''}" data-invoice="${first.ticket_or_invoice || ''}" data-vendor="${first.vendor || ''}">Save</button>
+      </div>`;
+    }
+
+    function commonGroupValue(rows, field) {
+      const values = [...new Set(rows.map(r => String(r[field] || '')))];
+      return values.length === 1 ? values[0] : '';
+    }
+
+    function changeOrderOptionsForSubproject(subprojectId, selectedValue='') {
+      const selected = String(selectedValue || '');
+      const filtered = state.changeOrders.filter(c => !subprojectId || String(c.subproject_id || '') === String(subprojectId));
+      return '<option value="">Base</option>' + filtered.map(c => `<option value="${c.id}" ${selected === String(c.id) ? 'selected' : ''}>${[c.co_number, c.job_number].filter(Boolean).join(' / ')}</option>`).join('');
+    }
+
+    function updateChangeOrderSelectForSubproject(coSelect, subprojectId, selectedValue=null) {
+      if (!coSelect) return;
+      const current = selectedValue === null ? coSelect.value : selectedValue;
+      coSelect.innerHTML = changeOrderOptionsForSubproject(subprojectId, current);
+      if (current && ![...coSelect.options].some(opt => opt.value === String(current))) {
+        coSelect.value = '';
+      }
+    }
+
+    function groupAssignmentSelect(group, field) {
+      const selected = commonGroupValue(group.rows, field);
+      if (field === 'subproject_id') {
+        return `<select data-group-field="${field}" data-group="${group.id}" onclick="event.stopPropagation()">
+          <option value="">Unassigned</option>
+          ${state.subprojects.map(s => `<option value="${s.id}" ${selected === String(s.id) ? 'selected' : ''}>${s.job_number || ''} ${s.code}</option>`).join('')}
+        </select>`;
+      }
+      const groupSubprojectId = commonGroupValue(group.rows, 'subproject_id');
+      return `<select data-group-field="${field}" data-group="${group.id}" onclick="event.stopPropagation()">
+        ${changeOrderOptionsForSubproject(groupSubprojectId, selected)}
+      </select>`;
+    }
+
+    function groupSaveButton(group) {
+      const ids = group.rows.map(r => r.id).join(',');
+      return `<button class="btn" type="button" data-save-cost-group="${group.id}" data-record-ids="${ids}" onclick="event.stopPropagation()">Save All</button>`;
+    }
+
+    function pdfLink(row) {
+      if (!row.source_file) return '';
+      const viewerHref = `/pdf-viewer/${encodeURIComponent(row.source_file)}`;
+      const rawHref = `/uploads/${encodeURIComponent(row.source_file)}`;
+      return `<span onclick="event.stopPropagation();"><a class="pdf-link" href="${viewerHref}">View</a> <a class="pdf-link" href="${rawHref}" target="_blank" rel="noopener">Original</a></span>`;
+    }
+
+    function wireInvoiceToggles(scope=document) {
+      scope.querySelectorAll('[data-toggle-invoice]').forEach(row => {
+        row.onclick = event => {
+          if (event.target.closest('a, button, select, input')) return;
+          const groupId = row.dataset.toggleInvoice;
+          const isOpen = row.dataset.open === 'true';
+          row.dataset.open = isOpen ? 'false' : 'true';
+          const icon = row.querySelector(`[data-toggle-icon="${groupId}"]`);
+          if (icon) icon.textContent = isOpen ? '+' : '-';
+          document.querySelectorAll(`[data-invoice-detail="${groupId}"]`).forEach(detail => detail.classList.toggle('hidden', isOpen));
+        };
+      });
+    }
+
+    function wireInvoiceSubprojectSaves(scope=document) {
+      scope.querySelectorAll('[data-save-invoice-subproject]').forEach(btn => {
+        btn.onclick = async event => {
+          event.stopPropagation();
+          const groupId = btn.dataset.saveInvoiceSubproject;
+          const select = scope.querySelector(`[data-invoice-subproject="${groupId}"]`) || document.querySelector(`[data-invoice-subproject="${groupId}"]`);
+          await api('/api/vendor-invoice/subproject', {
+            method: 'POST',
+            body: JSON.stringify({
+              project_id: state.projectId,
+              source_file: btn.dataset.sourceFile,
+              ticket_or_invoice: btn.dataset.invoice,
+              vendor: btn.dataset.vendor,
+              subproject_id: select ? select.value : ''
+            })
+          });
+          markSaved();
+          await refresh();
+        };
+      });
+    }
+
+    function groupedReadonlyCostTable(headers, records, includeSubproject=false) {
+      const groups = costRecordGroups(records);
+      const body = groups.map(group => {
+        if (group.type === 'single') {
+          const r = group.rows[0];
+          const cells = [
+            r.record_date || '',
+            ...(includeSubproject ? [[r.job_number, r.subproject_code].filter(Boolean).join(' ')] : []),
+            r.source || '',
+            r.ticket_or_invoice || '',
+            pdfLink(r),
+            r.cost_type || '',
+            r.item || r.description || '',
+            Number(r.qty || 0).toFixed(2),
+            money(r.sales_rate || r.rate),
+            money(r.sales_amount || r.amount),
+            money(r.amount)
+          ];
+          return `<tr>${cells.map(c => `<td>${c}</td>`).join('')}</tr>`;
+        }
+        const first = group.rows[0];
+        const total = group.rows.reduce((sum, r) => sum + Number(r.amount || 0), 0);
+        const salesTotal = group.rows.reduce((sum, r) => sum + Number(r.sales_amount || r.amount || 0), 0);
+        const qtyTotal = group.rows.reduce((sum, r) => sum + Number(r.qty || 0), 0);
+        const groupLabel = group.type === 'fieldwise' ? 'Field Wise Ticket' : 'Vendor Invoice';
+        const groupType = group.type === 'fieldwise' ? 'Imported ticket lines' : 'Material';
+        const summary = [
+          first.record_date || '',
+          ...(includeSubproject ? [invoiceSubprojectLabel(group.rows)] : []),
+          invoiceSummaryButton(group, groupLabel),
+          first.ticket_or_invoice || '',
+          pdfLink(first),
+          groupType,
+          `<span class="invoice-line-count">${group.rows.length} line item(s)</span>`,
+          qtyTotal.toFixed(2),
+          '',
+          money(salesTotal),
+          money(total)
+        ];
+        const details = group.rows.map(r => {
+          const cells = [
+            r.record_date || '',
+            ...(includeSubproject ? [[r.job_number, r.subproject_code].filter(Boolean).join(' ')] : []),
+            r.source || '',
+            r.ticket_or_invoice || '',
+            pdfLink(r),
+            r.cost_type || '',
+            r.item || r.description || '',
+            Number(r.qty || 0).toFixed(2),
+            money(r.sales_rate || r.rate),
+            money(r.sales_amount || r.amount),
+            money(r.amount)
+          ];
+          return `<tr class="invoice-detail hidden" data-invoice-detail="${group.id}">${cells.map(c => `<td>${c}</td>`).join('')}</tr>`;
+        }).join('');
+        return `<tr class="invoice-summary" data-toggle-invoice="${group.id}">${summary.map(c => `<td>${c}</td>`).join('')}</tr>${details}`;
+      }).join('');
+      return `<table><thead><tr>${headers.map(h => `<th>${h}</th>`).join('')}</tr></thead><tbody>${body}</tbody></table>`;
+    }
+
+    function uniqueOptions(records, getter) {
+      return [...new Set(records.map(getter).filter(Boolean))].sort((a, b) => String(a).localeCompare(String(b)));
+    }
+
+    function optionList(values, selectedValue) {
+      const selected = String(selectedValue || '');
+      return values.map(v => `<option ${String(v) === selected ? 'selected' : ''}>${htmlEscape(v)}</option>`).join('');
+    }
+
+    function costRecordFilterMarkup(filterId, records, includeSubproject=false) {
+      const sourceOptions = uniqueOptions(records, r => r.source || '');
+      const typeOptions = uniqueOptions(records, r => r.cost_type || '');
+      const subprojectOptions = uniqueOptions(records, r => [r.job_number, r.subproject_code].filter(Boolean).join(' '));
+      return `<div class="cost-filter" data-cost-filter="${filterId}">
+        <div class="cost-filter-bar">
+          <div><label>Search</label><input data-cost-search="${filterId}" placeholder="Ticket, item, description, vendor, file"></div>
+          ${includeSubproject ? `<div><label>Subproject</label><select data-cost-subproject="${filterId}"><option value="">All</option>${subprojectOptions.map(v => `<option value="${htmlEscape(v)}">${htmlEscape(v)}</option>`).join('')}</select></div>` : ''}
+          <div><label>Source</label><select data-cost-source="${filterId}"><option value="">All</option>${sourceOptions.map(v => `<option value="${htmlEscape(v)}">${htmlEscape(v)}</option>`).join('')}</select></div>
+          <div><label>Type</label><select data-cost-type="${filterId}"><option value="">All</option>${typeOptions.map(v => `<option value="${htmlEscape(v)}">${htmlEscape(v)}</option>`).join('')}</select></div>
+          <button class="btn" type="button" data-cost-clear="${filterId}">Clear</button>
+        </div>
+        <div class="cost-filter-count" data-cost-count="${filterId}"></div>
+        <div class="table-wrap" data-cost-table="${filterId}"></div>
+      </div>`;
+    }
+
+    function initCostRecordFilter(scope, filterId, records, headers, includeSubproject=false) {
+      const container = scope.querySelector(`[data-cost-filter="${filterId}"]`);
+      if (!container) return;
+      const searchEl = container.querySelector(`[data-cost-search="${filterId}"]`);
+      const sourceEl = container.querySelector(`[data-cost-source="${filterId}"]`);
+      const typeEl = container.querySelector(`[data-cost-type="${filterId}"]`);
+      const subprojectEl = container.querySelector(`[data-cost-subproject="${filterId}"]`);
+      const countEl = container.querySelector(`[data-cost-count="${filterId}"]`);
+      const tableEl = container.querySelector(`[data-cost-table="${filterId}"]`);
+      const clearEl = container.querySelector(`[data-cost-clear="${filterId}"]`);
+      const draw = () => {
+        const query = String(searchEl?.value || '').trim().toLowerCase();
+        const source = sourceEl?.value || '';
+        const type = typeEl?.value || '';
+        const subproject = subprojectEl?.value || '';
+        const filtered = records.filter(r => {
+          const subLabel = [r.job_number, r.subproject_code].filter(Boolean).join(' ');
+          const haystack = [
+            r.record_date, r.source, r.source_file, r.ticket_or_invoice, r.vendor,
+            r.cost_type, r.item, r.description, r.raw_cost_source, subLabel
+          ].join(' ').toLowerCase();
+          return (!query || haystack.includes(query)) &&
+            (!source || r.source === source) &&
+            (!type || r.cost_type === type) &&
+            (!subproject || subLabel === subproject);
+        });
+        countEl.textContent = `Showing ${filtered.length} of ${records.length} cost record(s)`;
+        tableEl.innerHTML = filtered.length
+          ? groupedReadonlyCostTable(headers, filtered, includeSubproject)
+          : '<table><tbody><tr><td>No cost records match these filters.</td></tr></tbody></table>';
+        wireInvoiceToggles(tableEl);
+      };
+      [searchEl, sourceEl, typeEl, subprojectEl].filter(Boolean).forEach(el => {
+        el.oninput = draw;
+        el.onchange = draw;
+      });
+      if (clearEl) clearEl.onclick = () => {
+        if (searchEl) searchEl.value = '';
+        if (sourceEl) sourceEl.value = '';
+        if (typeEl) typeEl.value = '';
+        if (subprojectEl) subprojectEl.value = '';
+        draw();
+      };
+      draw();
+    }
+
+    function vendorInvoiceLineFilterMarkup(filterId, lines) {
+      const vendorOptions = uniqueOptions(lines, r => r.vendor || '');
+      const subprojectOptions = uniqueOptions(lines, r => [r.job_number, r.subproject_code].filter(Boolean).join(' '));
+      return `<div class="cost-filter" data-vendor-filter="${filterId}">
+        <div class="cost-filter-bar">
+          <div><label>Search</label><input data-vendor-search="${filterId}" placeholder="Invoice, item, description, vendor, file"></div>
+          <div><label>Vendor</label><select data-vendor-name="${filterId}"><option value="">All</option>${vendorOptions.map(v => `<option value="${htmlEscape(v)}">${htmlEscape(v)}</option>`).join('')}</select></div>
+          <div><label>Subproject</label><select data-vendor-subproject="${filterId}"><option value="">All</option>${subprojectOptions.map(v => `<option value="${htmlEscape(v)}">${htmlEscape(v)}</option>`).join('')}</select></div>
+          <div><label>Date</label><input type="date" data-vendor-date="${filterId}"></div>
+          <button class="btn" type="button" data-vendor-clear="${filterId}">Clear</button>
+        </div>
+        <div class="filter-summary">
+          <div class="summary-pill"><div class="summary-label">Lines Shown</div><div class="summary-value" data-vendor-count="${filterId}">0 of ${lines.length}</div></div>
+          <div class="summary-pill"><div class="summary-label">Amount Total</div><div class="summary-value amount" data-vendor-amount="${filterId}">$0.00</div></div>
+        </div>
+      </div>`;
+    }
+
+    function bidFilterMarkup(filterId, bids) {
+      const customerOptions = uniqueOptions(bids, r => r.customer || '');
+      const stageOptions = uniqueOptions(bids, r => r.stage || '');
+      const estimatorOptions = uniqueOptions(bids, r => r.estimator || '');
+      return `<div class="cost-filter" data-bid-filter="${filterId}">
+        <div class="cost-filter-bar">
+          <div><label>Search</label><input data-bid-search="${filterId}" placeholder="RFQ, customer, project, notes"></div>
+          <div><label>Customer</label><select data-bid-customer="${filterId}"><option value="">All</option>${customerOptions.map(v => `<option value="${htmlEscape(v)}">${htmlEscape(v)}</option>`).join('')}</select></div>
+          <div><label>Stage</label><select data-bid-stage="${filterId}"><option value="">All</option>${stageOptions.map(v => `<option value="${htmlEscape(v)}">${htmlEscape(v)}</option>`).join('')}</select></div>
+          <div><label>Estimator</label><select data-bid-estimator="${filterId}"><option value="">All</option>${estimatorOptions.map(v => `<option value="${htmlEscape(v)}">${htmlEscape(v)}</option>`).join('')}</select></div>
+          <button class="btn" type="button" data-bid-clear="${filterId}">Clear</button>
+        </div>
+        <div class="filter-summary">
+          <div class="summary-pill"><div class="summary-label">Bids Shown</div><div class="summary-value" data-bid-count="${filterId}">0 of ${bids.length}</div></div>
+          <div class="summary-pill"><div class="summary-label">Bid Price Total</div><div class="summary-value amount" data-bid-total="${filterId}">$0.00</div></div>
+          <div class="summary-pill"><div class="summary-label">Weighted Total</div><div class="summary-value" data-bid-weighted="${filterId}">$0.00</div></div>
+        </div>
+      </div>`;
+    }
+
+    function isBidStale(bid) {
+      if (['Won','Lost'].includes(String(bid.outcome || ''))) return false;
+      const lastUpdate = Date.parse(bid.updated_at || bid.created_at || '');
+      if (!lastUpdate) return false;
+      return Date.now() - lastUpdate >= 5 * 24 * 60 * 60 * 1000;
+    }
+
+    function bidTableHtml(bids) {
+      if (!bids.length) return '<tbody><tr><td>No bids match these filters.</td></tr></tbody>';
+      const stageOptions = ['New RFQ','Go/No-Go','Estimating','Submitted','Award Pending','Closed'];
+      const goNoGoOptions = ['Go','No Go','Review'];
+      const outcomeOptions = ['Pending','Won','Lost'];
+      return `<thead><tr><th>RFQ</th><th>Received</th><th>Customer</th><th>Project</th><th>Estimator</th><th>Stage</th><th>Due</th><th>Go / No-Go</th><th>Est. Cost</th><th>Margin</th><th>Bid Price</th><th>Prob.</th><th>Weighted</th><th>Outcome</th><th>Notes</th><th></th></tr></thead>
+        <tbody>${bids.map(b => `<tr class="${isBidStale(b) ? 'bid-stale' : ''}" title="${isBidStale(b) ? 'No update in 5 or more days' : ''}">
+          <td><input data-bid="${b.id}" data-field="rfq_no" value="${htmlEscape(b.rfq_no || '')}"></td>
+          <td><input data-bid="${b.id}" data-field="date_received" type="date" value="${htmlEscape(b.date_received || '')}"></td>
+          <td><input data-bid="${b.id}" data-field="customer" value="${htmlEscape(b.customer || '')}"></td>
+          <td><input data-bid="${b.id}" data-field="project_name" value="${htmlEscape(b.project_name || '')}"></td>
+          <td><input data-bid="${b.id}" data-field="estimator" value="${htmlEscape(b.estimator || '')}"></td>
+          <td><select data-bid="${b.id}" data-field="stage">${optionList(stageOptions, b.stage)}</select></td>
+          <td><input data-bid="${b.id}" data-field="bid_due_date" type="date" value="${htmlEscape(b.bid_due_date || '')}"></td>
+          <td><select data-bid="${b.id}" data-field="go_no_go">${optionList(goNoGoOptions, b.go_no_go)}</select></td>
+          <td><input data-bid="${b.id}" data-field="estimated_cost" type="number" step="0.01" value="${Number(b.estimated_cost || 0).toFixed(2)}"></td>
+          <td><input data-bid="${b.id}" data-field="target_margin" type="number" step="0.01" value="${Number(b.target_margin || 0).toFixed(2)}"></td>
+          <td><input data-bid="${b.id}" data-field="bid_price" type="number" step="0.01" value="${Number(b.bid_price || 0).toFixed(2)}"></td>
+          <td><input data-bid="${b.id}" data-field="probability" type="number" step="0.01" value="${Number(b.probability || 0).toFixed(2)}"></td>
+          <td>${money(b.weighted_value)}</td>
+          <td><select data-bid="${b.id}" data-field="outcome">${optionList(outcomeOptions, b.outcome)}</select></td>
+          <td><input data-bid="${b.id}" data-field="notes" value="${htmlEscape(b.notes || '')}"></td>
+          <td><button class="btn" data-save-bid="${b.id}" type="button">Save</button></td>
+        </tr>`).join('')}</tbody>`;
+    }
+
+    function fieldTicketLineFilterMarkup(filterId, lines) {
+      const ticketOptions = uniqueOptions(lines, r => r.ticket_or_invoice || '');
+      const subprojectOptions = uniqueOptions(lines, r => [r.job_number, r.subproject_code].filter(Boolean).join(' '));
+      const typeOptions = uniqueOptions(lines, r => r.cost_type || '');
+      return `<div class="cost-filter" data-field-ticket-filter="${filterId}">
+        <div class="cost-filter-bar">
+          <div><label>Search</label><input data-field-ticket-search="${filterId}" placeholder="Ticket, item, description, source file"></div>
+          <div><label>Ticket</label><select data-field-ticket-number="${filterId}"><option value="">All</option>${ticketOptions.map(v => `<option value="${htmlEscape(v)}">${htmlEscape(v)}</option>`).join('')}</select></div>
+          <div><label>Subproject</label><select data-field-ticket-subproject="${filterId}"><option value="">All</option>${subprojectOptions.map(v => `<option value="${htmlEscape(v)}">${htmlEscape(v)}</option>`).join('')}</select></div>
+          <div><label>Type</label><select data-field-ticket-type="${filterId}"><option value="">All</option>${typeOptions.map(v => `<option value="${htmlEscape(v)}">${htmlEscape(v)}</option>`).join('')}</select></div>
+          <button class="btn" type="button" data-field-ticket-clear="${filterId}">Clear</button>
+        </div>
+        <div class="filter-summary">
+          <div class="summary-pill"><div class="summary-label">Lines Shown</div><div class="summary-value" data-field-ticket-count="${filterId}">0 of ${lines.length}</div></div>
+          <div class="summary-pill"><div class="summary-label">Sales Total</div><div class="summary-value amount" data-field-ticket-sales="${filterId}">$0.00</div></div>
+          <div class="summary-pill"><div class="summary-label">Raw Cost Total</div><div class="summary-value" data-field-ticket-raw="${filterId}">$0.00</div></div>
+        </div>
+      </div>`;
+    }
+
+    function invoiceDateInputValue(value) {
+      const text = String(value || '').trim();
+      const m = text.match(/^([0-9]{1,2})\/([0-9]{1,2})\/([0-9]{2,4})$/);
+      if (!m) return text;
+      const year = m[3].length === 2 ? `20${m[3]}` : m[3];
+      return `${year}-${m[1].padStart(2, '0')}-${m[2].padStart(2, '0')}`;
+    }
+
+    function vendorInvoiceLinesTableHtml(lines) {
+      if (!lines.length) {
+        return '<tbody><tr><td>No vendor invoice lines match these filters.</td></tr></tbody>';
+      }
+      const body = vendorInvoiceGroups(lines).map(group => {
+        if (group.type === 'single') {
+          const r = group.rows[0];
+          return `<tr>
+            <td>${r.ticket_or_invoice || ''}</td>
+            <td>${pdfLink(r)}</td>
+            <td>${r.record_date || ''}</td>
+            <td>${r.vendor || ''}</td>
+            <td>${[r.job_number, r.subproject_code].filter(Boolean).join(' ')}</td>
+            <td>${r.item || ''}</td>
+            <td>${r.description || ''}</td>
+            <td>${Number(r.qty || 0).toFixed(2)}</td>
+            <td>${money(r.rate)}</td>
+            <td>${money(r.amount)}</td>
+          </tr>`;
+        }
+        const first = group.rows[0];
+        const total = group.rows.reduce((sum, r) => sum + Number(r.amount || 0), 0);
+        const qtyTotal = group.rows.reduce((sum, r) => sum + Number(r.qty || 0), 0);
+        const summary = `<tr class="invoice-summary" data-toggle-invoice="${group.id}">
+          <td>${invoiceSummaryButton(group, first.ticket_or_invoice || 'Invoice')}</td>
+          <td>${pdfLink(first)}</td>
+          <td>${first.record_date || ''}</td>
+          <td>${first.vendor || ''}</td>
+          <td>${invoiceSubprojectSelect(group)}</td>
+          <td><span class="invoice-line-count">${group.rows.length} line item(s)</span></td>
+          <td>Click to view invoice items</td>
+          <td>${qtyTotal.toFixed(2)}</td>
+          <td></td>
+          <td>${money(total)}</td>
+        </tr>`;
+        const details = group.rows.map(r => `<tr class="invoice-detail hidden" data-invoice-detail="${group.id}">
+          <td>${r.ticket_or_invoice || ''}</td>
+          <td>${pdfLink(r)}</td>
+          <td>${r.record_date || ''}</td>
+          <td>${r.vendor || ''}</td>
+          <td>${[r.job_number, r.subproject_code].filter(Boolean).join(' ')}</td>
+          <td>${r.item || ''}</td>
+          <td>${r.description || ''}</td>
+          <td>${Number(r.qty || 0).toFixed(2)}</td>
+          <td>${money(r.rate)}</td>
+          <td>${money(r.amount)}</td>
+        </tr>`).join('');
+        return summary + details;
+      }).join('');
+      return `
+        <thead><tr><th>Invoice</th><th>PDF</th><th>Date</th><th>Vendor</th><th>Subproject</th><th>Item</th><th>Description</th><th>Qty</th><th>Unit Cost</th><th>Amount</th></tr></thead>
+        <tbody>${body}</tbody>`;
+    }
+
+    function groupedEditableCostRows(records, spOpts, coOpts) {
+      return costRecordGroups(records).map(group => {
+        const rowHtml = c => `<tr>
+          <td>${c.record_date || ''}</td><td>${c.source}</td><td>${c.ticket_or_invoice || ''}</td><td>${pdfLink(c)}</td>
+          <td><select data-field="cost_type" data-id="${c.id}"><option>${c.cost_type || 'Uncoded'}</option><option>Labor</option><option>Material</option><option>Field Ticket Material</option><option>Equipment</option><option>Rental</option><option>Other</option></select></td>
+          <td>${c.item || ''}</td><td>${c.description || ''}</td><td>${Number(c.qty || 0).toFixed(2)}</td><td>${money(c.sales_rate || c.rate)}</td><td>${money(c.sales_amount || c.amount)}</td><td>${money(c.amount)}</td><td class="${c.raw_cost_source === 'Missing project rate' || c.raw_cost_source === 'Missing internal rate' ? 'warn' : ''}">${c.raw_cost_source || ''}</td>
+          <td><select data-field="subproject_id" data-id="${c.id}"><option value="">Unassigned</option>${spOpts}</select></td>
+          <td><select data-field="change_order_id" data-id="${c.id}">${changeOrderOptionsForSubproject(c.subproject_id, c.change_order_id)}</select></td>
+          <td><button class="btn" data-save="${c.id}">Save</button></td>
+        </tr>`;
+        if (group.type === 'single') return rowHtml(group.rows[0]);
+        const first = group.rows[0];
+        const total = group.rows.reduce((sum, r) => sum + Number(r.amount || 0), 0);
+        const salesTotal = group.rows.reduce((sum, r) => sum + Number(r.sales_amount || r.amount || 0), 0);
+        const qtyTotal = group.rows.reduce((sum, r) => sum + Number(r.qty || 0), 0);
+        const subproject = invoiceSubprojectLabel(group.rows);
+        const firstType = [...new Set(group.rows.map(r => r.cost_type || '').filter(Boolean))];
+        const groupType = firstType.length === 1 ? firstType[0] : 'Mixed';
+        const groupLabel = group.type === 'fieldwise' ? 'Field Wise Ticket' : 'Vendor Invoice';
+        const rateSource = group.type === 'fieldwise' ? 'Field Wise import' : 'Vendor invoice';
+        const summary = `<tr class="invoice-summary" data-toggle-invoice="${group.id}">
+          <td>${first.record_date || ''}</td>
+          <td>${invoiceSummaryButton(group, groupLabel)}</td>
+          <td>${first.ticket_or_invoice || ''}</td>
+          <td>${pdfLink(first)}</td>
+          <td>${groupType}</td>
+          <td><span class="invoice-line-count">${group.rows.length} line item(s)</span></td>
+          <td>${group.type === 'fieldwise' ? first.source_file || '' : first.vendor || ''}</td>
+          <td>${qtyTotal.toFixed(2)}</td>
+          <td></td>
+          <td>${money(salesTotal)}</td>
+          <td>${money(total)}</td>
+          <td>${rateSource}</td>
+          <td>${groupAssignmentSelect(group, 'subproject_id')}</td>
+          <td>${groupAssignmentSelect(group, 'change_order_id')}</td>
+          <td>${groupSaveButton(group)}</td>
+        </tr>`;
+        const details = group.rows.map(c => rowHtml(c).replace('<tr>', `<tr class="invoice-detail hidden" data-invoice-detail="${group.id}">`)).join('');
+        return summary + details;
+      }).join('');
+    }
+
+    function subprojectTable(subprojects, selectedId=null) {
+      return `<table><thead><tr><th>Job</th><th>Code</th><th>Name</th><th>Pricing</th><th>Sales / Contract</th><th>Labor Hrs</th><th>Budget</th><th>Raw Actual</th><th>Used</th></tr></thead><tbody>${subprojects.map(x => {
+        const used = x.budget_total ? x.actual_cost / x.budget_total : 0;
+        const laborUsed = Number(x.labor_hours_used || 0);
+        const laborBudget = Number(x.budget_labor_hours || 0);
+        const laborPct = laborBudget ? laborUsed / laborBudget : 0;
+        const salesValue = x.pricing_type === 'T&M' ? x.sales_value : x.contract_value;
+        const open = `<button class="btn" style="padding:4px 7px" data-open-subproject="${x.id}" type="button">Open</button>`;
+        const selected = String(selectedId || '') === String(x.id);
+        return `<tr class="selectable-row ${selected ? 'selected' : ''}" data-select-subproject="${x.id}">
+          <td>${x.job_number || ''}</td>
+          <td>${x.code}</td>
+          <td>${open} ${x.name}</td>
+          <td>${x.pricing_type || 'Fixed'}</td>
+          <td>${money(salesValue)}</td>
+          <td>${laborUsed.toFixed(2)} / ${laborBudget.toFixed(2)}<br><div class="bar"><span style="width:${Math.min(100, laborPct*100)}%"></span></div></td>
+          <td>${money(x.budget_total)}</td>
+          <td>${money(x.actual_cost)}</td>
+          <td><div class="bar"><span style="width:${Math.min(100, used*100)}%"></span></div> ${pct(used)}</td>
+        </tr>`;
+      }).join('')}</tbody></table>`;
+    }
+
+    async function loadSubprojectDetail(subprojectId, shouldScroll=true, changeOrderId=null) {
+      openSubprojectDetailId = subprojectId;
+      const coParam = changeOrderId ? `&change_order_id=${encodeURIComponent(changeOrderId)}` : '';
+      const d = await api(`/api/subproject-detail?subproject_id=${subprojectId}${coParam}`);
+      const panel = document.getElementById('subprojectDetailPanel');
+      const costFilterId = `costFilter${++costFilterSeq}`;
+      document.getElementById('subprojectDetailTitle').textContent = `${d.subproject.job_number || ''} ${d.subproject.code} - ${d.subproject.name} / ${d.scope_label || 'Base Contract'}`;
+      panel.classList.remove('hidden');
+      const laborPct = Number(d.labor_hours_used_pct || 0);
+      const budgetPct = Number(d.budget_used || 0);
+      document.getElementById('subprojectDetail').innerHTML = `
+        <div class="grid cols-4">
+          <div class="panel kpi"><div class="label">${d.subproject.pricing_type === 'T&M' && !d.selected_change_order ? 'Field Wise Sales Value' : 'Contract Value'}</div><div class="value">${money(d.contract_value)}</div><div class="hint">${d.subproject.pricing_type || 'Fixed'} pricing</div></div>
+          <div class="panel kpi"><div class="label">Raw Actual Cost</div><div class="value">${money(d.raw_actual)}</div><div class="hint">Budget used ${pct(budgetPct)}</div></div>
+          <div class="panel kpi"><div class="label">Profit</div><div class="value ${d.profit >= 0 ? 'good' : 'bad'}">${money(d.profit)}</div><div class="hint">Margin ${pct(d.margin)}</div></div>
+          <div class="panel kpi"><div class="label">Labor Hours</div><div class="value">${Number(d.labor_hours_used || 0).toFixed(2)}</div><div class="hint">of ${Number(d.labor_hours_budget || 0).toFixed(2)} budgeted</div></div>
+        </div>
+        <div class="grid cols-2" style="margin-top:14px">
+          <div>
+            <h3>Budget And Labor</h3>
+            ${table(['Metric','Value'], [
+              ['Raw cost budget', money(d.budget_total)],
+              ['Labor $ budget', money(d.subproject.budget_labor)],
+              ['Material budget', money(d.subproject.budget_material)],
+              ['Equipment budget', money(d.subproject.budget_equipment)],
+              ['Raw actual cost', money(d.raw_actual)],
+              ['Budget remaining', money(d.budget_total - d.raw_actual)],
+              ['Labor hours used', `${Number(d.labor_hours_used || 0).toFixed(2)} / ${Number(d.labor_hours_budget || 0).toFixed(2)}`],
+              ['Labor hours used %', pct(laborPct)]
+            ])}
+          </div>
+          <div>
+            <h3>Material Comparison</h3>
+            ${table(['Metric','Amount'], [
+              ['Field ticket material listed', money(d.field_ticket_material)],
+              ['Vendor invoice material purchased', money(d.vendor_material)],
+              ['Difference', money(d.vendor_material - d.field_ticket_material)]
+            ])}
+          </div>
+        </div>
+        <h3>Cost Type Breakdown</h3>
+        ${table(['Type','Amount'], d.by_type.map(x => [x.label, money(x.amount)]))}
+        <details>
+          <summary>Cost Records (${d.records.length})</summary>
+          <div class="detail-body">
+            ${costRecordFilterMarkup(costFilterId, d.records)}
+          </div>
+        </details>
+      `;
+      initCostRecordFilter(panel, costFilterId, d.records, ['Date','Source','Ticket / Invoice','PDF','Type','Item','Qty','Unit Price','Sales','Raw Cost']);
+      wireInvoiceToggles(panel);
+      if (shouldScroll) panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+
+    document.getElementById('closeSubprojectDetail').onclick = () => {
+      openSubprojectDetailId = null;
+      document.getElementById('subprojectDetailPanel').classList.add('hidden');
+    };
+
+    async function loadMasterDetail(shouldScroll=true) {
+      if (!state.projectId) return;
+      masterDetailIsOpen = true;
+      const d = await api(`/api/master-detail?project_id=${state.projectId}`);
+      const panel = document.getElementById('masterDetailPanel');
+      const costFilterId = `costFilter${++costFilterSeq}`;
+      document.getElementById('masterDetailTitle').textContent = `${d.project.name} - Master Project Detail`;
+      panel.classList.remove('hidden');
+      const laborPct = Number(d.labor_hours_used_pct || 0);
+      const budgetPct = Number(d.budget_used || 0);
+      document.getElementById('masterDetail').innerHTML = `
+        <div class="grid cols-4">
+          <div class="panel kpi"><div class="label">Contract + Approved COs</div><div class="value">${money(d.contract_value)}</div><div class="hint">Base ${money(d.base_contract_value)} / COs ${money(d.approved_co_value)}</div></div>
+          <div class="panel kpi"><div class="label">Raw Actual Cost</div><div class="value">${money(d.raw_actual)}</div><div class="hint">Budget used ${pct(budgetPct)}</div></div>
+          <div class="panel kpi"><div class="label">Profit</div><div class="value ${d.profit >= 0 ? 'good' : 'bad'}">${money(d.profit)}</div><div class="hint">Margin ${pct(d.margin)}</div></div>
+          <div class="panel kpi"><div class="label">Labor Hours</div><div class="value">${Number(d.labor_hours_used || 0).toFixed(2)}</div><div class="hint">of ${Number(d.labor_hours_budget || 0).toFixed(2)} budgeted</div></div>
+        </div>
+        <div class="grid cols-2" style="margin-top:14px">
+          <div>
+            <h3>Budget And Labor</h3>
+            ${table(['Metric','Value'], [
+              ['Raw cost budget', money(d.budget_total)],
+              ['Raw actual cost', money(d.raw_actual)],
+              ['Budget remaining', money(d.budget_total - d.raw_actual)],
+              ['Labor hours used', `${Number(d.labor_hours_used || 0).toFixed(2)} / ${Number(d.labor_hours_budget || 0).toFixed(2)}`],
+              ['Labor hours used %', pct(laborPct)]
+            ])}
+          </div>
+          <div>
+            <h3>Material Comparison</h3>
+            ${table(['Metric','Amount'], [
+              ['Field ticket material listed', money(d.field_ticket_material)],
+              ['Vendor invoice material purchased', money(d.vendor_material)],
+              ['Difference', money(d.vendor_material - d.field_ticket_material)]
+            ])}
+          </div>
+        </div>
+        <h3>Subproject Rollup</h3>
+        ${subprojectTable(d.subprojects)}
+        <h3>Cost Type Breakdown</h3>
+        ${table(['Type','Amount'], d.by_type.map(x => [x.label, money(x.amount)]))}
+        <details>
+          <summary>All Cost Records (${d.records.length})</summary>
+          <div class="detail-body">
+            ${costRecordFilterMarkup(costFilterId, d.records, true)}
+          </div>
+        </details>
+      `;
+      panel.querySelectorAll('[data-open-subproject]').forEach(btn => btn.onclick = () => loadSubprojectDetail(btn.dataset.openSubproject));
+      initCostRecordFilter(panel, costFilterId, d.records, ['Date','Subproject','Source','Ticket / Invoice','PDF','Type','Item','Qty','Unit Price','Sales','Raw Cost'], true);
+      wireInvoiceToggles(panel);
+      if (shouldScroll) panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+
+    document.getElementById('openMasterDetail').onclick = loadMasterDetail;
+    document.getElementById('closeMasterDetail').onclick = () => {
+      masterDetailIsOpen = false;
+      document.getElementById('masterDetailPanel').classList.add('hidden');
+    };
+
+    async function refreshOpenDetails() {
+      if (masterDetailIsOpen && !document.getElementById('masterDetailPanel').classList.contains('hidden')) {
+        await loadMasterDetail(false);
+      }
+      if (openSubprojectDetailId && !document.getElementById('subprojectDetailPanel').classList.contains('hidden')) {
+        await loadSubprojectDetail(openSubprojectDetailId, false, selectedDashboardChangeOrderId);
+      }
+    }
+
+    function loadSubprojectEditor() {
+      const tableEl = document.getElementById('subprojectEditTable');
+      if (!tableEl) return;
+      tableEl.innerHTML = `
+        <thead><tr><th>Job / Order #</th><th>Code</th><th>Name</th><th>Pricing</th><th>Contract Value</th><th>Labor Hours Budget</th><th>Labor $ Budget</th><th>Material Budget</th><th>Equipment Budget</th><th></th></tr></thead>
+        <tbody>${state.subprojects.map(s => `<tr>
+          <td><input data-sp="${s.id}" data-field="job_number" value="${s.job_number || ''}"></td>
+          <td><input data-sp="${s.id}" data-field="code" value="${s.code || ''}"></td>
+          <td><input data-sp="${s.id}" data-field="name" value="${s.name || ''}"></td>
+          <td><select data-sp="${s.id}" data-field="pricing_type"><option ${s.pricing_type === 'Fixed' ? 'selected' : ''}>Fixed</option><option ${s.pricing_type === 'T&M' ? 'selected' : ''}>T&M</option></select></td>
+          <td><input data-sp="${s.id}" data-field="contract_value" type="number" step="0.01" value="${s.contract_value || 0}"></td>
+          <td><input data-sp="${s.id}" data-field="budget_labor_hours" type="number" step="0.01" value="${s.budget_labor_hours || 0}"></td>
+          <td><input data-sp="${s.id}" data-field="budget_labor" type="number" step="0.01" value="${s.budget_labor || 0}"></td>
+          <td><input data-sp="${s.id}" data-field="budget_material" type="number" step="0.01" value="${s.budget_material || 0}"></td>
+          <td><input data-sp="${s.id}" data-field="budget_equipment" type="number" step="0.01" value="${s.budget_equipment || 0}"></td>
+          <td><button class="btn" data-save-sp="${s.id}">Save</button></td>
+        </tr>`).join('')}</tbody>`;
+      document.querySelectorAll('[data-save-sp]').forEach(btn => btn.onclick = async () => {
+        const id = btn.dataset.saveSp;
+        const fields = {};
+        document.querySelectorAll(`[data-sp="${id}"]`).forEach(el => fields[el.dataset.field] = el.value);
+        await api(`/api/subprojects/${id}`, { method:'PUT', body: JSON.stringify(fields) });
+        markSaved();
+        await refresh();
+      });
+    }
+
+    function loadInternalRateEditor() {
+      const tableEl = document.getElementById('rateEditTable');
+      if (!tableEl) return;
+      const selectedRateSetId = Number(document.getElementById('rateSetSelect')?.value || 0);
+      const shownRates = selectedRateSetId ? state.internalRates.filter(r => r.rate_set_id === selectedRateSetId) : state.internalRates;
+      tableEl.innerHTML = `
+        <thead><tr><th>Type</th><th>Category</th><th>Raw Rate</th><th></th></tr></thead>
+        <tbody>${shownRates.map(r => `<tr>
+          <td><select data-rate="${r.id}" data-field="category_type"><option ${r.category_type === 'Labor' ? 'selected' : ''}>Labor</option><option ${r.category_type === 'Equipment' ? 'selected' : ''}>Equipment</option></select></td>
+          <td><input data-rate="${r.id}" data-field="category" value="${r.category || ''}"></td>
+          <td><input data-rate="${r.id}" data-field="raw_rate" type="number" step="0.01" value="${r.raw_rate || 0}"></td>
+          <td><button class="btn" data-save-rate="${r.id}">Save</button></td>
+        </tr>`).join('')}</tbody>`;
+      document.querySelectorAll('[data-save-rate]').forEach(btn => btn.onclick = async () => {
+        const id = btn.dataset.saveRate;
+        const fields = {};
+        document.querySelectorAll(`[data-rate="${id}"]`).forEach(el => fields[el.dataset.field] = el.value);
+        await api(`/api/internal-rates/${id}`, { method:'PUT', body: JSON.stringify(fields) });
+        markSaved();
+        await refresh();
+      });
+      const rateSetSelect = document.getElementById('rateSetSelect');
+      if (rateSetSelect) rateSetSelect.onchange = loadInternalRateEditor;
+    }
+
+    async function loadCosts() {
+      if (!state.projectId) return;
+      const costs = await api(`/api/cost-records?project_id=${state.projectId}`);
+      const showAll = document.getElementById('showAllCosts')?.checked;
+      const visibleCosts = showAll ? costs : costs.filter(c =>
+        !c.subproject_id ||
+        !c.cost_type ||
+        c.cost_type === 'Uncoded' ||
+        c.raw_cost_source === 'Missing project rate' ||
+        c.raw_cost_source === 'Missing internal rate'
+      );
+      const spOpts = state.subprojects.map(s => `<option value="${s.id}">${s.job_number || ''} ${s.code}</option>`).join('');
+      const coOpts = state.changeOrders.map(c => `<option value="${c.id}">${[c.co_number, c.job_number].filter(Boolean).join(' / ')}</option>`).join('');
+      if (!visibleCosts.length) {
+        document.getElementById('costTable').innerHTML = '<tbody><tr><td>No exceptions. Imported records are coded and flowing through automatically.</td></tr></tbody>';
+        const showAllBox = document.getElementById('showAllCosts');
+        if (showAllBox) showAllBox.onchange = loadCosts;
+        return;
+      }
+      document.getElementById('costTable').innerHTML = `
+        <thead><tr><th>Date</th><th>Source</th><th>Ticket / Invoice</th><th>PDF</th><th>Type</th><th>Item</th><th>Description</th><th>Qty</th><th>Unit Price</th><th>Sales</th><th>Raw Cost</th><th>Rate Source</th><th>Subproject</th><th>CO</th><th></th></tr></thead>
+        <tbody>${groupedEditableCostRows(visibleCosts, spOpts, coOpts)}</tbody>`;
+      wireEditableCostTable(document.getElementById('costTable'), costs, loadCosts);
+      const showAllBox = document.getElementById('showAllCosts');
+      if (showAllBox) showAllBox.onchange = loadCosts;
+    }
+
+    function wireEditableCostTable(scope, costs, reloadFn) {
+      if (!scope) return;
+      wireInvoiceToggles(scope);
+      costs.forEach(c => {
+        const sp = scope.querySelector(`select[data-id="${c.id}"][data-field="subproject_id"]`);
+        const co = scope.querySelector(`select[data-id="${c.id}"][data-field="change_order_id"]`);
+        if (sp) sp.value = c.subproject_id || '';
+        if (co) updateChangeOrderSelectForSubproject(co, sp?.value || c.subproject_id || '', c.change_order_id || '');
+        if (sp && co) {
+          sp.onchange = () => updateChangeOrderSelectForSubproject(co, sp.value, co.value);
+        }
+      });
+      scope.querySelectorAll('select[data-group-field="subproject_id"]').forEach(sp => {
+        const groupId = sp.dataset.group;
+        const co = scope.querySelector(`select[data-group="${groupId}"][data-group-field="change_order_id"]`);
+        if (co) updateChangeOrderSelectForSubproject(co, sp.value, co.value);
+        sp.onchange = event => {
+          event.stopPropagation();
+          updateChangeOrderSelectForSubproject(co, sp.value, co?.value || '');
+        };
+      });
+      scope.querySelectorAll('[data-save]').forEach(btn => btn.onclick = async () => {
+        const id = btn.dataset.save;
+        const fields = {};
+        scope.querySelectorAll(`select[data-id="${id}"]`).forEach(el => fields[el.dataset.field] = el.value);
+        await api(`/api/cost-records/${id}`, { method:'PUT', body: JSON.stringify(fields) });
+        markSaved();
+        await refresh();
+        if (reloadFn) await reloadFn();
+      });
+      scope.querySelectorAll('[data-save-cost-group]').forEach(btn => btn.onclick = async event => {
+        event.stopPropagation();
+        const groupId = btn.dataset.saveCostGroup;
+        const fields = { ids: (btn.dataset.recordIds || '').split(',').filter(Boolean) };
+        scope.querySelectorAll(`select[data-group="${groupId}"]`).forEach(el => fields[el.dataset.groupField] = el.value);
+        await api('/api/cost-records/bulk-update', { method:'POST', body: JSON.stringify(fields) });
+        markSaved();
+        await refresh();
+        if (reloadFn) await reloadFn();
+      });
+    }
+
+    async function loadFieldTicketLines() {
+      const tableEl = document.getElementById('fieldTicketLinesTable');
+      const filterEl = document.getElementById('fieldTicketLineFilters');
+      if (!tableEl || !state.projectId) return;
+      const allCosts = await api(`/api/cost-records?project_id=${state.projectId}`);
+      const tickets = allCosts.filter(c => c.source === 'Field Wise' || c.source === 'Field Wise PDF');
+      if (!tickets.length) {
+        if (filterEl) filterEl.innerHTML = '';
+        tableEl.innerHTML = '<tbody><tr><td>No Field Wise ticket lines imported yet.</td></tr></tbody>';
+        return;
+      }
+      const spOpts = state.subprojects.map(s => `<option value="${s.id}">${s.job_number || ''} ${s.code}</option>`).join('');
+      const coOpts = state.changeOrders.map(c => `<option value="${c.id}">${[c.co_number, c.job_number].filter(Boolean).join(' / ')}</option>`).join('');
+      const filterId = `fieldTicketFilter${++costFilterSeq}`;
+      if (filterEl) filterEl.innerHTML = fieldTicketLineFilterMarkup(filterId, tickets);
+      const container = filterEl?.querySelector(`[data-field-ticket-filter="${filterId}"]`);
+      const searchEl = container?.querySelector(`[data-field-ticket-search="${filterId}"]`);
+      const ticketEl = container?.querySelector(`[data-field-ticket-number="${filterId}"]`);
+      const subprojectEl = container?.querySelector(`[data-field-ticket-subproject="${filterId}"]`);
+      const typeEl = container?.querySelector(`[data-field-ticket-type="${filterId}"]`);
+      const countEl = container?.querySelector(`[data-field-ticket-count="${filterId}"]`);
+      const salesEl = container?.querySelector(`[data-field-ticket-sales="${filterId}"]`);
+      const rawEl = container?.querySelector(`[data-field-ticket-raw="${filterId}"]`);
+      const clearEl = container?.querySelector(`[data-field-ticket-clear="${filterId}"]`);
+      const draw = () => {
+        const query = String(searchEl?.value || '').trim().toLowerCase();
+        const ticket = ticketEl?.value || '';
+        const subproject = subprojectEl?.value || '';
+        const type = typeEl?.value || '';
+        const filtered = tickets.filter(r => {
+          const subLabel = [r.job_number, r.subproject_code].filter(Boolean).join(' ');
+          const haystack = [
+            r.record_date, r.source, r.source_file, r.ticket_or_invoice,
+            r.cost_type, r.item, r.description, r.raw_cost_source, subLabel
+          ].join(' ').toLowerCase();
+          return (!query || haystack.includes(query)) &&
+            (!ticket || r.ticket_or_invoice === ticket) &&
+            (!subproject || subLabel === subproject) &&
+            (!type || r.cost_type === type);
+        });
+        const salesTotal = filtered.reduce((sum, r) => sum + Number(r.sales_amount || r.amount || 0), 0);
+        const rawTotal = filtered.reduce((sum, r) => sum + Number(r.amount || 0), 0);
+        if (countEl) countEl.textContent = `${filtered.length} of ${tickets.length}`;
+        if (salesEl) salesEl.textContent = money(salesTotal);
+        if (rawEl) rawEl.textContent = money(rawTotal);
+        tableEl.innerHTML = filtered.length
+          ? `<thead><tr><th>Date</th><th>Source</th><th>Ticket</th><th>PDF</th><th>Type</th><th>Item</th><th>Description</th><th>Qty</th><th>Unit Price</th><th>Sales</th><th>Raw Cost</th><th>Rate Source</th><th>Subproject</th><th>CO</th><th></th></tr></thead>
+             <tbody>${groupedEditableCostRows(filtered, spOpts, coOpts)}</tbody>`
+          : '<tbody><tr><td>No Field Wise ticket lines match these filters.</td></tr></tbody>';
+        wireEditableCostTable(tableEl, filtered, loadFieldTicketLines);
+      };
+      [searchEl, ticketEl, subprojectEl, typeEl].filter(Boolean).forEach(el => {
+        el.oninput = draw;
+        el.onchange = draw;
+      });
+      if (clearEl) clearEl.onclick = () => {
+        if (searchEl) searchEl.value = '';
+        if (ticketEl) ticketEl.value = '';
+        if (subprojectEl) subprojectEl.value = '';
+        if (typeEl) typeEl.value = '';
+        draw();
+      };
+      draw();
+    }
+
+    async function loadImportHistory() {
+      const tableEl = document.getElementById('importHistoryTable');
+      if (!tableEl || !state.projectId) return;
+      const imports = await api(`/api/imports?project_id=${state.projectId}`);
+      tableEl.innerHTML = `
+        <thead><tr><th>Source</th><th>File</th><th>Records</th><th>Sales</th><th>Raw Cost</th><th>Last Imported</th><th></th></tr></thead>
+        <tbody>${imports.map(row => `<tr>
+          <td>${row.source || ''}</td>
+          <td>${row.source_file || ''}</td>
+          <td>${row.record_count}</td>
+          <td>${money(row.sales_amount)}</td>
+          <td>${money(row.raw_amount)}</td>
+          <td>${row.last_imported || ''}</td>
+          <td><button class="btn" data-delete-import="${row.source_file}" data-source="${row.source}">Remove Import</button></td>
+        </tr>`).join('')}</tbody>`;
+      document.querySelectorAll('[data-delete-import]').forEach(btn => btn.onclick = async () => {
+        const file = btn.dataset.deleteImport;
+        const source = btn.dataset.source;
+        if (!window.confirm(`Remove imported records from ${file}?`)) return;
+        await api('/api/imports/delete', {
+          method: 'POST',
+          body: JSON.stringify({ project_id: state.projectId, source_file: file, source })
+        });
+        await refresh();
+      });
+    }
+
+    async function loadVendorInvoiceLines() {
+      const tableEl = document.getElementById('vendorInvoiceLinesTable');
+      const filterEl = document.getElementById('vendorInvoiceLineFilters');
+      if (!tableEl || !state.projectId) return;
+      const lines = await api(`/api/vendor-invoice-lines?project_id=${state.projectId}`);
+      if (!lines.length) {
+        if (filterEl) filterEl.innerHTML = '';
+        tableEl.innerHTML = '<tbody><tr><td>No vendor invoice lines imported yet.</td></tr></tbody>';
+        return;
+      }
+      const filterId = `vendorFilter${++costFilterSeq}`;
+      if (filterEl) filterEl.innerHTML = vendorInvoiceLineFilterMarkup(filterId, lines);
+      const container = filterEl?.querySelector(`[data-vendor-filter="${filterId}"]`);
+      const searchEl = container?.querySelector(`[data-vendor-search="${filterId}"]`);
+      const vendorEl = container?.querySelector(`[data-vendor-name="${filterId}"]`);
+      const subprojectEl = container?.querySelector(`[data-vendor-subproject="${filterId}"]`);
+      const dateEl = container?.querySelector(`[data-vendor-date="${filterId}"]`);
+      const countEl = container?.querySelector(`[data-vendor-count="${filterId}"]`);
+      const amountEl = container?.querySelector(`[data-vendor-amount="${filterId}"]`);
+      const clearEl = container?.querySelector(`[data-vendor-clear="${filterId}"]`);
+      const draw = () => {
+        const query = String(searchEl?.value || '').trim().toLowerCase();
+        const vendor = vendorEl?.value || '';
+        const subproject = subprojectEl?.value || '';
+        const date = dateEl?.value || '';
+        const filtered = lines.filter(r => {
+          const subLabel = [r.job_number, r.subproject_code].filter(Boolean).join(' ');
+          const haystack = [
+            r.ticket_or_invoice, r.source_file, r.vendor, r.record_date, subLabel,
+            r.item, r.description
+          ].join(' ').toLowerCase();
+          return (!query || haystack.includes(query)) &&
+            (!vendor || r.vendor === vendor) &&
+            (!subproject || subLabel === subproject) &&
+            (!date || invoiceDateInputValue(r.record_date) === date);
+        });
+        const filteredAmount = filtered.reduce((sum, r) => sum + Number(r.amount || 0), 0);
+        if (countEl) countEl.textContent = `${filtered.length} of ${lines.length}`;
+        if (amountEl) amountEl.textContent = money(filteredAmount);
+        tableEl.innerHTML = vendorInvoiceLinesTableHtml(filtered);
+        wireInvoiceToggles(tableEl);
+        wireInvoiceSubprojectSaves(tableEl);
+      };
+      [searchEl, vendorEl, subprojectEl, dateEl].filter(Boolean).forEach(el => {
+        el.oninput = draw;
+        el.onchange = draw;
+      });
+      if (clearEl) clearEl.onclick = () => {
+        if (searchEl) searchEl.value = '';
+        if (vendorEl) vendorEl.value = '';
+        if (subprojectEl) subprojectEl.value = '';
+        if (dateEl) dateEl.value = '';
+        draw();
+      };
+      draw();
+    }
+
+    async function loadCustomerInvoices() {
+      const tableEl = document.getElementById('customerInvoiceTable');
+      const summaryEl = document.getElementById('customerInvoiceSummary');
+      if (!tableEl || !state.projectId) return;
+      const invoices = await api(`/api/customer-invoices?project_id=${state.projectId}`);
+      const active = invoices.filter(i => i.status !== 'Void');
+      const billed = active.reduce((sum, i) => sum + Number(i.amount || 0), 0);
+      const paid = active.reduce((sum, i) => sum + Number(i.paid_amount || 0), 0);
+      const open = active
+        .filter(i => !['Draft','Paid'].includes(i.status || ''))
+        .reduce((sum, i) => sum + Math.max(0, Number(i.amount || 0) - Number(i.paid_amount || 0)), 0);
+      if (summaryEl) {
+        summaryEl.innerHTML = table(['Invoices','Billed','Paid','Open AR'], [[active.length, money(billed), money(paid), money(open)]]);
+      }
+      if (!invoices.length) {
+        tableEl.innerHTML = '<tbody><tr><td>No customer invoices entered yet.</td></tr></tbody>';
+        return;
+      }
+      const spOpts = '<option value="">Unassigned</option>' + state.subprojects.map(s => `<option value="${s.id}">${s.job_number || ''} ${s.code}</option>`).join('');
+      const coOpts = '<option value="">Base Contract</option>' + state.changeOrders.map(c => `<option value="${c.id}">${[c.co_number, c.job_number].filter(Boolean).join(' / ')}</option>`).join('');
+      tableEl.innerHTML = `
+        <thead><tr><th>Invoice #</th><th>Type</th><th>Subproject</th><th>CO</th><th>Invoice Date</th><th>Due Date</th><th>Status</th><th>Amount</th><th>Paid</th><th>Open</th><th>Notes</th><th></th></tr></thead>
+        <tbody>${invoices.map(i => {
+          const openAmount = Math.max(0, Number(i.amount || 0) - Number(i.paid_amount || 0));
+          return `<tr>
+            <td><input data-cinv="${i.id}" data-field="invoice_number" value="${htmlEscape(i.invoice_number || '')}"></td>
+            <td><select data-cinv="${i.id}" data-field="billing_type">${['Progress','Base Contract','Change Order','T&M','Retainage','Final'].map(v => `<option ${i.billing_type === v ? 'selected' : ''}>${v}</option>`).join('')}</select></td>
+            <td><select data-cinv="${i.id}" data-field="subproject_id">${spOpts}</select></td>
+            <td><select data-cinv="${i.id}" data-field="change_order_id">${coOpts}</select></td>
+            <td><input data-cinv="${i.id}" data-field="invoice_date" type="date" value="${htmlEscape(i.invoice_date || '')}"></td>
+            <td><input data-cinv="${i.id}" data-field="due_date" type="date" value="${htmlEscape(i.due_date || '')}"></td>
+            <td><select data-cinv="${i.id}" data-field="status">${['Draft','Sent','Partial','Paid','Overdue','Void'].map(v => `<option ${i.status === v ? 'selected' : ''}>${v}</option>`).join('')}</select></td>
+            <td><input data-cinv="${i.id}" data-field="amount" type="number" step="0.01" value="${Number(i.amount || 0).toFixed(2)}"></td>
+            <td><input data-cinv="${i.id}" data-field="paid_amount" type="number" step="0.01" value="${Number(i.paid_amount || 0).toFixed(2)}"></td>
+            <td>${money(openAmount)}</td>
+            <td><input data-cinv="${i.id}" data-field="notes" value="${htmlEscape(i.notes || '')}"></td>
+            <td><button class="btn" data-save-customer-invoice="${i.id}" type="button">Save</button></td>
+          </tr>`;
+        }).join('')}</tbody>`;
+      invoices.forEach(i => {
+        const sp = tableEl.querySelector(`select[data-cinv="${i.id}"][data-field="subproject_id"]`);
+        const co = tableEl.querySelector(`select[data-cinv="${i.id}"][data-field="change_order_id"]`);
+        if (sp) sp.value = i.subproject_id || '';
+        if (co) co.value = i.change_order_id || '';
+      });
+      tableEl.querySelectorAll('[data-save-customer-invoice]').forEach(btn => btn.onclick = async () => {
+        const id = btn.dataset.saveCustomerInvoice;
+        const fields = {};
+        tableEl.querySelectorAll(`[data-cinv="${id}"]`).forEach(el => fields[el.dataset.field] = el.value);
+        await api(`/api/customer-invoices/${id}`, { method:'PUT', body: JSON.stringify(fields) });
+        markSaved();
+        await refresh();
+      });
+    }
+
+    async function loadBidDashboard() {
+      const summary = await api('/api/bid-summary');
+      document.getElementById('bidKpis').innerHTML = `
+        <div class="panel kpi"><div class="label">Open Pipeline</div><div class="value">${money(summary.open_pipeline)}</div><div class="hint">${summary.open_count} open RFQ(s)</div></div>
+        <div class="panel kpi"><div class="label">Weighted Forecast</div><div class="value">${money(summary.weighted_forecast)}</div></div>
+        <div class="panel kpi"><div class="label">Win Rate</div><div class="value">${pct(summary.win_rate)}</div></div>
+        <div class="panel kpi"><div class="label">Avg Target Margin</div><div class="value">${pct(summary.avg_target_margin)}</div></div>`;
+      document.getElementById('bidStageSummary').innerHTML = table(['Stage','Count','Value'], summary.stage.map(x => [x.stage, x.count, money(x.value)]));
+      document.getElementById('bidEstimatorSummary').innerHTML = table(['Estimator','Open RFQs','Open Value'], summary.estimator.map(x => [x.estimator, x.open_rfqs, money(x.open_value)]));
+      const filterId = `bidFilter${++costFilterSeq}`;
+      const filterEl = document.getElementById('bidFilters');
+      const tableEl = document.getElementById('bidTable');
+      filterEl.innerHTML = bidFilterMarkup(filterId, summary.bids);
+      const container = filterEl.querySelector(`[data-bid-filter="${filterId}"]`);
+      const searchEl = container.querySelector(`[data-bid-search="${filterId}"]`);
+      const customerEl = container.querySelector(`[data-bid-customer="${filterId}"]`);
+      const stageEl = container.querySelector(`[data-bid-stage="${filterId}"]`);
+      const estimatorEl = container.querySelector(`[data-bid-estimator="${filterId}"]`);
+      const countEl = container.querySelector(`[data-bid-count="${filterId}"]`);
+      const totalEl = container.querySelector(`[data-bid-total="${filterId}"]`);
+      const weightedEl = container.querySelector(`[data-bid-weighted="${filterId}"]`);
+      const clearEl = container.querySelector(`[data-bid-clear="${filterId}"]`);
+      const draw = () => {
+        const query = String(searchEl.value || '').trim().toLowerCase();
+        const customer = customerEl.value || '';
+        const stage = stageEl.value || '';
+        const estimator = estimatorEl.value || '';
+        const filtered = summary.bids.filter(b => {
+          const haystack = [b.rfq_no, b.customer, b.project_name, b.estimator, b.stage, b.go_no_go, b.outcome, b.notes].join(' ').toLowerCase();
+          return (!query || haystack.includes(query)) &&
+            (!customer || b.customer === customer) &&
+            (!stage || b.stage === stage) &&
+            (!estimator || b.estimator === estimator);
+        });
+        countEl.textContent = `${filtered.length} of ${summary.bids.length}`;
+        totalEl.textContent = money(filtered.reduce((sum, b) => sum + Number(b.bid_price || 0), 0));
+        weightedEl.textContent = money(filtered.reduce((sum, b) => sum + Number(b.weighted_value || 0), 0));
+        tableEl.innerHTML = bidTableHtml(filtered);
+        wireBidSaves(tableEl);
+      };
+      [searchEl, customerEl, stageEl, estimatorEl].forEach(el => {
+        el.oninput = draw;
+        el.onchange = draw;
+      });
+      clearEl.onclick = () => {
+        searchEl.value = '';
+        customerEl.value = '';
+        stageEl.value = '';
+        estimatorEl.value = '';
+        draw();
+      };
+      draw();
+    }
+
+    function wireBidSaves(scope=document) {
+      scope.querySelectorAll('[data-bid]').forEach(el => {
+        el.oninput = () => el.closest('tr')?.classList.add('bid-dirty');
+        el.onchange = () => el.closest('tr')?.classList.add('bid-dirty');
+      });
+      scope.querySelectorAll('[data-save-bid]').forEach(btn => {
+        btn.onclick = async () => {
+          const id = btn.dataset.saveBid;
+          const fields = {};
+          scope.querySelectorAll(`[data-bid="${id}"]`).forEach(el => fields[el.dataset.field] = el.value);
+          await api(`/api/bids/${id}`, { method:'PUT', body: JSON.stringify(fields) });
+          btn.closest('tr')?.classList.remove('bid-dirty');
+          markSaved();
+          await loadBidDashboard();
+        };
+      });
+    }
+
+    async function loadCurrentUser() {
+      const me = await api('/api/me');
+      state.currentUser = me;
+      document.body.classList.toggle('read-only', me.role === 'Read Only');
+      document.getElementById('currentUser').textContent = `${me.display_name || me.username}${me.role === 'Read Only' ? ' / Read Only' : ''}`;
+      document.getElementById('systemAdminBtn').classList.toggle('hidden', me.role !== 'Admin');
+      document.getElementById('systemRevisionBtn').classList.toggle('hidden', me.role !== 'Admin');
+    }
+
+    async function loadUsers() {
+      if (state.currentUser?.role !== 'Admin') return;
+      const users = await api('/api/users');
+      document.getElementById('usersTable').innerHTML = `
+        <thead><tr><th>Username</th><th>Name</th><th>Role</th><th>Status</th><th>New Password</th><th></th></tr></thead>
+        <tbody>${users.map(u => `<tr>
+          <td>${u.username}</td>
+          <td>${u.display_name || ''}</td>
+          <td><select data-user-role="${u.id}"><option ${u.role === 'User' ? 'selected' : ''}>User</option><option ${u.role === 'Read Only' ? 'selected' : ''}>Read Only</option><option ${u.role === 'Admin' ? 'selected' : ''}>Admin</option></select></td>
+          <td>${u.active ? 'Active' : 'Inactive'}</td>
+          <td><input data-user-password="${u.id}" type="password" placeholder="Leave blank"></td>
+          <td>
+            <button class="btn" data-reset-user="${u.id}" type="button">Reset</button>
+            <button class="btn" data-toggle-user="${u.id}" data-active="${u.active}" type="button">${u.active ? 'Deactivate' : 'Activate'}</button>
+          </td>
+        </tr>`).join('')}</tbody>`;
+      document.querySelectorAll('[data-reset-user]').forEach(btn => btn.onclick = async () => {
+        const id = btn.dataset.resetUser;
+        const password = document.querySelector(`[data-user-password="${id}"]`).value;
+        if (!password) return;
+        await api(`/api/users/${id}`, { method:'PUT', body: JSON.stringify({ password }) });
+        await loadUsers();
+      });
+      document.querySelectorAll('[data-toggle-user]').forEach(btn => btn.onclick = async () => {
+        const id = btn.dataset.toggleUser;
+        await api(`/api/users/${id}`, { method:'PUT', body: JSON.stringify({ active: btn.dataset.active === '1' ? 0 : 1 }) });
+        await loadUsers();
+      });
+      document.querySelectorAll('[data-user-role]').forEach(sel => sel.onchange = async () => {
+        await api(`/api/users/${sel.dataset.userRole}`, { method:'PUT', body: JSON.stringify({ role: sel.value }) });
+        await loadUsers();
+      });
+    }
+
+    document.getElementById('projectForm').onsubmit = async e => {
+      e.preventDefault();
+      const data = formDataObj(e.target);
+      if (state.projectId && !projectCreateMode) {
+        await api(`/api/projects/${state.projectId}`, { method:'PUT', body: JSON.stringify(data) });
+      } else {
+        const saved = await api('/api/projects', { method:'POST', body: JSON.stringify(data) });
+        state.projectId = saved.id;
+        localStorage.setItem('selectedProjectId', state.projectId);
+      }
+      setProjectCreateMode(false);
+      markSaved();
+      await loadProjects();
+    };
+    document.getElementById('newProjectBtn').onclick = async () => {
+      if (!(await confirmDiscard())) return;
+      markSaved();
+      setProjectCreateMode(true);
+      updateNavForTab('setup');
+      document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.tab').forEach(t => t.classList.add('hidden'));
+      document.querySelector('[data-tab="setup"]').classList.add('active');
+      document.getElementById('setup').classList.remove('hidden');
+      document.querySelector('#projectForm input[name="project_code"]').focus();
+    };
+    document.getElementById('cancelNewProjectBtn').onclick = async () => {
+      setProjectCreateMode(false);
+      markSaved();
+      await refresh();
+    };
+    document.getElementById('subprojectForm').onsubmit = async e => {
+      e.preventDefault();
+      await api('/api/subprojects', { method:'POST', body: JSON.stringify({ ...formDataObj(e.target), project_id: state.projectId }) });
+      e.target.reset(); markSaved(); await refresh();
+    };
+    document.getElementById('coForm').onsubmit = async e => {
+      e.preventDefault();
+      await api('/api/change-orders', { method:'POST', body: JSON.stringify({ ...formDataObj(e.target), project_id: state.projectId }) });
+      e.target.reset(); markSaved(); await refresh();
+      updateCoPricingFields();
+    };
+    function updateCoPricingFields() {
+      const pricing = document.getElementById('coPricingType')?.value || 'Fixed';
+      const approved = document.getElementById('coApprovedValue');
+      if (!approved) return;
+      approved.disabled = pricing === 'T&M';
+      approved.placeholder = pricing === 'T&M' ? 'Calculated from Field Wise tickets' : '';
+      if (pricing === 'T&M') approved.value = '0';
+    }
+    document.getElementById('coPricingType').onchange = updateCoPricingFields;
+    document.getElementById('invoiceForm').onsubmit = async e => {
+      e.preventDefault();
+      await api('/api/invoices', { method:'POST', body: JSON.stringify({ ...formDataObj(e.target), project_id: state.projectId }) });
+      e.target.reset(); markSaved(); await refresh();
+    };
+    document.getElementById('customerInvoiceForm').onsubmit = async e => {
+      e.preventDefault();
+      await api('/api/customer-invoices', { method:'POST', body: JSON.stringify({ ...formDataObj(e.target), project_id: state.projectId }) });
+      e.target.reset();
+      markSaved();
+      fillSelects();
+      await refresh();
+      openTab('billing');
+    };
+    document.getElementById('bidForm').onsubmit = async e => {
+      e.preventDefault();
+      await api('/api/bids', { method:'POST', body: JSON.stringify(formDataObj(e.target)) });
+      e.target.reset();
+      markSaved();
+      await loadBidDashboard();
+    };
+    document.getElementById('userForm').onsubmit = async e => {
+      e.preventDefault();
+      await api('/api/users', { method:'POST', body: JSON.stringify(formDataObj(e.target)) });
+      e.target.reset();
+      markSaved();
+      await loadUsers();
+    };
+    document.getElementById('importForm').onsubmit = async e => {
+      e.preventDefault();
+      const fileInput = e.target.querySelector('input[type="file"]');
+      const resultEl = document.getElementById('importResult');
+      const selectedFiles = Array.from(fileInput.files || []);
+      if (!selectedFiles.length) {
+        resultEl.textContent = 'Choose one or more Field Wise files first.';
+        return;
+      }
+      resultEl.textContent = `Importing ${selectedFiles.length} Field Wise file(s)...`;
+      const results = [];
+      for (const file of selectedFiles) {
+        const fd = new FormData();
+        fd.append('file', file);
+        fd.append('project_id', state.projectId);
+        try {
+          const data = await api('/api/import-fieldwise', { method:'POST', body: fd });
+          results.push({ file: file.name, ok: true, data });
+        } catch (err) {
+          results.push({ file: file.name, ok: false, error: err.message });
+        }
+      }
+      const importedTotal = results.reduce((sum, r) => sum + (r.ok ? Number(r.data.imported || 0) : 0), 0);
+      const skippedTotal = results.reduce((sum, r) => sum + (r.ok ? Number(r.data.skipped || 0) : 0), 0);
+      const failedTotal = results.filter(r => !r.ok).length;
+      const detailLines = results.map(r => {
+        if (!r.ok) return `${r.file}: failed - ${r.error}`;
+        const d = r.data;
+        const matched = d.matched_change_order_id ? `auto-coded to CO for job/order ${d.order_number}` : d.matched_subproject_id ? `auto-coded to order ${d.order_number}` : `needs review for order ${d.order_number || 'blank'}`;
+        const skipped = d.skipped ? `, skipped ${d.skipped} duplicate line item(s)` : '';
+        return `${r.file}: imported ${d.imported} record(s)${skipped}, ${matched}`;
+      });
+      resultEl.innerHTML = `Imported ${importedTotal} total Field Wise record(s) from ${selectedFiles.length} file(s). Skipped duplicates: ${skippedTotal}. Failed: ${failedTotal}.<br>${detailLines.map(x => `<span>${htmlEscape(x)}</span>`).join('<br>')}`;
+      fileInput.value = '';
+      markSaved();
+      await refresh();
+      await loadImportHistory();
+      await loadFieldTicketLines();
+    };
+    document.getElementById('addRate').onclick = async () => {
+      await api('/api/internal-rates', {
+        method: 'POST',
+        body: JSON.stringify({
+          category_type: document.getElementById('rateType').value,
+          rate_set_id: document.getElementById('rateSetSelect').value,
+          category: document.getElementById('rateCategory').value,
+          raw_rate: document.getElementById('rateRaw').value
+        })
+      });
+      document.getElementById('rateCategory').value = '';
+      document.getElementById('rateRaw').value = '0';
+      markSaved();
+      await refresh();
+    };
+    document.getElementById('importVendorInvoice').onclick = async () => {
+      const fileInput = document.getElementById('vendorInvoiceFile');
+      const resultEl = document.getElementById('vendorImportResult');
+      if (!fileInput.files.length) {
+        resultEl.textContent = 'Choose one or more vendor invoice PDFs first.';
+        return;
+      }
+      const selectedFiles = Array.from(fileInput.files);
+      resultEl.textContent = `Importing ${selectedFiles.length} vendor invoice PDF(s)...`;
+      try {
+        const results = [];
+        for (const file of selectedFiles) {
+          const fd = new FormData();
+          fd.append('file', file);
+          fd.append('project_id', state.projectId);
+          try {
+            const data = await api('/api/import-vendor-invoice', { method: 'POST', body: fd });
+            results.push({ file: file.name, ok: true, data });
+          } catch (err) {
+            results.push({ file: file.name, ok: false, error: err.message });
+          }
+        }
+        const importedLines = results.filter(r => r.ok && !r.data.duplicate).reduce((sum, r) => sum + Number(r.data.imported || 0), 0);
+        const duplicateCount = results.filter(r => r.ok && r.data.duplicate).length;
+        const failedCount = results.filter(r => !r.ok).length;
+        const detailLines = results.map(r => {
+          if (!r.ok) return `${r.file}: failed - ${r.error}`;
+          const d = r.data;
+          if (d.duplicate) return `${r.file}: duplicate ${d.vendor || 'Vendor'} invoice ${d.invoice_number || ''}, already has ${d.existing_line_count || 0} line item(s) totaling ${money(d.existing_total)}`;
+          const matched = d.matched_subproject_id ? `auto-coded to PO/order ${d.order_number}` : `needs subproject review`;
+          return `${r.file}: imported ${d.imported} line item(s) from ${d.vendor || 'vendor'} invoice ${d.invoice_number || ''}, ${matched}`;
+        });
+        resultEl.innerHTML = `Imported ${importedLines} total line item(s) from ${selectedFiles.length} PDF(s). Duplicates: ${duplicateCount}. Failed: ${failedCount}.<br>${detailLines.map(x => `<span>${htmlEscape(x)}</span>`).join('<br>')}`;
+        fileInput.value = '';
+        markSaved();
+        await refresh();
+        await loadVendorInvoiceLines();
+      } catch (err) {
+        resultEl.textContent = `Import failed: ${err.message}`;
+      }
+    };
+
+    updateCoPricingFields();
+    (async () => {
+      await loadCurrentUser();
+      await loadProjects();
+    })();
+  </script>
+</body>
+</html>
+"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        print("%s - %s" % (self.address_string(), fmt % args))
+
+    def do_GET(self):
+        try:
+            parsed = urlparse(self.path)
+            qs = parse_qs(parsed.query)
+            if parsed.path == "/login":
+                if current_user(self):
+                    return redirect_response(self, "/")
+                return text_response(self, LOGIN_HTML)
+            public_paths = ("/brand/",)
+            user = current_user(self)
+            if not user and not parsed.path.startswith(public_paths):
+                if parsed.path.startswith("/api/"):
+                    return json_response(self, {"error": "Login required"}, 401)
+                return redirect_response(self, "/login")
+            if parsed.path == "/developer-revision":
+                if user.get("role") != "Admin":
+                    return text_response(self, "Admin required", "text/plain", 403)
+                return text_response(self, developer_revision_html(user))
+            if parsed.path == "/api/developer-revision":
+                if user.get("role") != "Admin":
+                    return json_response(self, {"error": "Admin required"}, 403)
+                return json_response(self, app_revision_info())
+            if parsed.path == "/":
+                return text_response(self, HTML)
+            if parsed.path.startswith("/uploads/"):
+                path = upload_pdf_path(parsed.path.removeprefix("/uploads/"))
+                if not path:
+                    return text_response(self, "Not found", "text/plain", 404)
+                return file_response(self, path, "application/pdf")
+            if parsed.path.startswith("/pdf-viewer/"):
+                html = pdf_viewer_html(parsed.path.removeprefix("/pdf-viewer/"))
+                if not html:
+                    return text_response(self, "Not found", "text/plain", 404)
+                return text_response(self, html)
+            if parsed.path.startswith("/pdf-page/"):
+                parts = parsed.path.removeprefix("/pdf-page/").rsplit("/", 1)
+                if len(parts) != 2 or not parts[1].endswith(".png"):
+                    return text_response(self, "Not found", "text/plain", 404)
+                page_index = parts[1].removesuffix(".png")
+                try:
+                    image_data = render_pdf_page_png(parts[0], page_index)
+                except Exception:
+                    image_data = None
+                if not image_data:
+                    return text_response(self, "Not found", "text/plain", 404)
+                return bytes_response(self, image_data, "image/png")
+            if parsed.path.startswith("/brand/"):
+                file_name = Path(unquote(parsed.path.removeprefix("/brand/"))).name
+                path = (BRAND_DIR / file_name).resolve()
+                brand_root = BRAND_DIR.resolve()
+                if brand_root not in path.parents or not path.exists() or path.suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp"):
+                    return text_response(self, "Not found", "text/plain", 404)
+                content_types = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}
+                return file_response(self, path, content_types.get(path.suffix.lower(), "application/octet-stream"))
+            if parsed.path == "/api/projects":
+                return json_response(self, rows("SELECT * FROM projects ORDER BY project_code"))
+            if parsed.path == "/api/me":
+                return json_response(self, user)
+            if parsed.path == "/api/users":
+                if not require_admin(self):
+                    return json_response(self, {"error": "Admin required"}, 403)
+                return json_response(self, rows("SELECT id, username, display_name, role, active, created_at FROM users ORDER BY username"))
+            if parsed.path == "/api/bid-summary":
+                return json_response(self, bid_summary())
+            if parsed.path == "/api/bids":
+                return json_response(self, rows("SELECT * FROM bid_requests ORDER BY bid_due_date, rfq_no"))
+            if parsed.path == "/api/rate-sets":
+                return json_response(self, rows("SELECT * FROM rate_sets WHERE active = 1 ORDER BY name"))
+            if parsed.path == "/api/subprojects":
+                return json_response(self, rows("SELECT * FROM subprojects WHERE project_id = ? ORDER BY code", (qs.get("project_id", [""])[0],)))
+            if parsed.path == "/api/change-orders":
+                return json_response(self, rows("SELECT * FROM change_orders WHERE project_id = ? ORDER BY co_number", (qs.get("project_id", [""])[0],)))
+            if parsed.path == "/api/customer-invoices":
+                return json_response(
+                    self,
+                    rows(
+                        """
+                        SELECT ci.*, sp.job_number, sp.code AS subproject_code, co.co_number, co.job_number AS co_job_number
+                        FROM customer_invoices ci
+                        LEFT JOIN subprojects sp ON sp.id = ci.subproject_id
+                        LEFT JOIN change_orders co ON co.id = ci.change_order_id
+                        WHERE ci.project_id = ?
+                        ORDER BY ci.invoice_date DESC, ci.id DESC
+                        """,
+                        (qs.get("project_id", [""])[0],),
+                    ),
+                )
+            if parsed.path == "/api/internal-rates":
+                return json_response(self, rows("SELECT * FROM internal_rates WHERE active = 1 ORDER BY rate_set_id, category_type, category"))
+            if parsed.path == "/api/cost-records":
+                return json_response(self, rows("SELECT * FROM cost_records WHERE project_id = ? ORDER BY CASE WHEN subproject_id IS NULL THEN 0 ELSE 1 END, record_date DESC, id DESC", (qs.get("project_id", [""])[0],)))
+            if parsed.path == "/api/imports":
+                return json_response(
+                    self,
+                    rows(
+                        """
+                        SELECT
+                          source,
+                          source_file,
+                          COUNT(*) AS record_count,
+                          COALESCE(SUM(sales_amount), 0) AS sales_amount,
+                          COALESCE(SUM(amount), 0) AS raw_amount,
+                          MAX(created_at) AS last_imported
+                        FROM cost_records
+                        WHERE project_id = ?
+                          AND source IN ('Field Wise', 'Field Wise PDF', 'Vendor Invoice')
+                          AND source_file IS NOT NULL
+                        GROUP BY source, source_file
+                        ORDER BY MAX(created_at) DESC
+                        """,
+                        (qs.get("project_id", [""])[0],),
+                    ),
+                )
+            if parsed.path == "/api/vendor-invoice-lines":
+                return json_response(
+                    self,
+                    rows(
+                        """
+                        SELECT cr.*, sp.job_number, sp.code AS subproject_code
+                        FROM cost_records cr
+                        LEFT JOIN subprojects sp ON sp.id = cr.subproject_id
+                        WHERE cr.project_id = ?
+                          AND cr.source = 'Vendor Invoice'
+                        ORDER BY cr.record_date DESC, cr.ticket_or_invoice, cr.id
+                        """,
+                        (qs.get("project_id", [""])[0],),
+                    ),
+                )
+            if parsed.path == "/api/summary":
+                summary = project_summary(qs.get("project_id", [""])[0])
+                return json_response(self, summary or {"error": "Project not found"}, 200 if summary else 404)
+            if parsed.path == "/api/subproject-detail":
+                detail = subproject_detail(qs.get("subproject_id", [""])[0], qs.get("change_order_id", [""])[0] or None)
+                return json_response(self, detail or {"error": "Subproject not found"}, 200 if detail else 404)
+            if parsed.path == "/api/master-detail":
+                detail = master_project_detail(qs.get("project_id", [""])[0])
+                return json_response(self, detail or {"error": "Project not found"}, 200 if detail else 404)
+            return text_response(self, "Not found", "text/plain", 404)
+        except Exception as e:
+            traceback.print_exc()
+            return json_response(self, {"error": str(e)}, 500)
+
+    def do_POST(self):
+        try:
+            parsed = urlparse(self.path)
+            if parsed.path == "/api/login":
+                data = parse_json(self)
+                user = one("SELECT * FROM users WHERE username = ? AND active = 1", (data.get("username"),))
+                if not user or not verify_password(data.get("password"), user["password_hash"]):
+                    return json_response(self, {"error": "Invalid login"}, 401)
+                token = create_session(user["id"])
+                return login_success_response(self, token)
+            if parsed.path == "/api/logout":
+                token = parse_cookie_header(self.headers.get("Cookie")).get("pm_session")
+                if token:
+                    execute("DELETE FROM user_sessions WHERE session_token = ?", (token,))
+                return logout_response(self)
+            if not current_user(self):
+                return json_response(self, {"error": "Login required"}, 401)
+            if not require_editor(self):
+                return json_response(self, {"error": "Read-only users cannot make changes."}, 403)
+            if parsed.path == "/api/import-fieldwise":
+                form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": self.headers.get("Content-Type")})
+                project_id = form.getvalue("project_id")
+                file_item = form["file"]
+                safe_name = Path(file_item.filename).name
+                path = UPLOAD_DIR / f"{datetime.now().strftime('%Y%m%d%H%M%S')}-{safe_name}"
+                with open(path, "wb") as f:
+                    f.write(file_item.file.read())
+                if safe_name.lower().endswith(".pdf"):
+                    result = import_fieldwise_pdf(path, project_id)
+                else:
+                    result = import_fieldwise_xlsx(path, project_id)
+                return json_response(self, {
+                    "imported": result["count"],
+                    "skipped": result["skipped"],
+                    "order_number": result["order_number"],
+                    "matched_subproject_id": result["matched_subproject_id"],
+                    "matched_change_order_id": result.get("matched_change_order_id"),
+                })
+            if parsed.path == "/api/import-vendor-invoice":
+                form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": self.headers.get("Content-Type")})
+                project_id = form.getvalue("project_id")
+                file_item = form["file"]
+                safe_name = Path(file_item.filename).name
+                path = UPLOAD_DIR / f"{datetime.now().strftime('%Y%m%d%H%M%S')}-{safe_name}"
+                with open(path, "wb") as f:
+                    f.write(file_item.file.read())
+                result = import_vendor_invoice_pdf(path, project_id)
+                return json_response(
+                    self,
+                    {
+                        "imported": result["count"],
+                        "skipped": result["skipped"],
+                        "order_number": result["order_number"],
+                        "matched_subproject_id": result["matched_subproject_id"],
+                        "vendor": result["vendor"],
+                        "invoice_number": result["invoice_number"],
+                        "duplicate": result.get("duplicate", False),
+                        "existing_line_count": result.get("existing_line_count", 0),
+                        "existing_total": result.get("existing_total", 0),
+                        "existing_source_file": result.get("existing_source_file", ""),
+                    },
+                )
+
+            data = parse_json(self)
+            now = datetime.now().isoformat(timespec="seconds")
+            if parsed.path == "/api/users":
+                if not require_admin(self):
+                    return json_response(self, {"error": "Admin required"}, 403)
+                new_id = execute(
+                    "INSERT INTO users (username, display_name, password_hash, role, active, created_at) VALUES (?, ?, ?, ?, 1, ?)",
+                    (data.get("username"), data.get("display_name"), hash_password(data.get("password")), clean_role(data.get("role")), now),
+                )
+                return json_response(self, {"id": new_id})
+            if parsed.path == "/api/projects":
+                new_id = execute(
+                    "INSERT INTO projects (project_code, name, customer, location, customer_po, description, rate_set_id, contract_value, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (data.get("project_code"), data.get("name"), data.get("customer"), data.get("location"), data.get("customer_po"), data.get("description"), data.get("rate_set_id") or None, money(data.get("contract_value")), now),
+                )
+                return json_response(self, {"id": new_id})
+            if parsed.path == "/api/bids":
+                estimated_cost = money(data.get("estimated_cost"))
+                target_margin = money(data.get("target_margin"))
+                probability = money(data.get("probability"))
+                bid_price = bid_price_value(estimated_cost, target_margin)
+                outcome = data.get("outcome") or "Pending"
+                weighted = weighted_bid_value(outcome, bid_price, probability)
+                new_id = execute(
+                    """
+                    INSERT INTO bid_requests (
+                      rfq_no, date_received, customer, project_name, estimator, stage, bid_due_date,
+                      go_no_go, estimated_cost, target_margin, bid_price, probability, weighted_value,
+                      submission_status, outcome, notes, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        data.get("rfq_no"),
+                        data.get("date_received"),
+                        data.get("customer"),
+                        data.get("project_name"),
+                        data.get("estimator"),
+                        data.get("stage"),
+                        data.get("bid_due_date"),
+                        data.get("go_no_go"),
+                        estimated_cost,
+                        target_margin,
+                        bid_price,
+                        probability,
+                        weighted,
+                        data.get("stage"),
+                        outcome,
+                        data.get("notes"),
+                        now,
+                        now,
+                    ),
+                )
+                return json_response(self, {"id": new_id})
+            if parsed.path == "/api/subprojects":
+                new_id = execute(
+                    "INSERT INTO subprojects (project_id, job_number, code, name, pricing_type, contract_value, budget_labor_hours, budget_labor, budget_material, budget_equipment, budget_vendor, budget_other) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)",
+                    (
+                        data.get("project_id"),
+                        data.get("job_number"),
+                        data.get("code"),
+                        data.get("name"),
+                        data.get("pricing_type") or "Fixed",
+                        money(data.get("contract_value")),
+                        money(data.get("budget_labor_hours")),
+                        money(data.get("budget_labor")),
+                        money(data.get("budget_material")),
+                        money(data.get("budget_equipment")),
+                    ),
+                )
+                execute(
+                    "UPDATE projects SET contract_value = (SELECT COALESCE(SUM(contract_value), 0) FROM subprojects WHERE project_id = ?) WHERE id = ?",
+                    (data.get("project_id"), data.get("project_id")),
+                )
+                return json_response(self, {"id": new_id})
+            if parsed.path == "/api/change-orders":
+                new_id = execute(
+                    "INSERT INTO change_orders (project_id, subproject_id, co_number, job_number, pricing_type, title, status, quoted_value, approved_value) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        data.get("project_id"),
+                        data.get("subproject_id") or None,
+                        data.get("co_number"),
+                        data.get("job_number"),
+                        data.get("pricing_type") or "Fixed",
+                        data.get("title"),
+                        data.get("status"),
+                        money(data.get("quoted_value")),
+                        0 if data.get("pricing_type") == "T&M" else money(data.get("approved_value")),
+                    ),
+                )
+                return json_response(self, {"id": new_id})
+            if parsed.path == "/api/customer-invoices":
+                new_id = execute(
+                    """
+                    INSERT INTO customer_invoices (
+                      project_id, subproject_id, change_order_id, invoice_number, billing_type,
+                      invoice_date, due_date, status, amount, paid_amount, notes, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        data.get("project_id"),
+                        data.get("subproject_id") or None,
+                        data.get("change_order_id") or None,
+                        data.get("invoice_number"),
+                        data.get("billing_type") or "Progress",
+                        data.get("invoice_date"),
+                        data.get("due_date"),
+                        data.get("status") or "Draft",
+                        money(data.get("amount")),
+                        money(data.get("paid_amount")),
+                        data.get("notes"),
+                        now,
+                    ),
+                )
+                return json_response(self, {"id": new_id})
+            if parsed.path == "/api/internal-rates":
+                existing_rate = one(
+                    "SELECT id FROM internal_rates WHERE rate_set_id = ? AND category_type = ? AND category = ?",
+                    (data.get("rate_set_id") or None, data.get("category_type"), data.get("category")),
+                )
+                if existing_rate:
+                    execute(
+                        "UPDATE internal_rates SET raw_rate = ?, active = 1 WHERE id = ?",
+                        (money(data.get("raw_rate")), existing_rate["id"]),
+                    )
+                    new_id = existing_rate["id"]
+                else:
+                    new_id = execute(
+                        "INSERT INTO internal_rates (rate_set_id, category_type, category, raw_rate, active) VALUES (?, ?, ?, ?, 1)",
+                        (data.get("rate_set_id") or None, data.get("category_type"), data.get("category"), money(data.get("raw_rate"))),
+                    )
+                updated = apply_internal_rate(data.get("category_type"), data.get("category"), money(data.get("raw_rate")), data.get("rate_set_id"))
+                return json_response(self, {"id": new_id, "updated_cost_records": updated})
+            if parsed.path == "/api/imports/delete":
+                with db() as con:
+                    deleted = con.execute(
+                        """
+                        DELETE FROM cost_records
+                        WHERE project_id = ?
+                          AND source = ?
+                          AND source_file = ?
+                        """,
+                        (data.get("project_id"), data.get("source"), data.get("source_file")),
+                    ).rowcount
+                return json_response(self, {"deleted": deleted})
+            if parsed.path == "/api/cost-records/bulk-update":
+                ids = [str(x) for x in data.get("ids", []) if str(x).isdigit()]
+                if not ids:
+                    return json_response(self, {"updated": 0})
+                change_order_id = data.get("change_order_id") or None
+                subproject_id = data.get("subproject_id") or None
+                placeholders = ",".join(["?"] * len(ids))
+                with db() as con:
+                    updated = con.execute(
+                        f"""
+                        UPDATE cost_records
+                        SET subproject_id = ?,
+                            change_order_id = ?,
+                            amount = CASE
+                              WHEN cost_type = 'Field Ticket Material' THEN
+                                CASE WHEN ? IS NOT NULL OR COALESCE((SELECT pricing_type FROM subprojects WHERE id = ?), 'Fixed') = 'T&M'
+                                  THEN COALESCE(sales_amount, 0) * ? ELSE 0 END
+                              ELSE amount
+                            END,
+                            raw_rate = CASE
+                              WHEN cost_type = 'Field Ticket Material' THEN
+                                CASE WHEN ? IS NOT NULL OR COALESCE((SELECT pricing_type FROM subprojects WHERE id = ?), 'Fixed') = 'T&M'
+                                  THEN COALESCE(sales_rate, rate, 0) * ? ELSE 0 END
+                              ELSE raw_rate
+                            END,
+                            raw_cost_source = CASE
+                              WHEN cost_type = 'Field Ticket Material' THEN
+                                CASE
+                                  WHEN ? IS NOT NULL THEN 'CO T&M material estimate at 35% margin'
+                                  WHEN COALESCE((SELECT pricing_type FROM subprojects WHERE id = ?), 'Fixed') = 'T&M' THEN 'Subproject T&M material estimate at 35% margin'
+                                  ELSE 'Usage only - not budget cost'
+                                END
+                              ELSE raw_cost_source
+                            END
+                        WHERE id IN ({placeholders})
+                        """,
+                        (
+                            subproject_id,
+                            change_order_id,
+                            change_order_id,
+                            subproject_id,
+                            CO_MATERIAL_COST_FACTOR,
+                            change_order_id,
+                            subproject_id,
+                            CO_MATERIAL_COST_FACTOR,
+                            change_order_id,
+                            subproject_id,
+                            *ids,
+                        ),
+                    ).rowcount
+                return json_response(self, {"updated": updated})
+            if parsed.path == "/api/vendor-invoice/subproject":
+                with db() as con:
+                    updated = con.execute(
+                        """
+                        UPDATE cost_records
+                        SET subproject_id = ?
+                        WHERE project_id = ?
+                          AND source = 'Vendor Invoice'
+                          AND source_file = ?
+                          AND ticket_or_invoice = ?
+                          AND COALESCE(vendor, '') = COALESCE(?, '')
+                        """,
+                        (
+                            data.get("subproject_id") or None,
+                            data.get("project_id"),
+                            data.get("source_file"),
+                            data.get("ticket_or_invoice"),
+                            data.get("vendor") or "",
+                        ),
+                    ).rowcount
+                return json_response(self, {"updated": updated})
+            if parsed.path == "/api/invoices":
+                new_id = execute(
+                    """
+                    INSERT INTO cost_records (
+                      project_id, subproject_id, change_order_id, source, ticket_or_invoice, record_date, status,
+                      cost_type, description, amount, vendor, created_at
+                    ) VALUES (?, ?, ?, 'Vendor Invoice', ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (data.get("project_id"), data.get("subproject_id") or None, data.get("change_order_id") or None, data.get("ticket_or_invoice"), data.get("record_date"), data.get("status"), data.get("cost_type"), data.get("description"), money(data.get("amount")), data.get("vendor"), now),
+                )
+                return json_response(self, {"id": new_id})
+            return json_response(self, {"error": "Not found"}, 404)
+        except Exception as e:
+            traceback.print_exc()
+            return json_response(self, {"error": str(e)}, 500)
+
+    def do_PUT(self):
+        try:
+            parsed = urlparse(self.path)
+            data = parse_json(self)
+            if not current_user(self):
+                return json_response(self, {"error": "Login required"}, 401)
+            if not require_editor(self):
+                return json_response(self, {"error": "Read-only users cannot make changes."}, 403)
+            if parsed.path.startswith("/api/users/"):
+                if not require_admin(self):
+                    return json_response(self, {"error": "Admin required"}, 403)
+                user_id = parsed.path.rsplit("/", 1)[-1]
+                if "password" in data and data.get("password"):
+                    execute("UPDATE users SET password_hash = ? WHERE id = ?", (hash_password(data.get("password")), user_id))
+                if "role" in data:
+                    execute("UPDATE users SET role = ? WHERE id = ?", (clean_role(data.get("role")), user_id))
+                if "active" in data:
+                    execute("UPDATE users SET active = ? WHERE id = ?", (1 if str(data.get("active")) == "1" else 0, user_id))
+                return json_response(self, {"ok": True})
+            if parsed.path.startswith("/api/cost-records/"):
+                record_id = parsed.path.rsplit("/", 1)[-1]
+                cost_type = data.get("cost_type") or None
+                if cost_type == "Field Ticket Material":
+                    change_order_id = data.get("change_order_id") or None
+                    subproject_id = data.get("subproject_id") or None
+                    execute(
+                        """
+                        UPDATE cost_records
+                        SET subproject_id = ?,
+                            change_order_id = ?,
+                            cost_type = ?,
+                            amount = CASE
+                              WHEN ? IS NOT NULL OR COALESCE((SELECT pricing_type FROM subprojects WHERE id = ?), 'Fixed') = 'T&M'
+                                THEN COALESCE(sales_amount, 0) * ?
+                              ELSE 0
+                            END,
+                            raw_rate = CASE
+                              WHEN ? IS NOT NULL OR COALESCE((SELECT pricing_type FROM subprojects WHERE id = ?), 'Fixed') = 'T&M'
+                                THEN COALESCE(sales_rate, rate, 0) * ?
+                              ELSE 0
+                            END,
+                            raw_cost_source = CASE
+                              WHEN ? IS NOT NULL THEN 'CO T&M material estimate at 35% margin'
+                              WHEN COALESCE((SELECT pricing_type FROM subprojects WHERE id = ?), 'Fixed') = 'T&M' THEN 'Subproject T&M material estimate at 35% margin'
+                              ELSE 'Usage only - not budget cost'
+                            END
+                        WHERE id = ?
+                        """,
+                        (
+                            subproject_id,
+                            change_order_id,
+                            cost_type,
+                            change_order_id,
+                            subproject_id,
+                            CO_MATERIAL_COST_FACTOR,
+                            change_order_id,
+                            subproject_id,
+                            CO_MATERIAL_COST_FACTOR,
+                            change_order_id,
+                            subproject_id,
+                            record_id,
+                        ),
+                    )
+                else:
+                    execute(
+                        "UPDATE cost_records SET subproject_id = ?, change_order_id = ?, cost_type = ? WHERE id = ?",
+                        (data.get("subproject_id") or None, data.get("change_order_id") or None, cost_type, record_id),
+                    )
+                return json_response(self, {"ok": True})
+            if parsed.path.startswith("/api/projects/"):
+                project_id = parsed.path.rsplit("/", 1)[-1]
+                execute(
+                    """
+                    UPDATE projects
+                    SET project_code = ?, name = ?, customer = ?, location = ?, customer_po = ?, description = ?, rate_set_id = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        data.get("project_code"),
+                        data.get("name"),
+                        data.get("customer"),
+                        data.get("location"),
+                        data.get("customer_po"),
+                        data.get("description"),
+                        data.get("rate_set_id") or None,
+                        project_id,
+                    ),
+                )
+                return json_response(self, {"ok": True})
+            if parsed.path.startswith("/api/bids/"):
+                bid_id = parsed.path.rsplit("/", 1)[-1]
+                estimated_cost = money(data.get("estimated_cost"))
+                target_margin = money(data.get("target_margin"))
+                probability = money(data.get("probability"))
+                bid_price = bid_price_value(estimated_cost, target_margin, data.get("bid_price"))
+                outcome = data.get("outcome") or "Pending"
+                weighted = weighted_bid_value(outcome, bid_price, probability)
+                execute(
+                    """
+                    UPDATE bid_requests
+                    SET rfq_no = ?, date_received = ?, customer = ?, project_name = ?, estimator = ?,
+                        stage = ?, bid_due_date = ?, go_no_go = ?, estimated_cost = ?, target_margin = ?,
+                        bid_price = ?, probability = ?, weighted_value = ?, submission_status = ?,
+                        outcome = ?, notes = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        data.get("rfq_no"),
+                        data.get("date_received"),
+                        data.get("customer"),
+                        data.get("project_name"),
+                        data.get("estimator"),
+                        data.get("stage"),
+                        data.get("bid_due_date"),
+                        data.get("go_no_go"),
+                        estimated_cost,
+                        target_margin,
+                        bid_price,
+                        probability,
+                        weighted,
+                        data.get("stage"),
+                        outcome,
+                        data.get("notes"),
+                        datetime.now().isoformat(timespec="seconds"),
+                        bid_id,
+                    ),
+                )
+                return json_response(self, {"ok": True})
+            if parsed.path.startswith("/api/subprojects/"):
+                subproject_id = parsed.path.rsplit("/", 1)[-1]
+                execute(
+                    """
+                    UPDATE subprojects
+                    SET job_number = ?, code = ?, name = ?, pricing_type = ?, contract_value = ?, budget_labor_hours = ?, budget_labor = ?, budget_material = ?, budget_equipment = ?, budget_vendor = 0, budget_other = 0
+                    WHERE id = ?
+                    """,
+                    (
+                        data.get("job_number"),
+                        data.get("code"),
+                        data.get("name"),
+                        data.get("pricing_type") or "Fixed",
+                        money(data.get("contract_value")),
+                        money(data.get("budget_labor_hours")),
+                        money(data.get("budget_labor")),
+                        money(data.get("budget_material")),
+                        money(data.get("budget_equipment")),
+                        subproject_id,
+                    ),
+                )
+                subproject = one("SELECT project_id FROM subprojects WHERE id = ?", (subproject_id,))
+                if subproject:
+                    execute(
+                        """
+                        UPDATE cost_records
+                        SET amount = CASE
+                              WHEN change_order_id IS NOT NULL OR COALESCE((SELECT pricing_type FROM subprojects WHERE id = cost_records.subproject_id), 'Fixed') = 'T&M'
+                                THEN COALESCE(sales_amount, 0) * ?
+                              ELSE 0
+                            END,
+                            raw_rate = CASE
+                              WHEN change_order_id IS NOT NULL OR COALESCE((SELECT pricing_type FROM subprojects WHERE id = cost_records.subproject_id), 'Fixed') = 'T&M'
+                                THEN COALESCE(sales_rate, rate, 0) * ?
+                              ELSE 0
+                            END,
+                            raw_cost_source = CASE
+                              WHEN change_order_id IS NOT NULL THEN 'CO T&M material estimate at 35% margin'
+                              WHEN COALESCE((SELECT pricing_type FROM subprojects WHERE id = cost_records.subproject_id), 'Fixed') = 'T&M' THEN 'Subproject T&M material estimate at 35% margin'
+                              ELSE 'Usage only - not budget cost'
+                            END
+                        WHERE subproject_id = ?
+                          AND cost_type = 'Field Ticket Material'
+                        """,
+                        (CO_MATERIAL_COST_FACTOR, CO_MATERIAL_COST_FACTOR, subproject_id),
+                    )
+                    execute(
+                        "UPDATE projects SET contract_value = (SELECT COALESCE(SUM(contract_value), 0) FROM subprojects WHERE project_id = ?) WHERE id = ?",
+                        (subproject["project_id"], subproject["project_id"]),
+                    )
+                return json_response(self, {"ok": True})
+            if parsed.path.startswith("/api/customer-invoices/"):
+                invoice_id = parsed.path.rsplit("/", 1)[-1]
+                execute(
+                    """
+                    UPDATE customer_invoices
+                    SET subproject_id = ?, change_order_id = ?, invoice_number = ?, billing_type = ?,
+                        invoice_date = ?, due_date = ?, status = ?, amount = ?, paid_amount = ?, notes = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        data.get("subproject_id") or None,
+                        data.get("change_order_id") or None,
+                        data.get("invoice_number"),
+                        data.get("billing_type") or "Progress",
+                        data.get("invoice_date"),
+                        data.get("due_date"),
+                        data.get("status") or "Draft",
+                        money(data.get("amount")),
+                        money(data.get("paid_amount")),
+                        data.get("notes"),
+                        invoice_id,
+                    ),
+                )
+                return json_response(self, {"ok": True})
+            if parsed.path.startswith("/api/internal-rates/"):
+                rate_id = parsed.path.rsplit("/", 1)[-1]
+                execute(
+                    "UPDATE internal_rates SET category_type = ?, category = ?, raw_rate = ? WHERE id = ?",
+                    (data.get("category_type"), data.get("category"), money(data.get("raw_rate")), rate_id),
+                )
+                rate = one("SELECT rate_set_id FROM internal_rates WHERE id = ?", (rate_id,))
+                updated = apply_internal_rate(data.get("category_type"), data.get("category"), money(data.get("raw_rate")), rate["rate_set_id"] if rate else None)
+                return json_response(self, {"ok": True, "updated_cost_records": updated})
+            return json_response(self, {"error": "Not found"}, 404)
+        except Exception as e:
+            traceback.print_exc()
+            return json_response(self, {"error": str(e)}, 500)
+
+
+if __name__ == "__main__":
+    init_db()
+    print(f"Project Dashboard running at http://{HOST}:{PORT}")
+    print("Press Ctrl+C to stop.")
+    ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
