@@ -1205,6 +1205,11 @@ def project_summary(project_id):
         """,
         (project_id,),
     )
+    for subproject in subprojects:
+        sales_value = money(subproject.get("sales_value"))
+        actual_cost = money(subproject.get("actual_cost"))
+        subproject["profit"] = sales_value - actual_cost
+        subproject["margin"] = subproject["profit"] / sales_value if sales_value else 0
 
     change_orders = rows(
         """
@@ -3135,7 +3140,7 @@ HTML = r"""
         invoices = invoices.filter(i => String(i.change_order_id || '') === String(selectedCo.id));
       } else if (selectedSubproject) {
         label = `${selectedSubproject.job_number || ''} ${selectedSubproject.code || ''}`;
-        contractValue = Number(selectedSubproject.contract_value || 0);
+        contractValue = Number(selectedSubproject.sales_value || selectedSubproject.contract_value || 0);
         const subprojectCoIds = summary.change_orders
           .filter(co => String(co.subproject_id || '') === String(selectedSubproject.id))
           .map(co => String(co.id));
@@ -3717,12 +3722,14 @@ HTML = r"""
     }
 
     function subprojectTable(subprojects, selectedId=null) {
-      return `<table><thead><tr><th>Job</th><th>Code</th><th>Name</th><th>Pricing</th><th>Sales / Contract</th><th>Labor Hrs</th><th>Budget</th><th>Raw Actual</th><th>Used</th></tr></thead><tbody>${subprojects.map(x => {
+      return `<table><thead><tr><th>Job</th><th>Code</th><th>Name</th><th>Pricing</th><th>Sales / Contract</th><th>Labor Hrs</th><th>Budget</th><th>Raw Actual</th><th>Profit</th><th>Margin</th><th>Used</th></tr></thead><tbody>${subprojects.map(x => {
         const used = x.budget_total ? x.actual_cost / x.budget_total : 0;
         const laborUsed = Number(x.labor_hours_used || 0);
         const laborBudget = Number(x.budget_labor_hours || 0);
         const laborPct = laborBudget ? laborUsed / laborBudget : 0;
         const salesValue = x.pricing_type === 'T&M' ? x.sales_value : x.contract_value;
+        const profit = Number(x.profit || 0);
+        const margin = Number(x.margin || 0);
         const open = `<button class="btn" style="padding:4px 7px" data-open-subproject="${x.id}" type="button">Open</button>`;
         const selected = String(selectedId || '') === String(x.id);
         return `<tr class="selectable-row ${selected ? 'selected' : ''}" data-select-subproject="${x.id}">
@@ -3734,6 +3741,8 @@ HTML = r"""
           <td>${laborUsed.toFixed(2)} / ${laborBudget.toFixed(2)}<br><div class="bar"><span style="width:${Math.min(100, laborPct*100)}%"></span></div></td>
           <td>${money(x.budget_total)}</td>
           <td>${money(x.actual_cost)}</td>
+          <td class="${profit >= 0 ? 'good' : 'bad'}">${money(profit)}</td>
+          <td class="${margin >= 0 ? 'good' : 'bad'}">${pct(margin)}</td>
           <td><div class="bar"><span style="width:${Math.min(100, used*100)}%"></span></div> ${pct(used)}</td>
         </tr>`;
       }).join('')}</tbody></table>`;
