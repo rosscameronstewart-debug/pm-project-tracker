@@ -16,6 +16,25 @@ Then open:
 http://127.0.0.1:8765
 ```
 
+## Server Bind Address
+
+By default the app binds to `127.0.0.1` for local development.
+
+For a Lightsail/Tailscale server, bind to all interfaces:
+
+```powershell
+$env:PM_TRACKER_HOST="0.0.0.0"
+$env:PM_TRACKER_PORT="8765"
+python app.py
+```
+
+On Linux/systemd, set:
+
+```text
+PM_TRACKER_HOST=0.0.0.0
+PM_TRACKER_PORT=8765
+```
+
 ## First Workflow
 
 1. Create a master project.
