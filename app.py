@@ -2297,7 +2297,6 @@ LOGIN_HTML = r"""
     <label>Password</label><input name="password" type="password" autocomplete="current-password" required>
     <button type="submit">Log In</button>
     <div class="error" id="loginError"></div>
-    <div class="hint">Default first login: admin / ChangeMe123!. Change this after creating your real admin users.</div>
   </form>
   <script>
     document.getElementById('loginForm').onsubmit = async event => {
