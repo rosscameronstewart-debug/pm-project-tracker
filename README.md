@@ -4,6 +4,12 @@ A local project-cost tracking tool for industrial electrical jobs with master pr
 
 ## Start
 
+Install Python dependencies:
+
+```powershell
+python -m pip install -r requirements.txt
+```
+
 Run:
 
 ```powershell
@@ -34,6 +40,10 @@ On Linux/systemd, set:
 PM_TRACKER_HOST=0.0.0.0
 PM_TRACKER_PORT=8765
 ```
+
+## OCR Invoice Imports
+
+Scanned/image-only vendor invoices require OCR support. Install the dependencies in `requirements.txt`; the app uses `rapidocr_onnxruntime` as an automatic OCR fallback when a PDF has no embedded text.
 
 ## First Workflow
 

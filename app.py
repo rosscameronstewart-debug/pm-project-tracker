@@ -465,7 +465,7 @@ def date_text(value):
     text = str(value or "").strip()
     if not text:
         return ""
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%m/%d/%Y"):
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y"):
         try:
             return datetime.strptime(text, fmt).date().isoformat()
         except ValueError:
@@ -1882,10 +1882,10 @@ def import_vendor_invoice_pdf(path, project_id):
 
     source_file = Path(path).name
     lower = text.lower()
+    compact_lower = re.sub(r"\s+", "", lower)
     if "dsgsupply" in lower or "dakota supply group" in lower or "dsg truck delivery" in lower or "dsg#" in lower:
         vendor = "Dakota Supply Group"
         item_lines = []
-        compact_lower = re.sub(r"\s+", "", lower)
         if ("invoicesummary" in compact_lower or "invoice summary" in lower) and "qty" in lower and "subtotal" in lower:
             invoice_number = first_regex([r"Invoice#\s*:?\s*([A-Za-z0-9.\-]+)"], text)
             invoice_date = first_regex([r"Invoice Date\s*:?\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4})"], text)
@@ -2024,13 +2024,16 @@ def import_vendor_invoice_pdf(path, project_id):
                     current["description"] += " " + line
             if current:
                 item_lines.append(current)
-    elif "ced williston" in lower:
+    elif "ced williston" in lower or "cedwilliston" in compact_lower:
         vendor = "CED Williston"
-        invoice_header = re.search(r"([0-9]{3,}\s*-\s*[0-9]{3,})\s+([0-9]{2}/[0-9]{2}/[0-9]{2})", text)
-        invoice_number = invoice_header.group(1).strip() if invoice_header else ""
+        invoice_header = re.search(r"([0-9]{3,}\s*-\s*[0-9]{3,})\s+([0-9]{2}/[0-9]{2}/[0-9]{2,4})", text)
+        invoice_number = invoice_header.group(1).strip() if invoice_header else first_regex([r"\b([0-9]{3,}\s*-\s*[0-9]{3,})\b"], text)
         invoice_date = invoice_header.group(2).strip() if invoice_header else ""
-        order_number = first_regex([r"CUSTOMER\s*\nORDER\s*\n.*?([0-9]{3,})\s*\nSALES PERSON", r"\bORDER\s*\n.*?([0-9]{3,})"], text, flags=re.IGNORECASE | re.DOTALL)
-        total_due = parse_money_text(first_regex([r"TOTAL DUE\s+([0-9,]+\.[0-9]{2})"], text))
+        if not invoice_date and invoice_number:
+            invoice_date = first_regex([re.escape(invoice_number) + r".*?([0-9]{2}/[0-9]{2}/[0-9]{4})", re.escape(invoice_number) + r".*?([0-9]{2}/[0-9]{2}/[0-9]{2})"], text, flags=re.IGNORECASE | re.DOTALL)
+        invoice_date = date_text(invoice_date)
+        order_number = first_regex([r"\b(HUNT-[0-9]+)\b", r"CUSTOMERORDERNO\.\s*\n([A-Za-z0-9\-]+)", r"CUSTOMER\s*\nORDER\s*\n.*?([A-Za-z0-9\-]+)\s*\nSALES PERSON", r"\bORDER\s*\n.*?([0-9]{3,})"], text, flags=re.IGNORECASE | re.DOTALL)
+        total_due = parse_money_text(first_regex([r"TOTAL\s*DUE\s+([0-9,]+\.[0-9]{2})", r"TOTALDUE\s*\n?\s*([0-9,]+\.[0-9]{2})"], text, flags=re.IGNORECASE))
         item_lines = []
         current = None
         stop_re = re.compile(r"^(TITLE TO|AT POINT|MERCHANDISE|A SERVICE|THIS SALE|CODE:|B -|C -|SALES TAX|SHIPPING CHARGE|TOTAL DUE)\b", re.IGNORECASE)
@@ -2067,6 +2070,31 @@ def import_vendor_invoice_pdf(path, project_id):
                 current["description"] += " " + line
         if current:
             item_lines.append(current)
+        if not item_lines:
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            for i, line in enumerate(lines):
+                start = re.match(r"^([0-9]+)([A-Z][A-Z0-9\-]*)$", line)
+                if not start or i + 3 >= len(lines):
+                    continue
+                ordered_qty, maker = start.groups()
+                description = lines[i + 1]
+                shipped_qty = money(lines[i + 2])
+                unit_price = parse_money_text(lines[i + 3])
+                if not shipped_qty or not unit_price:
+                    continue
+                product_code_tail = ""
+                for later in lines[i + 4:i + 8]:
+                    if re.fullmatch(r"[A-Z0-9][A-Z0-9\-]{2,}", later) and not re.fullmatch(r"[A-Z]", later):
+                        product_code_tail = later
+                        break
+                item_lines.append({
+                    "product_code": " ".join([maker, product_code_tail]).strip(),
+                    "description": description,
+                    "qty": shipped_qty or money(ordered_qty),
+                    "unit_price": unit_price,
+                    "amount": (shipped_qty or money(ordered_qty)) * unit_price,
+                })
+                break
     elif "border states" in lower:
         vendor = "Border States"
         invoice_number = first_regex([r"Invoice:\s*([A-Za-z0-9\-]+)"], text, flags=re.IGNORECASE)
