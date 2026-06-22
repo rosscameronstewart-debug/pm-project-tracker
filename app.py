@@ -9,7 +9,7 @@ import sqlite3
 import sys
 import tempfile
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
@@ -46,6 +46,7 @@ BRAND_DIR = DATA_DIR / "brand"
 DB_PATH = DATA_DIR / "pm_tracker.sqlite3"
 HOST = os.environ.get("PM_TRACKER_HOST", "127.0.0.1")
 PORT = int(os.environ.get("PM_TRACKER_PORT", "8765"))
+SESSION_IDLE_TIMEOUT_MINUTES = 30
 CO_MATERIAL_MARGIN = 0.35
 CO_MATERIAL_COST_FACTOR = 1 - CO_MATERIAL_MARGIN
 BID_TRACKER_SOURCE = Path(r"C:\Users\rossc\Twin Peaks Electrical\Project Manager WIP - General\Bid Request Management\_Bid Tracker\Bid Tracker.xlsx")
@@ -510,7 +511,8 @@ def verify_password(password, password_hash):
 def create_session(user_id):
     token = secrets.token_urlsafe(32)
     now = datetime.now()
-    expires = now.replace(year=now.year + 1)
+    expires = now + timedelta(minutes=SESSION_IDLE_TIMEOUT_MINUTES)
+    execute("DELETE FROM user_sessions WHERE expires_at <= ?", (now.isoformat(timespec="seconds"),))
     execute(
         "INSERT INTO user_sessions (user_id, session_token, created_at, expires_at) VALUES (?, ?, ?, ?)",
         (user_id, token, now.isoformat(timespec="seconds"), expires.isoformat(timespec="seconds")),
@@ -532,6 +534,7 @@ def current_user(handler):
     token = parse_cookie_header(handler.headers.get("Cookie")).get("pm_session")
     if not token:
         return None
+    now = datetime.now()
     user = one(
         """
         SELECT users.id, users.username, users.display_name, users.role, users.active
@@ -541,8 +544,14 @@ def current_user(handler):
           AND users.active = 1
           AND user_sessions.expires_at > ?
         """,
-        (token, datetime.now().isoformat(timespec="seconds")),
+        (token, now.isoformat(timespec="seconds")),
     )
+    if user:
+        new_expires = now + timedelta(minutes=SESSION_IDLE_TIMEOUT_MINUTES)
+        execute(
+            "UPDATE user_sessions SET expires_at = ? WHERE session_token = ?",
+            (new_expires.isoformat(timespec="seconds"), token),
+        )
     return user
 
 
@@ -1123,12 +1132,22 @@ def project_summary(project_id):
     totals = one(
         """
         SELECT
-          COALESCE(SUM(amount), 0) actual_cost,
-          COALESCE(SUM(CASE WHEN subproject_id IS NULL OR cost_type IS NULL OR cost_type = 'Uncoded' OR raw_cost_source IN ('Missing project rate', 'Missing internal rate') THEN amount ELSE 0 END), 0) uncoded_cost,
+          COALESCE(SUM(
+            CASE
+              WHEN cr.change_order_id IS NOT NULL AND COALESCE(co.pricing_type, 'Fixed') = 'T&M' THEN
+                CASE WHEN cr.source IN ('Field Wise', 'Field Wise PDF') THEN cr.amount ELSE 0 END
+              WHEN cr.change_order_id IS NULL AND COALESCE(sp.pricing_type, 'Fixed') = 'T&M' THEN
+                CASE WHEN cr.source IN ('Field Wise', 'Field Wise PDF') THEN cr.amount ELSE 0 END
+              ELSE cr.amount
+            END
+          ), 0) actual_cost,
+          COALESCE(SUM(CASE WHEN cr.subproject_id IS NULL OR cr.cost_type IS NULL OR cr.cost_type = 'Uncoded' OR cr.raw_cost_source IN ('Missing project rate', 'Missing internal rate') THEN cr.amount ELSE 0 END), 0) uncoded_cost,
           COUNT(*) record_count,
-          SUM(CASE WHEN subproject_id IS NULL OR cost_type IS NULL OR cost_type = 'Uncoded' OR raw_cost_source IN ('Missing project rate', 'Missing internal rate') THEN 1 ELSE 0 END) uncoded_count
-        FROM cost_records
-        WHERE project_id = ?
+          SUM(CASE WHEN cr.subproject_id IS NULL OR cr.cost_type IS NULL OR cr.cost_type = 'Uncoded' OR cr.raw_cost_source IN ('Missing project rate', 'Missing internal rate') THEN 1 ELSE 0 END) uncoded_count
+        FROM cost_records cr
+        LEFT JOIN subprojects sp ON sp.id = cr.subproject_id
+        LEFT JOIN change_orders co ON co.id = cr.change_order_id
+        WHERE cr.project_id = ?
         """,
         (project_id,),
     )
@@ -1190,7 +1209,13 @@ def project_summary(project_id):
           sp.contract_value,
           sp.budget_labor_hours,
           sp.budget_labor + sp.budget_material + COALESCE(sp.budget_equipment, 0) AS budget_total,
-          COALESCE(SUM(CASE WHEN cr.change_order_id IS NULL THEN cr.amount ELSE 0 END), 0) actual_cost,
+          COALESCE(SUM(
+            CASE
+              WHEN cr.change_order_id IS NULL AND COALESCE(sp.pricing_type, 'Fixed') = 'T&M' AND cr.source IN ('Field Wise', 'Field Wise PDF') THEN cr.amount
+              WHEN cr.change_order_id IS NULL AND COALESCE(sp.pricing_type, 'Fixed') <> 'T&M' THEN cr.amount
+              ELSE 0
+            END
+          ), 0) actual_cost,
           COALESCE(SUM(CASE WHEN cr.cost_type = 'Labor' AND cr.change_order_id IS NULL THEN cr.qty ELSE 0 END), 0) labor_hours_used,
           COALESCE(SUM(CASE WHEN cr.change_order_id IS NULL AND cr.source IN ('Field Wise', 'Field Wise PDF') THEN cr.sales_amount ELSE 0 END), 0) fieldwise_sales,
           CASE WHEN COALESCE(sp.pricing_type, 'Fixed') = 'T&M' THEN
@@ -1366,10 +1391,19 @@ def subproject_detail(subproject_id, change_order_id=None):
                 scope_label += f" / {selected_co.get('job_number')}"
             cost_scope_sql = "subproject_id = ? AND change_order_id = ?"
             cost_scope_params = [subproject_id, change_order_id]
+    is_tm_scope = (
+        (selected_co and (selected_co.get("pricing_type") or "Fixed") == "T&M")
+        or (not selected_co and (subproject.get("pricing_type") or "Fixed") == "T&M")
+    )
     totals = one(
         f"""
         SELECT
-          COALESCE(SUM(amount), 0) raw_actual,
+          COALESCE(SUM(
+            CASE
+              WHEN ? = 1 THEN CASE WHEN source IN ('Field Wise', 'Field Wise PDF') THEN amount ELSE 0 END
+              ELSE amount
+            END
+          ), 0) raw_actual,
           COALESCE(SUM(CASE WHEN cost_type = 'Labor' THEN qty ELSE 0 END), 0) labor_hours_used,
           COALESCE(SUM(CASE WHEN cost_type = 'Field Ticket Material' THEN sales_amount ELSE 0 END), 0) field_ticket_material,
           COALESCE(SUM(CASE WHEN source = 'Vendor Invoice' AND cost_type = 'Material' THEN amount ELSE 0 END), 0) vendor_material,
@@ -1377,19 +1411,25 @@ def subproject_detail(subproject_id, change_order_id=None):
         FROM cost_records
         WHERE {cost_scope_sql}
         """,
-        tuple(cost_scope_params),
+        tuple([1 if is_tm_scope else 0] + cost_scope_params),
     )
     by_type = rows(
         f"""
         SELECT
           COALESCE(cost_type, 'Uncoded') label,
-          COALESCE(SUM(CASE WHEN cost_type = 'Field Ticket Material' THEN sales_amount ELSE amount END), 0) amount
+          COALESCE(SUM(
+            CASE
+              WHEN ? = 1 AND source NOT IN ('Field Wise', 'Field Wise PDF') THEN 0
+              WHEN cost_type = 'Field Ticket Material' THEN sales_amount
+              ELSE amount
+            END
+          ), 0) amount
         FROM cost_records
         WHERE {cost_scope_sql}
         GROUP BY COALESCE(cost_type, 'Uncoded')
         ORDER BY amount DESC
         """,
-        tuple(cost_scope_params),
+        tuple([1 if is_tm_scope else 0] + cost_scope_params),
     )
     records = rows(
         f"""
@@ -2394,6 +2434,11 @@ HTML = r"""
     .home-card { cursor: pointer; transition: border-color .15s ease, box-shadow .15s ease; }
     .home-card:hover { border-color: var(--blue); box-shadow: 0 8px 24px rgba(25, 99, 176, .12); }
     .kpi { min-height: 98px; }
+    .help-card { position: relative; overflow: visible; }
+    .help-marker { position: absolute; top: 10px; right: 10px; z-index: 4; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border: 1px solid var(--line); border-radius: 50%; background: #fbfcfd; color: var(--blue); font-size: 13px; font-weight: 800; cursor: help; }
+    .help-marker:focus { outline: 2px solid rgba(34, 102, 170, .3); outline-offset: 2px; }
+    .help-popover { position: absolute; top: 28px; right: 0; z-index: 30; display: none; width: min(310px, calc(100vw - 52px)); padding: 10px 12px; border: 1px solid #bfd0e0; border-radius: 8px; background: white; color: var(--ink); box-shadow: 0 14px 34px rgba(15, 35, 55, .18); font-size: 13px; font-weight: 500; line-height: 1.38; text-transform: none; }
+    .help-marker:hover .help-popover, .help-marker:focus .help-popover { display: block; }
     .kpi.clickable { cursor: pointer; transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease; }
     .kpi.clickable:hover, .kpi.clickable:focus { border-color: var(--blue); box-shadow: 0 8px 24px rgba(25, 99, 176, .12); outline: none; transform: translateY(-1px); }
     .kpi .label { color: var(--muted); font-size: 13px; font-weight: 650; text-transform: uppercase; }
@@ -2831,6 +2876,7 @@ HTML = r"""
     const money = v => Number(v || 0).toLocaleString(undefined, { style: 'currency', currency: 'USD' });
     const pct = v => `${(Number(v || 0) * 100).toFixed(1)}%`;
     const htmlEscape = v => String(v ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+    const help = text => `<span class="help-marker" tabindex="0" aria-label="${htmlEscape(text)}">?<span class="help-popover">${htmlEscape(text)}</span></span>`;
     const api = async (url, opts={}) => {
       const res = await fetch(url, opts);
       if (res.status === 401) {
@@ -2895,6 +2941,16 @@ HTML = r"""
     });
     document.addEventListener('input', markUnsaved);
     document.addEventListener('change', markUnsaved);
+    document.addEventListener('click', event => {
+      if (event.target.closest('.help-marker')) event.stopPropagation();
+    }, true);
+    document.addEventListener('keydown', event => {
+      if (!event.target.closest('.help-marker')) return;
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+    }, true);
 
     document.querySelectorAll('nav button').forEach(btn => btn.addEventListener('click', async () => {
       if (!(await confirmDiscard())) return;
@@ -3043,14 +3099,20 @@ HTML = r"""
       const marginClass = s.margin >= .2 ? 'good' : s.margin >= .1 ? 'warn' : 'bad';
       document.getElementById('projectBanner').innerHTML = `
         <div class="project-banner">
-          <div class="project-title clickable" id="masterProjectBannerCard" role="button" tabindex="0">
+          <div class="project-title clickable help-card" id="masterProjectBannerCard" role="button" tabindex="0">
+            ${help('Master project totals combine all subprojects and approved change orders. Click to open the full master detail view.')}
             <div class="eyebrow">Master Project</div>
             <div class="name">${s.project.name}</div>
             <div class="muted">${s.project.customer || ''} ${s.project.location ? ' / ' + s.project.location : ''}</div>
             <div class="muted">${s.project.customer_po ? 'PO # ' + s.project.customer_po : ''}</div>
             <div class="muted">${s.project.description || ''}</div>
           </div>
-          ${s.subprojects.map(x => `<div class="job-chip clickable" data-banner-subproject="${x.id}" role="button" tabindex="0"><div class="job">${[x.job_number, x.code].filter(Boolean).join(' ')}</div><div class="label">${x.name}</div><div class="label">${money(x.actual_cost)} actual</div></div>`).join('')}
+          ${s.subprojects.map(x => {
+            const subprojectHelp = x.pricing_type === 'T&M'
+              ? 'T&M subproject actual uses Field Wise labor, equipment, and Field Wise material costs. Vendor invoices are shown for reference but are not counted in T&M raw cost.'
+              : 'Fixed subproject actual includes assigned cost records, including vendor invoices. Click to open this subproject detail.'
+            return `<div class="job-chip clickable help-card" data-banner-subproject="${x.id}" role="button" tabindex="0">${help(subprojectHelp)}<div class="job">${[x.job_number, x.code].filter(Boolean).join(' ')}</div><div class="label">${x.name}</div><div class="label">${money(x.actual_cost)} actual</div></div>`;
+          }).join('')}
         </div>`;
       const masterProjectBannerCard = document.getElementById('masterProjectBannerCard');
       if (masterProjectBannerCard) {
@@ -3081,10 +3143,10 @@ HTML = r"""
       const baseContractInput = document.querySelector('#projectForm input[name="contract_value"]');
       if (baseContractInput) baseContractInput.value = Number(s.base_contract_value || 0).toFixed(2);
       document.getElementById('kpis').innerHTML = `
-        <div class="panel kpi"><div class="label">Contract + Approved COs</div><div class="value">${money(s.contract_value)}</div><div class="hint">Base: ${money(s.base_contract_value)} / Approved COs: ${money(s.approved_co_value)}</div></div>
-        <div class="panel kpi"><div class="label">Raw Actual Cost</div><div class="value">${money(s.actual_cost)}</div><div class="hint">${s.record_count} cost records</div></div>
-        <div class="panel kpi"><div class="label">Projected Profit</div><div class="value ${s.profit >= 0 ? 'good' : 'bad'}">${money(s.profit)}</div><div class="hint ${marginClass}">Margin ${pct(s.margin)}</div></div>
-        <div class="panel kpi clickable" id="needsCodingKpi" role="button" tabindex="0"><div class="label">Needs Coding</div><div class="value ${s.uncoded_count ? 'warn' : 'good'}">${s.uncoded_count}</div><div class="hint">${money(s.uncoded_cost)}</div></div>`;
+        <div class="panel kpi help-card">${help('Base value is the sum of fixed subproject contract values plus Field Wise sales for T&M subprojects. Approved COs are added on top.')}<div class="label">Contract + Approved COs</div><div class="value">${money(s.contract_value)}</div><div class="hint">Base: ${money(s.base_contract_value)} / Approved COs: ${money(s.approved_co_value)}</div></div>
+        <div class="panel kpi help-card">${help('Raw actual cost comes from assigned cost records. For T&M work, vendor invoices are excluded from raw cost; Field Wise labor, equipment, and Field Wise material are used.')}<div class="label">Raw Actual Cost</div><div class="value">${money(s.actual_cost)}</div><div class="hint">${s.record_count} cost records</div></div>
+        <div class="panel kpi help-card">${help('Projected profit equals Contract + Approved COs minus Raw Actual Cost. Margin equals Projected Profit divided by Contract + Approved COs.')}<div class="label">Projected Profit</div><div class="value ${s.profit >= 0 ? 'good' : 'bad'}">${money(s.profit)}</div><div class="hint ${marginClass}">Margin ${pct(s.margin)}</div></div>
+        <div class="panel kpi clickable help-card" id="needsCodingKpi" role="button" tabindex="0">${help('Needs Coding counts cost records that are missing a subproject, cost type, or required internal/project rate. Click to review exceptions.')}<div class="label">Needs Coding</div><div class="value ${s.uncoded_count ? 'warn' : 'good'}">${s.uncoded_count}</div><div class="hint">${money(s.uncoded_cost)}</div></div>`;
       const needsCodingKpi = document.getElementById('needsCodingKpi');
       if (needsCodingKpi) {
         needsCodingKpi.onclick = async () => {
@@ -3172,10 +3234,10 @@ HTML = r"""
       billingSummaryEl.innerHTML = `
         <div class="muted" style="margin-bottom:8px">Showing invoicing for ${htmlEscape(billing.label)}</div>
         <div class="grid cols-4" style="margin-top:8px">
-          <div class="kpi"><div class="label">Billing Stage</div><div class="value" style="font-size:22px">${billing.stage}</div><div class="hint">${billing.invoiceCount} customer invoice(s)</div></div>
-          <div class="kpi"><div class="label">Invoiced Amount</div><div class="value">${money(billing.billed)}</div><div class="hint">${pct(billedPct)} of selected value</div><div class="bar"><span style="width:${Math.min(100, billedPct * 100)}%"></span></div></div>
-          <div class="kpi"><div class="label">Paid Amount</div><div class="value">${money(billing.paid)}</div><div class="hint">${pct(paidPct)} of selected value</div><div class="bar"><span style="width:${Math.min(100, paidPct * 100)}%"></span></div></div>
-          <div class="kpi"><div class="label">Open AR</div><div class="value ${Number(billing.open || 0) ? 'warn' : 'good'}">${money(billing.open)}</div><div class="hint">Remaining to bill ${money(billing.remaining)}</div></div>
+          <div class="kpi help-card">${help('Billing stage is based on customer invoices for the selected master project, subproject, or change order.')}<div class="label">Billing Stage</div><div class="value" style="font-size:22px">${billing.stage}</div><div class="hint">${billing.invoiceCount} customer invoice(s)</div></div>
+          <div class="kpi help-card">${help('Invoiced amount is the total customer invoice amount for the selected scope. The percent compares invoiced amount to the selected sales or contract value.')}<div class="label">Invoiced Amount</div><div class="value">${money(billing.billed)}</div><div class="hint">${pct(billedPct)} of selected value</div><div class="bar"><span style="width:${Math.min(100, billedPct * 100)}%"></span></div></div>
+          <div class="kpi help-card">${help('Paid amount is the total paid amount entered on customer invoices for the selected scope.')}<div class="label">Paid Amount</div><div class="value">${money(billing.paid)}</div><div class="hint">${pct(paidPct)} of selected value</div><div class="bar"><span style="width:${Math.min(100, paidPct * 100)}%"></span></div></div>
+          <div class="kpi help-card">${help('Open AR equals invoiced amount minus paid amount. Remaining to bill equals selected sales or contract value minus invoiced amount.')}<div class="label">Open AR</div><div class="value ${Number(billing.open || 0) ? 'warn' : 'good'}">${money(billing.open)}</div><div class="hint">Remaining to bill ${money(billing.remaining)}</div></div>
         </div>`;
       const billingBtn = document.getElementById('openBillingFromDashboard');
       if (billingBtn) billingBtn.onclick = async () => {
@@ -3760,10 +3822,10 @@ HTML = r"""
       const budgetPct = Number(d.budget_used || 0);
       document.getElementById('subprojectDetail').innerHTML = `
         <div class="grid cols-4">
-          <div class="panel kpi"><div class="label">${d.subproject.pricing_type === 'T&M' && !d.selected_change_order ? 'Field Wise Sales Value' : 'Contract Value'}</div><div class="value">${money(d.contract_value)}</div><div class="hint">${d.subproject.pricing_type || 'Fixed'} pricing</div></div>
-          <div class="panel kpi"><div class="label">Raw Actual Cost</div><div class="value">${money(d.raw_actual)}</div><div class="hint">Budget used ${pct(budgetPct)}</div></div>
-          <div class="panel kpi"><div class="label">Profit</div><div class="value ${d.profit >= 0 ? 'good' : 'bad'}">${money(d.profit)}</div><div class="hint">Margin ${pct(d.margin)}</div></div>
-          <div class="panel kpi"><div class="label">Labor Hours</div><div class="value">${Number(d.labor_hours_used || 0).toFixed(2)}</div><div class="hint">of ${Number(d.labor_hours_budget || 0).toFixed(2)} budgeted</div></div>
+          <div class="panel kpi help-card">${help(d.subproject.pricing_type === 'T&M' && !d.selected_change_order ? 'For T&M base work, sales value is the total Field Wise billable sales imported for this subproject.' : 'For fixed work, contract value is the entered subproject contract or selected change order value.')}<div class="label">${d.subproject.pricing_type === 'T&M' && !d.selected_change_order ? 'Field Wise Sales Value' : 'Contract Value'}</div><div class="value">${money(d.contract_value)}</div><div class="hint">${d.subproject.pricing_type || 'Fixed'} pricing</div></div>
+          <div class="panel kpi help-card">${help(d.subproject.pricing_type === 'T&M' && !d.selected_change_order ? 'For T&M profit, raw actual cost uses Field Wise labor, equipment, and Field Wise material costs. Vendor invoices are visible below but not counted here.' : 'Raw actual cost is the assigned cost-record total for this scope.')}<div class="label">Raw Actual Cost</div><div class="value">${money(d.raw_actual)}</div><div class="hint">Budget used ${pct(budgetPct)}</div></div>
+          <div class="panel kpi help-card">${help('Profit equals the sales or contract value minus raw actual cost. Margin equals profit divided by sales or contract value.')}<div class="label">Profit</div><div class="value ${d.profit >= 0 ? 'good' : 'bad'}">${money(d.profit)}</div><div class="hint">Margin ${pct(d.margin)}</div></div>
+          <div class="panel kpi help-card">${help('Labor hours are summed from Labor cost records for the selected scope and compared against the subproject labor-hour budget.')}<div class="label">Labor Hours</div><div class="value">${Number(d.labor_hours_used || 0).toFixed(2)}</div><div class="hint">of ${Number(d.labor_hours_budget || 0).toFixed(2)} budgeted</div></div>
         </div>
         <div class="grid cols-2" style="margin-top:14px">
           <div>
@@ -3819,10 +3881,10 @@ HTML = r"""
       const budgetPct = Number(d.budget_used || 0);
       document.getElementById('masterDetail').innerHTML = `
         <div class="grid cols-4">
-          <div class="panel kpi"><div class="label">Contract + Approved COs</div><div class="value">${money(d.contract_value)}</div><div class="hint">Base ${money(d.base_contract_value)} / COs ${money(d.approved_co_value)}</div></div>
-          <div class="panel kpi"><div class="label">Raw Actual Cost</div><div class="value">${money(d.raw_actual)}</div><div class="hint">Budget used ${pct(budgetPct)}</div></div>
-          <div class="panel kpi"><div class="label">Profit</div><div class="value ${d.profit >= 0 ? 'good' : 'bad'}">${money(d.profit)}</div><div class="hint">Margin ${pct(d.margin)}</div></div>
-          <div class="panel kpi"><div class="label">Labor Hours</div><div class="value">${Number(d.labor_hours_used || 0).toFixed(2)}</div><div class="hint">of ${Number(d.labor_hours_budget || 0).toFixed(2)} budgeted</div></div>
+          <div class="panel kpi help-card">${help('Master value equals base subproject value plus approved change orders. T&M base value comes from Field Wise sales; fixed base value comes from entered contract values.')}<div class="label">Contract + Approved COs</div><div class="value">${money(d.contract_value)}</div><div class="hint">Base ${money(d.base_contract_value)} / COs ${money(d.approved_co_value)}</div></div>
+          <div class="panel kpi help-card">${help('Master raw actual cost sums assigned cost records. For T&M scopes, vendor invoices are excluded from raw cost and Field Wise costs are used.')}<div class="label">Raw Actual Cost</div><div class="value">${money(d.raw_actual)}</div><div class="hint">Budget used ${pct(budgetPct)}</div></div>
+          <div class="panel kpi help-card">${help('Master profit equals Contract + Approved COs minus Raw Actual Cost. Margin equals profit divided by Contract + Approved COs.')}<div class="label">Profit</div><div class="value ${d.profit >= 0 ? 'good' : 'bad'}">${money(d.profit)}</div><div class="hint">Margin ${pct(d.margin)}</div></div>
+          <div class="panel kpi help-card">${help('Labor hours are summed from all Labor cost records in this master project and compared with the combined labor-hour budget.')}<div class="label">Labor Hours</div><div class="value">${Number(d.labor_hours_used || 0).toFixed(2)}</div><div class="hint">of ${Number(d.labor_hours_budget || 0).toFixed(2)} budgeted</div></div>
         </div>
         <div class="grid cols-2" style="margin-top:14px">
           <div>
