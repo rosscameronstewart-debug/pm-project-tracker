@@ -2779,6 +2779,19 @@ HTML = r"""
     .dashboard-split { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; margin-top: 14px; }
     .dashboard-table-wrap { overflow: auto; max-height: 360px; }
     .dashboard-table-wrap table { min-width: 760px; }
+    .hierarchy-wrap { display: grid; gap: 10px; }
+    .hierarchy-node { border: 1px solid var(--line); border-radius: 8px; background: #fbfcfd; padding: 12px; }
+    .hierarchy-node.collapsible { cursor: pointer; transition: border-color .15s ease, box-shadow .15s ease; }
+    .hierarchy-node.collapsible:hover, .hierarchy-node.collapsible:focus { border-color: var(--blue); box-shadow: 0 8px 24px rgba(25, 99, 176, .10); outline: none; }
+    .hierarchy-node.master { border-left: 5px solid var(--blue); background: white; }
+    .hierarchy-node.subproject { margin-left: 24px; border-left: 4px solid var(--green); }
+    .hierarchy-node.change-order { margin-left: 52px; border-left: 4px solid var(--gold); }
+    .hierarchy-node .node-title { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; font-weight: 750; }
+    .hierarchy-title-left { display: inline-flex; align-items: center; gap: 8px; min-width: 0; }
+    .hierarchy-toggle { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border: 1px solid var(--line); border-radius: 50%; background: white; color: var(--blue); font-weight: 800; flex: 0 0 auto; }
+    .hierarchy-children.collapsed { display: none; }
+    .hierarchy-node .node-meta { color: var(--muted); font-size: 13px; margin-top: 4px; }
+    .hierarchy-node .node-values { display: flex; gap: 14px; flex-wrap: wrap; color: var(--muted); font-size: 13px; margin-top: 8px; }
     .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
     .muted { color: var(--muted); }
     .good { color: var(--green); }
@@ -2975,6 +2988,10 @@ HTML = r"""
         <div id="masterDetail"></div>
       </div>
       <div class="grid cols-4" id="kpis"></div>
+      <div class="panel" style="margin-top:14px">
+        <h2>Project Hierarchy</h2>
+        <div id="projectHierarchy"></div>
+      </div>
       <div class="panel" style="margin-top:14px">
         <div style="display:flex;align-items:center;justify-content:space-between;gap:12px">
           <h2>Invoicing</h2>
@@ -3274,6 +3291,8 @@ HTML = r"""
     let selectedDashboardChangeOrderId = null;
     let invoiceGroupSeq = 0;
     let costFilterSeq = 0;
+    const collapsedHierarchyNodes = new Set();
+    const initializedHierarchyNodes = new Set();
     const money = v => Number(v || 0).toLocaleString(undefined, { style: 'currency', currency: 'USD' });
     const pct = v => `${(Number(v || 0) * 100).toFixed(1)}%`;
     const htmlEscape = v => String(v ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
@@ -3912,6 +3931,7 @@ HTML = r"""
         renderSubprojectSummary(s);
         renderBillingSummary(s);
       };
+      renderProjectHierarchy(s);
       renderChangeOrders(s);
       renderBillingSummary(s);
       const fieldMat = Number(s.material_compare?.field_ticket_material || 0);
@@ -3925,6 +3945,72 @@ HTML = r"""
         ]
       );
       document.getElementById('typeSummary').innerHTML = table(['Cost Type','Amount'], s.by_type.map(x => [x.label, money(x.amount)]));
+    }
+
+    function renderProjectHierarchy(summary) {
+      const target = document.getElementById('projectHierarchy');
+      if (!target) return;
+      const changeOrdersBySubproject = {};
+      (summary.change_orders || []).forEach(co => {
+        const key = String(co.subproject_id || '');
+        if (!changeOrdersBySubproject[key]) changeOrdersBySubproject[key] = [];
+        changeOrdersBySubproject[key].push(co);
+      });
+      const isCollapsed = key => collapsedHierarchyNodes.has(key);
+      const toggleGlyph = key => isCollapsed(key) ? '+' : '-';
+      const coNode = co => `<div class="hierarchy-node change-order">
+        <div class="node-title"><span>${htmlEscape([co.co_number, co.job_number].filter(Boolean).join(' / ') || 'Change Order')}</span><span>${money(co.sales_value || co.approved_value || 0)}</span></div>
+        <div class="node-meta">${htmlEscape(co.title || '')}</div>
+        <div class="node-values"><span>Status: ${htmlEscape(co.status || '')}</span><span>Pricing: ${htmlEscape(co.pricing_type || 'Fixed')}</span><span>Actual: ${money(co.actual_cost || 0)}</span></div>
+      </div>`;
+      const subprojectNodes = (summary.subprojects || []).map(sp => {
+        const nodeKey = `sp:${sp.id}`;
+        const coNodes = (changeOrdersBySubproject[String(sp.id)] || []).map(coNode).join('');
+        return `<div>
+          <div class="hierarchy-node subproject collapsible" data-hierarchy-toggle="${nodeKey}" role="button" tabindex="0">
+            <div class="node-title"><span class="hierarchy-title-left"><span class="hierarchy-toggle">${toggleGlyph(nodeKey)}</span><span>${htmlEscape([sp.job_number, sp.code].filter(Boolean).join(' ') || 'Subproject')} - ${htmlEscape(sp.name || '')}</span></span><span>${money(sp.sales_value || sp.contract_value || 0)}</span></div>
+            <div class="node-meta">${htmlEscape(sp.pricing_type || 'Fixed')} pricing</div>
+            <div class="node-values"><span>Actual: ${money(sp.actual_cost || 0)}</span><span>Profit: ${money(Number(sp.sales_value || sp.contract_value || 0) - Number(sp.actual_cost || 0))}</span></div>
+          </div>
+          <div class="hierarchy-children ${isCollapsed(nodeKey) ? 'collapsed' : ''}">${coNodes || '<div class="hierarchy-node change-order"><div class="node-meta">No change orders.</div></div>'}</div>
+        </div>`;
+      }).join('');
+      const orphanCos = changeOrdersBySubproject[''] || [];
+      const orphanKey = 'orphan-cos';
+      const orphanSection = orphanCos.length ? `<div class="hierarchy-node subproject collapsible" data-hierarchy-toggle="${orphanKey}" role="button" tabindex="0"><div class="node-title"><span class="hierarchy-title-left"><span class="hierarchy-toggle">${toggleGlyph(orphanKey)}</span><span>Unassigned Change Orders</span></span><span>${orphanCos.length}</span></div><div class="node-meta">Change orders not tied to a subproject.</div></div><div class="hierarchy-children ${isCollapsed(orphanKey) ? 'collapsed' : ''}">${orphanCos.map(coNode).join('')}</div>` : '';
+      const masterKey = `master:${summary.project?.id || state.projectId || 'current'}`;
+      if (!initializedHierarchyNodes.has(masterKey)) {
+        initializedHierarchyNodes.add(masterKey);
+        collapsedHierarchyNodes.add(masterKey);
+      }
+      target.innerHTML = `<div class="hierarchy-wrap">
+        <div class="hierarchy-node master collapsible" data-hierarchy-toggle="${masterKey}" role="button" tabindex="0">
+          <div class="node-title"><span class="hierarchy-title-left"><span class="hierarchy-toggle">${toggleGlyph(masterKey)}</span><span>${htmlEscape(summary.project?.name || 'Master Project')}</span></span><span>${money(summary.contract_value || 0)}</span></div>
+          <div class="node-meta">${htmlEscape(summary.project?.customer || '')}${summary.project?.location ? ' / ' + htmlEscape(summary.project.location) : ''}</div>
+          <div class="node-values"><span>Subprojects: ${(summary.subprojects || []).length}</span><span>Change Orders: ${(summary.change_orders || []).length}</span><span>Actual: ${money(summary.actual_cost || 0)}</span></div>
+        </div>
+        <div class="hierarchy-children ${isCollapsed(masterKey) ? 'collapsed' : ''}">
+          ${subprojectNodes || '<div class="muted">No subprojects yet.</div>'}
+          ${orphanSection}
+        </div>
+      </div>`;
+      target.querySelectorAll('[data-hierarchy-toggle]').forEach(node => {
+        const toggle = () => {
+          const key = node.dataset.hierarchyToggle;
+          if (collapsedHierarchyNodes.has(key)) collapsedHierarchyNodes.delete(key);
+          else collapsedHierarchyNodes.add(key);
+          renderProjectHierarchy(summary);
+        };
+        node.onclick = event => {
+          event.stopPropagation();
+          toggle();
+        };
+        node.onkeydown = event => {
+          if (event.key !== 'Enter' && event.key !== ' ') return;
+          event.preventDefault();
+          toggle();
+        };
+      });
     }
 
     function billingForDashboardScope(summary) {
