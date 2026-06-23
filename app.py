@@ -48,6 +48,7 @@ DB_PATH = DATA_DIR / "pm_tracker.sqlite3"
 HOST = os.environ.get("PM_TRACKER_HOST", "127.0.0.1")
 PORT = int(os.environ.get("PM_TRACKER_PORT", "8765"))
 SESSION_IDLE_TIMEOUT_MINUTES = 30
+DEFAULT_NEW_USER_PASSWORD = "TPE1776"
 CO_MATERIAL_MARGIN = 0.35
 CO_MATERIAL_COST_FACTOR = 1 - CO_MATERIAL_MARGIN
 BID_TRACKER_SOURCE = Path(r"C:\Users\rossc\Twin Peaks Electrical\Project Manager WIP - General\Bid Request Management\_Bid Tracker\Bid Tracker.xlsx")
@@ -327,6 +328,7 @@ def init_db():
               password_hash TEXT NOT NULL,
               role TEXT DEFAULT 'User',
               active INTEGER DEFAULT 1,
+              must_change_password INTEGER DEFAULT 0,
               created_at TEXT NOT NULL
             );
 
@@ -454,6 +456,9 @@ def init_db():
         rate_cols = [r["name"] for r in con.execute("PRAGMA table_info(internal_rates)").fetchall()]
         if "rate_set_id" not in rate_cols:
             con.execute("ALTER TABLE internal_rates ADD COLUMN rate_set_id INTEGER")
+        user_cols = [r["name"] for r in con.execute("PRAGMA table_info(users)").fetchall()]
+        if "must_change_password" not in user_cols:
+            con.execute("ALTER TABLE users ADD COLUMN must_change_password INTEGER DEFAULT 0")
         default_rate_set = con.execute("SELECT id FROM rate_sets WHERE name = 'Current'").fetchone()
         if not default_rate_set:
             cur = con.execute("INSERT INTO rate_sets (name, effective_date, active) VALUES ('Current', '', 1)")
@@ -565,7 +570,7 @@ def current_user(handler):
     now = datetime.now()
     user = one(
         """
-        SELECT users.id, users.username, users.display_name, users.role, users.active
+        SELECT users.id, users.username, users.display_name, users.role, users.active, COALESCE(users.must_change_password, 0) AS must_change_password
         FROM user_sessions
         JOIN users ON users.id = user_sessions.user_id
         WHERE user_sessions.session_token = ?
@@ -2781,6 +2786,7 @@ HTML = r"""
     .warn { color: var(--gold); }
     .hidden { display: none; }
     body.read-only form input, body.read-only form select, body.read-only form textarea { pointer-events: none; background: #f6f8fa; color: #607080; }
+    body.read-only #changePasswordForm input { pointer-events: auto; background: white; color: var(--ink); }
     body.read-only form .actions,
     body.read-only [data-save],
     body.read-only [data-save-sp],
@@ -2794,6 +2800,7 @@ HTML = r"""
     body.read-only [data-save-customer-invoice],
     body.read-only #addRate,
     body.read-only #importVendorInvoice { display: none !important; }
+    body.read-only #changePasswordForm .actions { display: flex !important; }
     .bar { height: 12px; background: #e8edf2; border-radius: 999px; overflow: hidden; }
     .bar span { display: block; height: 100%; background: var(--blue); }
     .invoice-summary { background: #fbfcfd; cursor: pointer; }
@@ -2868,6 +2875,7 @@ HTML = r"""
       <div class="system-menu-wrap">
         <button class="system-menu-btn" id="systemMenuButton" type="button" title="System settings">...</button>
         <div class="system-menu hidden" id="systemMenu">
+          <button id="systemAccountBtn" type="button">My Account</button>
           <button id="systemAdminBtn" type="button" class="hidden">Admin</button>
           <button id="systemRevisionBtn" type="button" class="hidden">Developer Revision</button>
           <button id="systemLogoutBtn" type="button">Logout</button>
@@ -3196,8 +3204,8 @@ HTML = r"""
           <h2>Add User</h2>
           <label>Username</label><input name="username" required>
           <label>Display Name</label><input name="display_name">
-          <label>Password</label><input name="password" type="password" required>
           <label>Role</label><select name="role"><option>User</option><option>Read Only</option><option>Admin</option></select>
+          <p class="muted">New users start with temporary password TPE1776 and must change it at first login.</p>
           <div class="actions"><button class="btn primary" type="submit">Add User</button></div>
         </form>
         <div class="panel">
@@ -3237,6 +3245,22 @@ HTML = r"""
       <div class="actions">
         <button class="btn primary" id="closeFinancialDuplicateModal" type="button">OK</button>
       </div>
+    </div>
+  </div>
+  <div class="modal-backdrop hidden" id="accountModal">
+    <div class="modal">
+      <h2>Change Password</h2>
+      <p id="accountPasswordMessage" class="muted"></p>
+      <form id="changePasswordForm">
+        <label>Current Password</label><input name="current_password" type="password" autocomplete="current-password" required>
+        <label>New Password</label><input name="new_password" type="password" autocomplete="new-password" required>
+        <label>Confirm New Password</label><input name="confirm_password" type="password" autocomplete="new-password" required>
+        <div class="error" id="changePasswordError"></div>
+        <div class="actions">
+          <button class="btn primary" type="submit">Save Password</button>
+          <button class="btn" id="closeAccountModal" type="button">Cancel</button>
+        </div>
+      </form>
     </div>
   </div>
 
@@ -3343,9 +3367,29 @@ HTML = r"""
     document.getElementById('financialDuplicateModal').onclick = event => {
       if (event.target.id === 'financialDuplicateModal') event.currentTarget.classList.add('hidden');
     };
+    function openAccountModal(force=false) {
+      const modal = document.getElementById('accountModal');
+      const message = document.getElementById('accountPasswordMessage');
+      message.textContent = force ? 'You are using a temporary password. Change it before continuing.' : 'Update your own login password.';
+      document.getElementById('closeAccountModal').classList.toggle('hidden', force);
+      document.getElementById('changePasswordError').textContent = '';
+      document.getElementById('changePasswordForm').reset();
+      modal.dataset.force = force ? '1' : '0';
+      modal.classList.remove('hidden');
+      setTimeout(() => document.querySelector('#changePasswordForm input[name="current_password"]')?.focus(), 50);
+    }
+    function closeAccountModal() {
+      if (document.getElementById('accountModal').dataset.force === '1') return;
+      document.getElementById('accountModal').classList.add('hidden');
+    }
+    document.getElementById('closeAccountModal').onclick = closeAccountModal;
+    document.getElementById('accountModal').onclick = event => {
+      if (event.target.id === 'accountModal') closeAccountModal();
+    };
     document.addEventListener('keydown', event => {
       if (event.key === 'Escape') document.getElementById('trendModal').classList.add('hidden');
       if (event.key === 'Escape') document.getElementById('financialDuplicateModal').classList.add('hidden');
+      if (event.key === 'Escape') closeAccountModal();
     });
 
     document.querySelectorAll('nav button').forEach(btn => btn.addEventListener('click', async () => {
@@ -3410,6 +3454,10 @@ HTML = r"""
       if (!(await confirmDiscard())) return;
       openTab('admin');
     };
+    document.getElementById('systemAccountBtn').onclick = () => {
+      document.getElementById('systemMenu').classList.add('hidden');
+      openAccountModal(false);
+    };
     document.getElementById('systemRevisionBtn').onclick = async () => {
       document.getElementById('systemMenu').classList.add('hidden');
       if (!(await confirmDiscard())) return;
@@ -3418,6 +3466,33 @@ HTML = r"""
     document.getElementById('systemLogoutBtn').onclick = async () => {
       await fetch('/api/logout', { method:'POST' });
       window.location.href = '/login';
+    };
+    document.getElementById('changePasswordForm').onsubmit = async event => {
+      event.preventDefault();
+      const form = event.target;
+      const data = formDataObj(form);
+      const error = document.getElementById('changePasswordError');
+      error.textContent = '';
+      if (data.new_password !== data.confirm_password) {
+        error.textContent = 'New passwords do not match.';
+        return;
+      }
+      if (String(data.new_password || '').length < 8) {
+        error.textContent = 'Use at least 8 characters.';
+        return;
+      }
+      if (data.new_password === 'TPE1776') {
+        error.textContent = 'Choose a password different from the temporary password.';
+        return;
+      }
+      try {
+        await api('/api/change-password', { method:'POST', body: JSON.stringify(data) });
+        document.getElementById('accountModal').dataset.force = '0';
+        document.getElementById('accountModal').classList.add('hidden');
+        await loadCurrentUser();
+      } catch (err) {
+        error.textContent = err.message;
+      }
     };
 
     function metricAmount(summary, key) {
@@ -5035,28 +5110,28 @@ HTML = r"""
       document.getElementById('currentUser').textContent = `${me.display_name || me.username}${me.role === 'Read Only' ? ' / Read Only' : ''}`;
       document.getElementById('systemAdminBtn').classList.toggle('hidden', me.role !== 'Admin');
       document.getElementById('systemRevisionBtn').classList.toggle('hidden', me.role !== 'Admin');
+      if (Number(me.must_change_password || 0)) openAccountModal(true);
     }
 
     async function loadUsers() {
       if (state.currentUser?.role !== 'Admin') return;
       const users = await api('/api/users');
       document.getElementById('usersTable').innerHTML = `
-        <thead><tr><th>Username</th><th>Name</th><th>Role</th><th>Status</th><th>New Password</th><th></th></tr></thead>
+        <thead><tr><th>Username</th><th>Name</th><th>Role</th><th>Status</th><th>Password</th><th></th></tr></thead>
         <tbody>${users.map(u => `<tr>
           <td>${u.username}</td>
           <td>${u.display_name || ''}</td>
           <td><select data-user-role="${u.id}"><option ${u.role === 'User' ? 'selected' : ''}>User</option><option ${u.role === 'Read Only' ? 'selected' : ''}>Read Only</option><option ${u.role === 'Admin' ? 'selected' : ''}>Admin</option></select></td>
-          <td>${u.active ? 'Active' : 'Inactive'}</td>
-          <td><input data-user-password="${u.id}" type="password" placeholder="Leave blank"></td>
+          <td>${u.active ? 'Active' : 'Inactive'}${Number(u.must_change_password || 0) ? '<div class="muted">Must change password</div>' : ''}</td>
+          <td><input data-user-password="${u.id}" type="password" placeholder="TPE1776"></td>
           <td>
-            <button class="btn" data-reset-user="${u.id}" type="button">Reset</button>
+            <button class="btn" data-reset-user="${u.id}" type="button">Reset Password</button>
             <button class="btn" data-toggle-user="${u.id}" data-active="${u.active}" type="button">${u.active ? 'Deactivate' : 'Activate'}</button>
           </td>
         </tr>`).join('')}</tbody>`;
       document.querySelectorAll('[data-reset-user]').forEach(btn => btn.onclick = async () => {
         const id = btn.dataset.resetUser;
-        const password = document.querySelector(`[data-user-password="${id}"]`).value;
-        if (!password) return;
+        const password = document.querySelector(`[data-user-password="${id}"]`).value || 'TPE1776';
         await api(`/api/users/${id}`, { method:'PUT', body: JSON.stringify({ password }) });
         await loadUsers();
       });
@@ -5339,7 +5414,7 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/api/users":
                 if not require_admin(self):
                     return json_response(self, {"error": "Admin required"}, 403)
-                return json_response(self, rows("SELECT id, username, display_name, role, active, created_at FROM users ORDER BY username"))
+                return json_response(self, rows("SELECT id, username, display_name, role, active, COALESCE(must_change_password, 0) AS must_change_password, created_at FROM users ORDER BY username"))
             if parsed.path == "/api/bid-summary":
                 return json_response(self, bid_summary())
             if parsed.path == "/api/texas-financial-summary":
@@ -5439,6 +5514,27 @@ class Handler(BaseHTTPRequestHandler):
                 return logout_response(self)
             if not current_user(self):
                 return json_response(self, {"error": "Login required"}, 401)
+            if parsed.path == "/api/change-password":
+                data = parse_json(self)
+                user = current_user(self)
+                account = one("SELECT id, password_hash FROM users WHERE id = ?", (user["id"],))
+                if not account or not verify_password(data.get("current_password"), account["password_hash"]):
+                    return json_response(self, {"error": "Current password is incorrect."}, 400)
+                new_password = str(data.get("new_password") or "")
+                if len(new_password) < 8:
+                    return json_response(self, {"error": "Use at least 8 characters."}, 400)
+                if new_password != data.get("confirm_password"):
+                    return json_response(self, {"error": "New passwords do not match."}, 400)
+                if new_password == DEFAULT_NEW_USER_PASSWORD:
+                    return json_response(self, {"error": "Choose a password different from the temporary password."}, 400)
+                execute(
+                    "UPDATE users SET password_hash = ?, must_change_password = 0 WHERE id = ?",
+                    (hash_password(new_password), user["id"]),
+                )
+                token = parse_cookie_header(self.headers.get("Cookie")).get("pm_session")
+                with db() as con:
+                    con.execute("DELETE FROM user_sessions WHERE user_id = ? AND session_token <> ?", (user["id"], token or ""))
+                return json_response(self, {"ok": True})
             if not require_editor(self):
                 return json_response(self, {"error": "Read-only users cannot make changes."}, 403)
             if parsed.path == "/api/import-fieldwise":
@@ -5533,8 +5629,8 @@ class Handler(BaseHTTPRequestHandler):
                 if not require_admin(self):
                     return json_response(self, {"error": "Admin required"}, 403)
                 new_id = execute(
-                    "INSERT INTO users (username, display_name, password_hash, role, active, created_at) VALUES (?, ?, ?, ?, 1, ?)",
-                    (data.get("username"), data.get("display_name"), hash_password(data.get("password")), clean_role(data.get("role")), now),
+                    "INSERT INTO users (username, display_name, password_hash, role, active, must_change_password, created_at) VALUES (?, ?, ?, ?, 1, 1, ?)",
+                    (data.get("username"), data.get("display_name"), hash_password(DEFAULT_NEW_USER_PASSWORD), clean_role(data.get("role")), now),
                 )
                 return json_response(self, {"id": new_id})
             if parsed.path.startswith("/api/projects/") and parsed.path.endswith("/archive"):
@@ -5788,7 +5884,7 @@ class Handler(BaseHTTPRequestHandler):
                     return json_response(self, {"error": "Admin required"}, 403)
                 user_id = parsed.path.rsplit("/", 1)[-1]
                 if "password" in data and data.get("password"):
-                    execute("UPDATE users SET password_hash = ? WHERE id = ?", (hash_password(data.get("password")), user_id))
+                    execute("UPDATE users SET password_hash = ?, must_change_password = 1 WHERE id = ?", (hash_password(data.get("password")), user_id))
                 if "role" in data:
                     execute("UPDATE users SET role = ? WHERE id = ?", (clean_role(data.get("role")), user_id))
                 if "active" in data:
