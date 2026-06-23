@@ -1753,22 +1753,43 @@ def extract_financial_metrics(path, report_type):
 
 
 def import_financial_report(path, report_date, report_type):
-    report_type = report_type or "combined"
-    metrics = extract_financial_metrics(path, report_type)
+    requested_report_type = report_type or "combined"
+    metrics = extract_financial_metrics(path, requested_report_type)
     if not metrics:
         raise RuntimeError("No recognizable Balance Sheet or P&L metrics were found.")
     report_date = report_date or infer_financial_report_date(path) or datetime.now().date().isoformat()
+    metric_types = {FINANCIAL_METRICS[m["metric_key"]][2] for m in metrics if m.get("metric_key") in FINANCIAL_METRICS}
+    report_type = next(iter(metric_types)) if requested_report_type == "combined" and len(metric_types) == 1 else requested_report_type
+    source_name = Path(path).name
+    original_source_name = re.sub(r"^\d{14}-", "", source_name)
+    existing_reports = rows(
+        "SELECT id, source_file FROM financial_reports WHERE report_date = ? AND report_type = ?",
+        (report_date, report_type),
+    )
+    for existing in existing_reports:
+        existing_source_name = re.sub(r"^\d{14}-", "", existing["source_file"] or "")
+        if existing_source_name == original_source_name:
+            return {
+                "report_id": existing["id"],
+                "count": 0,
+                "metrics": [],
+                "duplicate": True,
+                "report_date": report_date,
+                "report_type": report_type,
+                "source_file": source_name,
+                "original_source_file": original_source_name,
+            }
     now = datetime.now().isoformat(timespec="seconds")
     report_id = execute(
         "INSERT INTO financial_reports (report_date, report_type, source_file, uploaded_at, notes) VALUES (?, ?, ?, ?, ?)",
-        (report_date, report_type, Path(path).name, now, json.dumps({"matched": [m["source_label"] for m in metrics]}, default=str)),
+        (report_date, report_type, source_name, now, json.dumps({"matched": [m["source_label"] for m in metrics], "original_source_file": original_source_name}, default=str)),
     )
     for metric in metrics:
         execute(
             "INSERT OR REPLACE INTO financial_metrics (report_id, metric_key, label, amount) VALUES (?, ?, ?, ?)",
             (report_id, metric["metric_key"], metric["label"], metric["amount"]),
         )
-    return {"report_id": report_id, "count": len(metrics), "metrics": metrics}
+    return {"report_id": report_id, "count": len(metrics), "metrics": metrics, "duplicate": False, "report_date": report_date, "report_type": report_type, "source_file": source_name, "original_source_file": original_source_name}
 
 
 def texas_financial_summary():
@@ -2706,6 +2727,8 @@ HTML = r"""
     .help-card { position: relative; overflow: visible; }
     .help-marker { position: absolute; top: 10px; right: 10px; z-index: 4; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border: 1px solid var(--line); border-radius: 50%; background: #fbfcfd; color: var(--blue); font-size: 13px; font-weight: 800; cursor: help; }
     .help-marker:focus { outline: 2px solid rgba(34, 102, 170, .3); outline-offset: 2px; }
+    .inline-help-cell { position: relative; display: inline-flex; align-items: center; gap: 8px; padding-right: 30px; }
+    .inline-help-cell .help-marker { position: relative; top: auto; right: auto; flex: 0 0 auto; }
     .help-popover { position: absolute; top: 28px; right: 0; z-index: 30; display: none; width: min(310px, calc(100vw - 52px)); padding: 10px 12px; border: 1px solid #bfd0e0; border-radius: 8px; background: white; color: var(--ink); box-shadow: 0 14px 34px rgba(15, 35, 55, .18); font-size: 13px; font-weight: 500; line-height: 1.38; text-transform: none; }
     .help-marker:hover .help-popover, .help-marker:focus .help-popover { display: block; }
     .kpi.clickable { cursor: pointer; transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease; }
@@ -3206,6 +3229,16 @@ HTML = r"""
       <div class="trend-modal-body" id="trendModalBody"></div>
     </div>
   </div>
+  <div class="modal-backdrop hidden" id="financialDuplicateModal">
+    <div class="modal">
+      <h2>Duplicate Report Skipped</h2>
+      <p>The following Texas financial report upload was skipped because it already exists.</p>
+      <div id="financialDuplicateList"></div>
+      <div class="actions">
+        <button class="btn primary" id="closeFinancialDuplicateModal" type="button">OK</button>
+      </div>
+    </div>
+  </div>
 
   <script>
     let state = { projects: [], projectId: null, subprojects: [], changeOrders: [], internalRates: [], rateSets: [], currentUser: null };
@@ -3304,8 +3337,15 @@ HTML = r"""
     document.getElementById('trendModal').onclick = event => {
       if (event.target.id === 'trendModal') event.currentTarget.classList.add('hidden');
     };
+    document.getElementById('closeFinancialDuplicateModal').onclick = () => {
+      document.getElementById('financialDuplicateModal').classList.add('hidden');
+    };
+    document.getElementById('financialDuplicateModal').onclick = event => {
+      if (event.target.id === 'financialDuplicateModal') event.currentTarget.classList.add('hidden');
+    };
     document.addEventListener('keydown', event => {
       if (event.key === 'Escape') document.getElementById('trendModal').classList.add('hidden');
+      if (event.key === 'Escape') document.getElementById('financialDuplicateModal').classList.add('hidden');
     });
 
     document.querySelectorAll('nav button').forEach(btn => btn.addEventListener('click', async () => {
@@ -3515,6 +3555,19 @@ HTML = r"""
       modal.classList.remove('hidden');
     }
 
+    function showFinancialDuplicateModal(duplicates) {
+      if (!duplicates || !duplicates.length) return;
+      document.getElementById('financialDuplicateList').innerHTML = plainTable(
+        ['Report Date','Type','File'],
+        duplicates.map(d => [
+          htmlEscape(d.report_date || ''),
+          htmlEscape(d.report_type || ''),
+          htmlEscape(d.file || '')
+        ])
+      );
+      document.getElementById('financialDuplicateModal').classList.remove('hidden');
+    }
+
     async function loadTexasOpsDashboard() {
       const summary = await api('/api/texas-financial-summary');
       const revenue = metricAmount(summary, 'revenue');
@@ -3523,27 +3576,45 @@ HTML = r"""
       const cash = metricAmount(summary, 'cash');
       const workingCapital = metricAmount(summary, 'working_capital');
       const currentRatio = metricAmount(summary, 'current_ratio');
+      const financialRow = (label, value, helpText) => [label, `<span class="inline-help-cell">${value}${help(helpText)}</span>`];
       document.getElementById('financialKpis').innerHTML = `
-        <div class="panel kpi"><div class="label">Revenue</div><div class="value">${money(revenue)}</div><div class="hint">Latest P&L</div></div>
-        <div class="panel kpi"><div class="label">Operating Expenses</div><div class="value">${money(expenses)}</div><div class="hint">Latest P&L</div></div>
-        <div class="panel kpi"><div class="label">Net Income</div><div class="value ${netIncome >= 0 ? 'good' : 'bad'}">${money(netIncome)}</div><div class="hint">Revenue minus expenses</div></div>
-        <div class="panel kpi"><div class="label">Cash</div><div class="value">${money(cash)}</div><div class="hint">Latest balance sheet</div></div>`;
+        <div class="panel kpi help-card">${help('Revenue comes from the latest uploaded P&L report. The importer looks for Total Income, Total Revenue, Revenue, or Sales.')}<div class="label">Revenue</div><div class="value">${money(revenue)}</div><div class="hint">Latest P&L</div></div>
+        <div class="panel kpi help-card">${help('Operating Expenses comes from the latest uploaded P&L report. The importer looks for Total Expenses or Operating Expenses.')}<div class="label">Operating Expenses</div><div class="value">${money(expenses)}</div><div class="hint">Latest P&L</div></div>
+        <div class="panel kpi help-card">${help('Net Income comes from the latest uploaded P&L report. It is the report line for Net Income, Net Profit, or Net Earnings.')}<div class="label">Net Income</div><div class="value ${netIncome >= 0 ? 'good' : 'bad'}">${money(netIncome)}</div><div class="hint">Latest P&L</div></div>
+        <div class="panel kpi help-card">${help('Cash comes from the latest uploaded Balance Sheet. The importer looks for Bank Accounts, Cash, Cash in Bank, or Cash and Cash Equivalents.')}<div class="label">Cash</div><div class="value">${money(cash)}</div><div class="hint">Latest balance sheet</div></div>`;
       renderProfitabilityTrend(summary, localStorage.getItem('financialTrendMode') || 'graph');
       document.getElementById('financialBalanceSnapshot').innerHTML = plainTable(['Metric','Value'], [
-        ['Cash', money(cash)],
-        ['Accounts Receivable', money(metricAmount(summary, 'accounts_receivable'))],
-        ['Accounts Payable', money(metricAmount(summary, 'accounts_payable'))],
-        ['Current Assets', money(metricAmount(summary, 'current_assets'))],
-        ['Current Liabilities', money(metricAmount(summary, 'current_liabilities'))],
-        ['Working Capital', `<span class="${workingCapital >= 0 ? 'good' : 'bad'}">${money(workingCapital)}</span>`],
-        ['Current Ratio', currentRatio ? currentRatio.toFixed(2) : ''],
-        ['Total Assets', money(metricAmount(summary, 'total_assets'))],
-        ['Total Liabilities', money(metricAmount(summary, 'total_liabilities'))],
-        ['Equity', money(metricAmount(summary, 'equity'))],
+        financialRow('Cash', money(cash), 'Cash is pulled from the latest Balance Sheet cash or bank accounts line.'),
+        financialRow('Accounts Receivable', money(metricAmount(summary, 'accounts_receivable')), 'Accounts Receivable comes from the latest Balance Sheet AR line.'),
+        financialRow('Accounts Payable', money(metricAmount(summary, 'accounts_payable')), 'Accounts Payable comes from the latest Balance Sheet AP line when present.'),
+        financialRow('Current Assets', money(metricAmount(summary, 'current_assets')), 'Current Assets comes from the latest Balance Sheet total current assets line.'),
+        financialRow('Current Liabilities', money(metricAmount(summary, 'current_liabilities')), 'Current Liabilities comes from the latest Balance Sheet total current liabilities line.'),
+        financialRow('Working Capital', `<span class="${workingCapital >= 0 ? 'good' : 'bad'}">${money(workingCapital)}</span>`, 'Working Capital equals Current Assets minus Current Liabilities. It only calculates when both values come from the same report date.'),
+        financialRow('Current Ratio', currentRatio ? currentRatio.toFixed(2) : '', 'Current Ratio equals Current Assets divided by Current Liabilities. It only calculates when both values come from the same report date.'),
+        financialRow('Total Assets', money(metricAmount(summary, 'total_assets')), 'Total Assets comes from the latest Balance Sheet total assets line.'),
+        financialRow('Total Liabilities', money(metricAmount(summary, 'total_liabilities')), 'Total Liabilities comes from the latest Balance Sheet total liabilities line.'),
+        financialRow('Equity', money(metricAmount(summary, 'equity')), 'Equity comes from the latest Balance Sheet equity or total equity line.'),
       ]);
       document.getElementById('financialReports').innerHTML = summary.reports.length
-        ? plainTable(['Week Ending','Type','File','Uploaded'], summary.reports.map(r => [r.report_date, r.report_type, htmlEscape(r.source_file || ''), r.uploaded_at || '']))
+        ? plainTable(['Week Ending','Type','File','Uploaded',''], summary.reports.map(r => [
+            htmlEscape(r.report_date || ''),
+            htmlEscape(r.report_type || ''),
+            htmlEscape(r.source_file || ''),
+            htmlEscape(r.uploaded_at || ''),
+            `<button class="btn danger" type="button" data-delete-financial-report="${r.id}">Remove</button>`
+          ]))
         : '<div class="muted">No financial reports uploaded yet.</div>';
+      document.querySelectorAll('[data-delete-financial-report]').forEach(btn => btn.onclick = async () => {
+        const report = summary.reports.find(r => String(r.id) === String(btn.dataset.deleteFinancialReport));
+        const label = [report?.report_date, report?.source_file].filter(Boolean).join(' / ') || 'this report';
+        if (!window.confirm(`Remove ${label}? This will remove it from the Texas Ops dashboard.`)) return;
+        await api('/api/texas-financial-delete', {
+          method: 'POST',
+          body: JSON.stringify({ report_id: btn.dataset.deleteFinancialReport })
+        });
+        markSaved();
+        await loadTexasOpsDashboard();
+      });
     }
 
     document.getElementById('financialUploadForm').onsubmit = async event => {
@@ -3556,10 +3627,11 @@ HTML = r"""
         const res = await fetch('/api/texas-financial-import', { method:'POST', body:data });
         const payload = await res.json();
         if (!res.ok) throw new Error(payload.error || 'Upload failed');
-        resultEl.textContent = `Imported ${payload.imported} report(s), ${payload.metric_count} metric(s).`;
+        resultEl.textContent = `Imported ${payload.imported} report(s), ${payload.metric_count} metric(s). Skipped duplicates: ${payload.skipped_duplicates || 0}.`;
         form.reset();
         markSaved();
         await loadTexasOpsDashboard();
+        showFinancialDuplicateModal(payload.duplicates || []);
       } catch (err) {
         resultEl.textContent = `Import failed: ${err.message}`;
       }
@@ -5414,7 +5486,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
             if parsed.path == "/api/texas-financial-import":
                 form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": self.headers.get("Content-Type")})
-                report_date = form.getvalue("report_date") or datetime.now().date().isoformat()
+                report_date = form.getvalue("report_date") or None
                 report_type = form.getvalue("report_type") or "combined"
                 file_items = form["files"] if "files" in form else []
                 if not isinstance(file_items, list):
@@ -5422,6 +5494,7 @@ class Handler(BaseHTTPRequestHandler):
                 imported = 0
                 metric_count = 0
                 details = []
+                duplicates = []
                 for file_item in file_items:
                     if not getattr(file_item, "filename", ""):
                         continue
@@ -5430,13 +5503,32 @@ class Handler(BaseHTTPRequestHandler):
                     with open(path, "wb") as f:
                         f.write(file_item.file.read())
                     result = import_financial_report(path, report_date, report_type)
+                    if result.get("duplicate"):
+                        try:
+                            path.unlink()
+                        except Exception:
+                            pass
+                        duplicates.append({
+                            "file": result.get("original_source_file") or safe_name,
+                            "report_date": result.get("report_date"),
+                            "report_type": result.get("report_type"),
+                            "existing_report_id": result.get("report_id"),
+                        })
+                        details.append({"file": safe_name, "duplicate": True, "metrics": 0})
+                        continue
                     imported += 1
                     metric_count += result["count"]
-                    details.append({"file": safe_name, "metrics": result["count"]})
-                return json_response(self, {"imported": imported, "metric_count": metric_count, "details": details})
+                    details.append({"file": safe_name, "duplicate": False, "metrics": result["count"], "report_date": result.get("report_date")})
+                return json_response(self, {"imported": imported, "metric_count": metric_count, "details": details, "duplicates": duplicates, "skipped_duplicates": len(duplicates)})
 
             data = parse_json(self)
             now = datetime.now().isoformat(timespec="seconds")
+            if parsed.path == "/api/texas-financial-delete":
+                report_id = data.get("report_id")
+                with db() as con:
+                    metric_count = con.execute("DELETE FROM financial_metrics WHERE report_id = ?", (report_id,)).rowcount
+                    report_count = con.execute("DELETE FROM financial_reports WHERE id = ?", (report_id,)).rowcount
+                return json_response(self, {"deleted": report_count, "deleted_metrics": metric_count})
             if parsed.path == "/api/users":
                 if not require_admin(self):
                     return json_response(self, {"error": "Admin required"}, 403)
