@@ -1,4 +1,5 @@
 import cgi
+import csv
 import hashlib
 import hmac
 import json
@@ -174,6 +175,8 @@ def init_db():
               rate_set_id INTEGER,
               contract_value REAL DEFAULT 0,
               status TEXT DEFAULT 'Active',
+              closed_at TEXT,
+              archived_at TEXT,
               created_at TEXT NOT NULL
             );
 
@@ -334,6 +337,24 @@ def init_db():
               created_at TEXT NOT NULL,
               expires_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS financial_reports (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              report_date TEXT NOT NULL,
+              report_type TEXT NOT NULL,
+              source_file TEXT,
+              uploaded_at TEXT NOT NULL,
+              notes TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS financial_metrics (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              report_id INTEGER NOT NULL REFERENCES financial_reports(id) ON DELETE CASCADE,
+              metric_key TEXT NOT NULL,
+              label TEXT NOT NULL,
+              amount REAL DEFAULT 0,
+              UNIQUE(report_id, metric_key)
+            );
             """
         )
         existing_cols = [r["name"] for r in con.execute("PRAGMA table_info(subprojects)").fetchall()]
@@ -356,6 +377,13 @@ def init_db():
             con.execute("ALTER TABLE projects ADD COLUMN customer_po TEXT")
         if "description" not in project_cols:
             con.execute("ALTER TABLE projects ADD COLUMN description TEXT")
+        if "status" not in project_cols:
+            con.execute("ALTER TABLE projects ADD COLUMN status TEXT DEFAULT 'Active'")
+        if "closed_at" not in project_cols:
+            con.execute("ALTER TABLE projects ADD COLUMN closed_at TEXT")
+        if "archived_at" not in project_cols:
+            con.execute("ALTER TABLE projects ADD COLUMN archived_at TEXT")
+        con.execute("UPDATE projects SET status = COALESCE(status, 'Active')")
         co_cols = [r["name"] for r in con.execute("PRAGMA table_info(change_orders)").fetchall()]
         if "job_number" not in co_cols:
             con.execute("ALTER TABLE change_orders ADD COLUMN job_number TEXT")
@@ -1562,6 +1590,219 @@ def bid_summary():
     }
 
 
+FINANCIAL_METRICS = {
+    "revenue": ("Revenue", ["total for income", "total income", "total revenue", "revenue", "sales"], "pnl"),
+    "gross_profit": ("Gross Profit", ["gross profit", "gross margin"], "pnl"),
+    "operating_expenses": ("Operating Expenses", ["total for expenses", "total operating expenses", "operating expenses", "total expenses"], "pnl"),
+    "net_income": ("Net Income", ["net income", "net profit", "net earnings"], "pnl"),
+    "cash": ("Cash", ["cash and cash equivalents", "cash in bank", "bank accounts", "cash"], "balance_sheet"),
+    "accounts_receivable": ("Accounts Receivable", ["accounts receivable", "a/r", "ar"], "balance_sheet"),
+    "accounts_payable": ("Accounts Payable", ["accounts payable", "a/p", "ap"], "balance_sheet"),
+    "current_assets": ("Current Assets", ["total for current assets", "total current assets", "current assets"], "balance_sheet"),
+    "total_assets": ("Total Assets", ["total for assets", "total assets"], "balance_sheet"),
+    "current_liabilities": ("Current Liabilities", ["total for current liabilities", "total current liabilities", "current liabilities"], "balance_sheet"),
+    "total_liabilities": ("Total Liabilities", ["total for liabilities", "total liabilities"], "balance_sheet"),
+    "equity": ("Equity", ["total for equity", "total equity", "owner equity", "shareholder equity", "members equity", "equity"], "balance_sheet"),
+}
+
+
+def financial_amount(value):
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    negative = "(" in text and ")" in text
+    amount = parse_money_text(text)
+    return -abs(amount) if negative else amount
+
+
+def normalize_financial_label(value):
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+
+def match_financial_metric(label, report_type):
+    normalized = normalize_financial_label(label)
+    if normalized in ("total for liabilities and equity", "liabilities and equity"):
+        return None
+    matches = []
+    for key, (display, aliases, metric_type) in FINANCIAL_METRICS.items():
+        if report_type != "combined" and metric_type != report_type:
+            continue
+        for alias in aliases:
+            alias_norm = normalize_financial_label(alias)
+            if normalized == alias_norm:
+                matches.append((3, len(alias_norm), key))
+            elif normalized == f"total for {alias_norm}":
+                matches.append((1, len(alias_norm), key))
+    return sorted(matches, reverse=True)[0][2] if matches else None
+
+
+def parse_report_date_text(value):
+    text = str(value or "")
+    match = re.search(r"(?:as of|through|january\s+\d+\s*-\s*)?\s*([A-Za-z]{3,9}\s+\d{1,2},\s+\d{4})", text, re.IGNORECASE)
+    if not match:
+        return ""
+    for fmt in ("%b %d, %Y", "%B %d, %Y"):
+        try:
+            return datetime.strptime(match.group(1), fmt).date().isoformat()
+        except ValueError:
+            pass
+    return ""
+
+
+def infer_financial_report_date(path):
+    suffix = Path(path).suffix.lower()
+    candidates = []
+    if suffix in (".xlsx", ".xlsm") and openpyxl is not None:
+        wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+        try:
+            for ws in wb.worksheets:
+                for row in ws.iter_rows(min_row=1, max_row=min(ws.max_row, 8), values_only=True):
+                    candidates.extend(str(v) for v in (row or []) if v)
+        finally:
+            wb.close()
+    elif suffix == ".pdf":
+        candidates = extract_pdf_text(path).splitlines()[:12]
+    for candidate in candidates:
+        parsed = parse_report_date_text(candidate)
+        if parsed:
+            return parsed
+    return ""
+
+
+def extract_financial_pairs_from_xlsx(path):
+    if openpyxl is None:
+        raise RuntimeError("Excel import needs openpyxl, but it is not available.")
+    wb = openpyxl.load_workbook(path, data_only=True)
+    pairs = []
+    try:
+        for ws in wb.worksheets:
+            for row in ws.iter_rows(values_only=True):
+                text_cells = []
+                amount_cells = []
+                for idx, value in enumerate(row or []):
+                    if value is None:
+                        continue
+                    if isinstance(value, (int, float)) and not isinstance(value, bool):
+                        amount_cells.append((idx, float(value)))
+                    else:
+                        amount = financial_amount(value)
+                        if amount:
+                            amount_cells.append((idx, amount))
+                        elif str(value).strip():
+                            text_cells.append((idx, str(value).strip()))
+                if not text_cells or not amount_cells:
+                    continue
+                value_idx, amount = amount_cells[-1]
+                label = " ".join(text for idx, text in text_cells if idx < value_idx).strip()
+                if label:
+                    pairs.append((label, amount))
+    finally:
+        wb.close()
+    return pairs
+
+
+def extract_financial_pairs_from_csv(path):
+    pairs = []
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        for row in csv.reader(f):
+            text_cells = []
+            amount_cells = []
+            for idx, value in enumerate(row):
+                amount = financial_amount(value)
+                if amount:
+                    amount_cells.append((idx, amount))
+                elif str(value or "").strip():
+                    text_cells.append((idx, str(value).strip()))
+            if not text_cells or not amount_cells:
+                continue
+            value_idx, amount = amount_cells[-1]
+            label = " ".join(text for idx, text in text_cells if idx < value_idx).strip()
+            if label:
+                pairs.append((label, amount))
+    return pairs
+
+
+def extract_financial_pairs_from_pdf(path):
+    pairs = []
+    text = extract_pdf_text(path)
+    for line in text.splitlines():
+        cleaned = re.sub(r"\s+", " ", line).strip()
+        match = re.search(r"(.+?)\s+(\(?\$?\s*-?[0-9][0-9,]*\.?[0-9]*\)?)$", cleaned)
+        if match:
+            pairs.append((match.group(1).strip(), financial_amount(match.group(2))))
+    return pairs
+
+
+def extract_financial_metrics(path, report_type):
+    suffix = Path(path).suffix.lower()
+    if suffix in (".xlsx", ".xlsm"):
+        pairs = extract_financial_pairs_from_xlsx(path)
+    elif suffix in (".csv", ".tsv"):
+        pairs = extract_financial_pairs_from_csv(path)
+    elif suffix == ".pdf":
+        pairs = extract_financial_pairs_from_pdf(path)
+    else:
+        raise RuntimeError("Upload an Excel, CSV, or PDF financial report.")
+    metrics = {}
+    for label, amount in pairs:
+        key = match_financial_metric(label, report_type)
+        if key:
+            display = FINANCIAL_METRICS[key][0]
+            metrics[key] = {"metric_key": key, "label": display, "amount": amount, "source_label": label}
+    return list(metrics.values())
+
+
+def import_financial_report(path, report_date, report_type):
+    report_type = report_type or "combined"
+    metrics = extract_financial_metrics(path, report_type)
+    if not metrics:
+        raise RuntimeError("No recognizable Balance Sheet or P&L metrics were found.")
+    report_date = report_date or infer_financial_report_date(path) or datetime.now().date().isoformat()
+    now = datetime.now().isoformat(timespec="seconds")
+    report_id = execute(
+        "INSERT INTO financial_reports (report_date, report_type, source_file, uploaded_at, notes) VALUES (?, ?, ?, ?, ?)",
+        (report_date, report_type, Path(path).name, now, json.dumps({"matched": [m["source_label"] for m in metrics]}, default=str)),
+    )
+    for metric in metrics:
+        execute(
+            "INSERT OR REPLACE INTO financial_metrics (report_id, metric_key, label, amount) VALUES (?, ?, ?, ?)",
+            (report_id, metric["metric_key"], metric["label"], metric["amount"]),
+        )
+    return {"report_id": report_id, "count": len(metrics), "metrics": metrics}
+
+
+def texas_financial_summary():
+    reports = rows("SELECT * FROM financial_reports ORDER BY report_date DESC, id DESC")
+    metrics = rows(
+        """
+        SELECT fr.report_date, fr.report_type, fr.source_file, fm.metric_key, fm.label, fm.amount
+        FROM financial_reports fr
+        JOIN financial_metrics fm ON fm.report_id = fr.id
+        ORDER BY fr.report_date, fr.id, fm.metric_key
+        """
+    )
+    latest = {}
+    for metric in metrics:
+        latest[metric["metric_key"]] = metric
+    current_assets = money(latest.get("current_assets", {}).get("amount"))
+    current_liabilities = money(latest.get("current_liabilities", {}).get("amount"))
+    same_current_date = latest.get("current_assets", {}).get("report_date") == latest.get("current_liabilities", {}).get("report_date")
+    latest["working_capital"] = {
+        "label": "Working Capital",
+        "amount": current_assets - current_liabilities if same_current_date else 0,
+        "report_date": latest.get("current_assets", {}).get("report_date") if same_current_date else "",
+    }
+    latest["current_ratio"] = {
+        "label": "Current Ratio",
+        "amount": current_assets / current_liabilities if same_current_date and current_liabilities else 0,
+        "report_date": latest.get("current_assets", {}).get("report_date") if same_current_date else "",
+    }
+    history = {}
+    for metric in metrics:
+        history.setdefault(metric["metric_key"], []).append({"report_date": metric["report_date"], "amount": metric["amount"]})
+    return {"reports": reports[:24], "latest_metrics": latest, "history": history}
+
+
 def import_fieldwise_xlsx(path, project_id):
     if openpyxl is None:
         raise RuntimeError("openpyxl is not installed. Run this app with the bundled Codex Python or install openpyxl.")
@@ -1714,15 +1955,16 @@ def import_fieldwise_pdf(path, project_id):
     pages = []
     tables = []
     with pdfplumber.open(path) as pdf:
-        for page in pdf.pages:
+        for page_number, page in enumerate(pdf.pages, start=1):
             pages.append(page.extract_text() or "")
-            tables.extend(page.extract_tables() or [])
+            for table in page.extract_tables() or []:
+                tables.append((page_number, table))
     text = "\n".join(pages).strip()
     if not text:
         raise RuntimeError("No readable text was found in this PDF. It may be a scanned image PDF.")
 
     def table_value(label):
-        for table in tables:
+        for _, table in tables:
             for row in table:
                 if row and len(row) > 1 and str(row[0] or "").strip().lower() == label.lower():
                     return str(row[1] or "").strip()
@@ -1773,31 +2015,51 @@ def import_fieldwise_pdf(path, project_id):
 
     source_file = Path(path).name
     records = []
-    def add_fieldwise_item_row(row):
-        if len(row) < 5 or not row[0]:
+    seen_extracted_records = set()
+
+    def add_extracted_record(record):
+        key = (
+            record["cost_type"],
+            record["item"],
+            record["description"],
+            record["qty"],
+            record["rate"],
+            record["amount"],
+        )
+        if key in seen_extracted_records:
             return
+        seen_extracted_records.add(key)
+        records.append(record)
+
+    def looks_like_fieldwise_item_row(row):
+        if len(row) < 5 or not row[0]:
+            return False
         qty = money(row[2] if len(row) > 2 else 0)
         rate = parse_money_text(row[3] if len(row) > 3 else 0)
         amount = parse_money_text(row[4] if len(row) > 4 else 0)
         price_text = f"{row[3] if len(row) > 3 else ''} {row[4] if len(row) > 4 else ''}"
         if "$" not in price_text and not amount:
-            return
-        if not qty and not rate and not amount:
+            return False
+        return bool(qty or rate or amount)
+
+    def add_fieldwise_item_row(row, page_number):
+        if not looks_like_fieldwise_item_row(row):
             return
         item_name = str(row[0] or "").strip()
         is_equipment = is_equipment_item(item_name)
-        records.append(
+        add_extracted_record(
             {
                 "cost_type": "Equipment" if is_equipment else "Field Ticket Material",
                 "item": item_name,
                 "description": str(row[1] or work_description).strip(),
-                "qty": qty,
-                "rate": rate,
-                "amount": amount,
+                "qty": money(row[2] if len(row) > 2 else 0),
+                "rate": parse_money_text(row[3] if len(row) > 3 else 0),
+                "amount": parse_money_text(row[4] if len(row) > 4 else 0),
+                "source_page": page_number,
             }
         )
 
-    for table in tables:
+    for page_number, table in tables:
         if not table:
             continue
         header = [str(c or "").strip().lower() for c in table[0]]
@@ -1805,7 +2067,7 @@ def import_fieldwise_pdf(path, project_id):
             for row in table[1:]:
                 if not row or not row[0]:
                     continue
-                records.append(
+                add_extracted_record(
                     {
                         "cost_type": "Labor",
                         "item": str(row[0] or "").strip(),
@@ -1813,14 +2075,18 @@ def import_fieldwise_pdf(path, project_id):
                         "qty": money(row[1] if len(row) > 1 else 0),
                         "rate": parse_money_text(row[2] if len(row) > 2 else 0),
                         "amount": parse_money_text(row[3] if len(row) > 3 else 0),
+                        "source_page": page_number,
                     }
                 )
         elif header[:5] == ["item", "item description", "qty", "rate", "amount"]:
             for row in table[1:]:
-                add_fieldwise_item_row(row)
+                add_fieldwise_item_row(row, page_number)
+        elif looks_like_fieldwise_item_row(table[0]):
+            for row in table:
+                add_fieldwise_item_row(row, page_number)
         else:
             for row in table:
-                add_fieldwise_item_row(row)
+                add_fieldwise_item_row(row, page_number)
 
     if not records:
         amount_text = first_regex([r"TOTAL\s*\$?\s*([0-9,]+\.[0-9]{2})"], text)
@@ -1832,6 +2098,7 @@ def import_fieldwise_pdf(path, project_id):
                 "qty": 1,
                 "rate": parse_money_text(amount_text),
                 "amount": parse_money_text(amount_text),
+                "source_page": None,
             }
         )
 
@@ -1910,7 +2177,7 @@ def import_fieldwise_pdf(path, project_id):
                 sales_amount,
                 raw_rate,
                 rate_info["source"],
-                json.dumps({"job_text": job_text, "rate_category": rate_info["category"], "extracted_text": text[:12000]}, default=str),
+                json.dumps({"job_text": job_text, "rate_category": rate_info["category"], "source_page": record.get("source_page"), "extracted_text": text[:12000]}, default=str),
                 datetime.now().isoformat(timespec="seconds"),
             ),
         )
@@ -2427,6 +2694,8 @@ HTML = r"""
     nav button, .btn { border: 1px solid var(--line); background: white; color: var(--ink); padding: 9px 12px; border-radius: 6px; cursor: pointer; font-weight: 600; transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease, background-color .15s ease; }
     nav button:hover, nav button:focus-visible, .btn:hover, .btn:focus-visible { border-color: var(--blue); box-shadow: 0 8px 24px rgba(25, 99, 176, .12); outline: none; transform: translateY(-1px); }
     nav button.active, .btn.primary { background: var(--blue); color: white; border-color: var(--blue); }
+    .btn.danger { color: var(--red); border-color: #f0b8b2; }
+    .btn.danger:hover, .btn.danger:focus-visible { border-color: var(--red); box-shadow: 0 8px 24px rgba(180, 35, 24, .12); }
     .grid { display: grid; gap: 14px; }
     .grid.cols-4 { grid-template-columns: repeat(4, minmax(180px, 1fr)); }
     .grid.cols-2 { grid-template-columns: repeat(2, minmax(260px, 1fr)); }
@@ -2523,6 +2792,18 @@ HTML = r"""
     .filter-summary .summary-label { color: var(--muted); font-size: 11px; font-weight: 750; text-transform: uppercase; letter-spacing: .04em; }
     .filter-summary .summary-value { color: var(--ink); font-size: 18px; font-weight: 800; margin-top: 3px; }
     .filter-summary .summary-value.amount { color: var(--green); }
+    .segmented { display: inline-flex; gap: 0; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: white; }
+    .segmented button { border: 0; border-right: 1px solid var(--line); background: white; padding: 7px 10px; cursor: pointer; font-weight: 650; }
+    .segmented button:last-child { border-right: 0; }
+    .segmented button.active { background: var(--blue); color: white; }
+    .trend-chart { width: 100%; height: 300px; display: block; }
+    .trend-axis { stroke: #ccd6df; stroke-width: 1; }
+    .trend-line-revenue { fill: none; stroke: var(--blue); stroke-width: 3; }
+    .trend-line-profit { fill: none; stroke: var(--green); stroke-width: 3; }
+    .trend-point { stroke: white; stroke-width: 2; }
+    .trend-label { fill: var(--muted); font-size: 12px; }
+    .trend-legend { display: flex; gap: 14px; flex-wrap: wrap; color: var(--muted); font-size: 13px; font-weight: 650; margin-top: 8px; }
+    .trend-swatch { display: inline-block; width: 18px; height: 4px; border-radius: 999px; vertical-align: middle; margin-right: 6px; }
     .project-banner { display: grid; grid-template-columns: 1.4fr repeat(3, minmax(130px, .45fr)); gap: 12px; align-items: stretch; margin-bottom: 14px; }
     .project-title { background: #ffffff; border: 1px solid var(--line); border-left: 5px solid var(--blue); border-radius: 8px; padding: 14px 16px; }
     .project-title.clickable, .job-chip.clickable { cursor: pointer; transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease; }
@@ -2535,8 +2816,10 @@ HTML = r"""
     .modal-backdrop { position: fixed; inset: 0; background: rgba(15, 23, 42, .44); display: flex; align-items: center; justify-content: center; z-index: 50; padding: 20px; }
     .modal-backdrop.hidden { display: none; }
     .modal { background: white; border-radius: 8px; border: 1px solid var(--line); width: min(460px, 100%); padding: 18px; box-shadow: 0 18px 50px rgba(0,0,0,.22); }
+    .modal.large { width: min(1180px, calc(100vw - 40px)); max-height: calc(100vh - 40px); overflow: auto; }
     .modal h2 { margin-bottom: 8px; }
     .modal p { color: var(--muted); margin: 0; line-height: 1.45; }
+    .trend-modal-body .trend-chart { height: 560px; }
     details { border: 1px solid var(--line); border-radius: 8px; margin-top: 14px; overflow: hidden; background: white; }
     summary { cursor: pointer; font-weight: 750; padding: 12px 14px; background: #eef2f6; }
     details .detail-body { padding: 12px; }
@@ -2589,6 +2872,8 @@ HTML = r"""
       <button data-tab="review" data-nav-area="project" class="hidden">Review Exceptions</button>
       <button data-tab="invoices" data-nav-area="project" class="hidden">Vendor Invoices</button>
       <button data-tab="billing" data-nav-area="project" class="hidden">Customer Billing</button>
+      <button data-tab="archivedProjects" data-nav-area="home">Archived Projects</button>
+      <button data-tab="texasOps" data-nav-area="texas" class="hidden">Texas Ops</button>
     </nav>
 
     <section id="home" class="tab">
@@ -2603,7 +2888,49 @@ HTML = r"""
           <p class="muted">Track RFQs, due dates, estimators, bid stages, weighted forecast, win/loss, and risk notes.</p>
           <div class="actions"><button class="btn primary" data-open-tab="bids" type="button">Open Bid Tracking</button></div>
         </div>
+        <div class="panel home-card" data-open-tab="texasOps" role="button" tabindex="0">
+          <h2>Texas Operations</h2>
+          <p class="muted">Upload weekly Balance Sheet and P&L reports and review a financial overview with trends.</p>
+          <div class="actions"><button class="btn primary" data-open-tab="texasOps" type="button">Open Texas Ops</button></div>
+        </div>
+        <div class="panel home-card" data-open-tab="archivedProjects" role="button" tabindex="0">
+          <h2>Archived Projects</h2>
+          <p class="muted">Open closed projects for reference or restore them back to the active project list.</p>
+          <div class="actions"><button class="btn primary" data-open-tab="archivedProjects" type="button">Open Archive</button></div>
+        </div>
       </div>
+    </section>
+
+    <section id="archivedProjects" class="tab hidden">
+      <div class="panel">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px">
+          <h2>Archived Projects</h2>
+          <button class="btn" id="refreshArchivedProjects" type="button">Refresh</button>
+        </div>
+        <div class="table-wrap" id="archivedProjectsTable"></div>
+      </div>
+    </section>
+
+    <section id="texasOps" class="tab hidden">
+      <div class="panel">
+        <h2>Texas Operations Financial Overview</h2>
+        <form id="financialUploadForm">
+          <div class="grid cols-4">
+            <div><label>Week Ending Override</label><input name="report_date" type="date"></div>
+            <div><label>Report Type</label><select name="report_type"><option value="combined">Combined / Auto</option><option value="balance_sheet">Balance Sheet</option><option value="pnl">P&L</option></select></div>
+            <div style="grid-column:span 2"><label>Reports</label><input name="files" type="file" accept=".xlsx,.xlsm,.csv,.tsv,.pdf" multiple required></div>
+          </div>
+          <div class="muted" style="margin-top:8px">Leave week ending blank when uploading multiple weeks; the app will use the report date inside each file.</div>
+          <div class="actions"><button class="btn primary" type="submit">Upload Reports</button></div>
+          <div class="muted" id="financialUploadResult"></div>
+        </form>
+      </div>
+      <div class="grid cols-4" id="financialKpis" style="margin-top:14px"></div>
+      <div class="dashboard-split">
+        <div class="panel"><h2>Profitability Trend</h2><div id="financialProfitTrend"></div></div>
+        <div class="panel"><h2>Balance Sheet Snapshot</h2><div id="financialBalanceSnapshot"></div></div>
+      </div>
+      <div class="panel" style="margin-top:14px"><h2>Uploaded Reports</h2><div id="financialReports"></div></div>
     </section>
 
     <section id="dashboard" class="tab hidden">
@@ -2661,6 +2988,7 @@ HTML = r"""
             <button class="btn primary" id="saveProjectBtn" type="submit">Save Project</button>
             <button class="btn" id="newProjectBtn" type="button">New Master Project</button>
             <button class="btn hidden" id="cancelNewProjectBtn" type="button">Cancel New</button>
+            <button class="btn danger" id="archiveProjectBtn" type="button">Close & Archive Project</button>
           </div>
         </form>
         <form class="panel" id="subprojectForm">
@@ -2696,6 +3024,10 @@ HTML = r"""
       <div class="panel" style="margin-top:14px">
         <h2>Edit Subprojects</h2>
         <div class="table-wrap"><table id="subprojectEditTable"></table></div>
+      </div>
+      <div class="panel" style="margin-top:14px">
+        <h2>Edit Change Orders</h2>
+        <div class="table-wrap"><table id="changeOrderEditTable"></table></div>
       </div>
       <div class="panel" style="margin-top:14px">
         <h2>Internal Raw Rates</h2>
@@ -2862,6 +3194,18 @@ HTML = r"""
       </div>
     </div>
   </div>
+  <div class="modal-backdrop hidden" id="trendModal">
+    <div class="modal large">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px">
+        <div>
+          <h2 style="margin:0">Profitability Trend</h2>
+          <p id="trendModalSubtitle"></p>
+        </div>
+        <button class="btn" id="closeTrendModal" type="button">Close</button>
+      </div>
+      <div class="trend-modal-body" id="trendModalBody"></div>
+    </div>
+  </div>
 
   <script>
     let state = { projects: [], projectId: null, subprojects: [], changeOrders: [], internalRates: [], rateSets: [], currentUser: null };
@@ -2877,6 +3221,7 @@ HTML = r"""
     const pct = v => `${(Number(v || 0) * 100).toFixed(1)}%`;
     const htmlEscape = v => String(v ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
     const help = text => `<span class="help-marker" tabindex="0" aria-label="${htmlEscape(text)}">?<span class="help-popover">${htmlEscape(text)}</span></span>`;
+    const plainTable = (headers, rows) => `<table><thead><tr>${headers.map(h => `<th>${h}</th>`).join('')}</tr></thead><tbody>${rows.map(r => `<tr>${r.map(c => `<td>${c}</td>`).join('')}</tr>`).join('')}</tbody></table>`;
     const api = async (url, opts={}) => {
       const res = await fetch(url, opts);
       if (res.status === 401) {
@@ -2896,6 +3241,8 @@ HTML = r"""
       const cancelBtn = document.getElementById('cancelNewProjectBtn');
       if (saveBtn) saveBtn.textContent = enabled ? 'Create Project' : 'Save Project';
       if (cancelBtn) cancelBtn.classList.toggle('hidden', !enabled);
+      const archiveBtn = document.getElementById('archiveProjectBtn');
+      if (archiveBtn) archiveBtn.classList.toggle('hidden', enabled);
       if (form && enabled) {
         form.reset();
         const rateSelect = document.getElementById('projectRateSet');
@@ -2908,7 +3255,7 @@ HTML = r"""
       }
     };
     const isTemporaryViewControl = target => {
-      return target.closest('.cost-filter') || target.id === 'showAllCosts';
+      return target.closest('.cost-filter') || target.closest('#financialProfitTrend') || target.id === 'showAllCosts';
     };
     const markUnsaved = event => {
       if (isTemporaryViewControl(event.target)) return;
@@ -2951,6 +3298,15 @@ HTML = r"""
         event.stopPropagation();
       }
     }, true);
+    document.getElementById('closeTrendModal').onclick = () => {
+      document.getElementById('trendModal').classList.add('hidden');
+    };
+    document.getElementById('trendModal').onclick = event => {
+      if (event.target.id === 'trendModal') event.currentTarget.classList.add('hidden');
+    };
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Escape') document.getElementById('trendModal').classList.add('hidden');
+    });
 
     document.querySelectorAll('nav button').forEach(btn => btn.addEventListener('click', async () => {
       if (!(await confirmDiscard())) return;
@@ -2962,7 +3318,8 @@ HTML = r"""
       const inProjectArea = projectTabs.includes(tabName);
       document.querySelectorAll('nav button').forEach(btn => {
         const area = btn.dataset.navArea || '';
-        btn.classList.toggle('hidden', area === 'project' && !inProjectArea);
+        const shouldHide = (area === 'project' && !inProjectArea) || (area === 'texas' && tabName !== 'texasOps');
+        btn.classList.toggle('hidden', shouldHide);
       });
     }
 
@@ -2981,6 +3338,8 @@ HTML = r"""
       if (tabName === 'billing') loadCustomerInvoices();
       if (tabName === 'bids') loadBidDashboard();
       if (tabName === 'admin') loadUsers();
+      if (tabName === 'texasOps') loadTexasOpsDashboard();
+      if (tabName === 'archivedProjects') loadArchivedProjects();
     }
 
     document.querySelectorAll('[data-open-tab]').forEach(btn => btn.onclick = async () => {
@@ -3021,13 +3380,204 @@ HTML = r"""
       window.location.href = '/login';
     };
 
+    function metricAmount(summary, key) {
+      return Number(summary.latest_metrics?.[key]?.amount || 0);
+    }
+
+    function trendBars(points, colorClass='') {
+      if (!points || !points.length) return '<div class="muted">No history yet.</div>';
+      const max = Math.max(...points.map(p => Math.abs(Number(p.amount || 0))), 1);
+      return `<div>${points.slice(-8).map(p => {
+        const width = Math.max(4, Math.min(100, Math.abs(Number(p.amount || 0)) / max * 100));
+        const negative = Number(p.amount || 0) < 0;
+        return `<div style="margin:8px 0"><div style="display:flex;justify-content:space-between;gap:10px"><span>${htmlEscape(p.report_date)}</span><strong class="${negative ? 'bad' : colorClass}">${money(p.amount)}</strong></div><div class="bar"><span style="width:${width}%;background:${negative ? 'var(--red)' : 'var(--blue)'}"></span></div></div>`;
+      }).join('')}</div>`;
+    }
+
+    function defaultFinancialTrendRange() {
+      const year = String(new Date().getFullYear());
+      return { start: `${year}-01-01`, end: `${year}-12-31` };
+    }
+
+    function financialTrendRange() {
+      const defaults = defaultFinancialTrendRange();
+      return {
+        start: localStorage.getItem('financialTrendStart') || defaults.start,
+        end: localStorage.getItem('financialTrendEnd') || defaults.end,
+      };
+    }
+
+    function rangeLabel(range) {
+      return `${range.start || 'Start'} to ${range.end || 'End'}`;
+    }
+
+    function dateRangePoints(points, range=financialTrendRange()) {
+      return (points || [])
+        .filter(p => {
+          const date = String(p.report_date || '');
+          return (!range.start || date >= range.start) && (!range.end || date <= range.end);
+        })
+        .sort((a, b) => String(a.report_date || '').localeCompare(String(b.report_date || '')));
+    }
+
+    function linePath(points, xFor, yFor) {
+      return points.map((p, i) => `${i ? 'L' : 'M'} ${xFor(p)} ${yFor(p)}`).join(' ');
+    }
+
+    function trendLineGraph(summary, range=financialTrendRange(), options={}) {
+      const netPoints = dateRangePoints(summary.history?.net_income || [], range);
+      const revenuePoints = dateRangePoints(summary.history?.revenue || [], range);
+      const allPoints = [...netPoints, ...revenuePoints];
+      if (!allPoints.length) return `<div class="muted">No P&L history in ${htmlEscape(rangeLabel(range))}.</div>`;
+      const width = options.width || 720;
+      const height = options.height || 300;
+      const pad = options.pad || { left: 78, right: 22, top: 24, bottom: 46 };
+      const dates = [...new Set(allPoints.map(p => p.report_date))].sort();
+      const values = allPoints.map(p => Number(p.amount || 0));
+      let min = Math.min(0, ...values);
+      let max = Math.max(0, ...values);
+      if (min === max) { min -= 1; max += 1; }
+      const plotW = width - pad.left - pad.right;
+      const plotH = height - pad.top - pad.bottom;
+      const xDate = d => pad.left + (dates.length === 1 ? plotW / 2 : dates.indexOf(d) / (dates.length - 1) * plotW);
+      const yVal = v => pad.top + (max - Number(v || 0)) / (max - min) * plotH;
+      const xFor = p => xDate(p.report_date);
+      const yFor = p => yVal(p.amount);
+      const zeroY = yVal(0);
+      const yTicks = [max, (max + min) / 2, min];
+      const dateLabels = dates.map(d => {
+        const date = new Date(`${d}T00:00:00`);
+        return Number.isNaN(date.getTime()) ? d : date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+      });
+      const circles = (points, color) => points.map(p => `<circle class="trend-point" cx="${xFor(p)}" cy="${yFor(p)}" r="4" fill="${color}"><title>${p.report_date}: ${money(p.amount)}</title></circle>`).join('');
+      return `<svg class="trend-chart ${options.large ? 'trend-chart-large' : ''}" viewBox="0 0 ${width} ${height}" role="img" aria-label="Profitability trend graph">
+        ${yTicks.map(t => `<line class="trend-axis" x1="${pad.left}" x2="${width - pad.right}" y1="${yVal(t)}" y2="${yVal(t)}"></line><text class="trend-label" x="8" y="${yVal(t) + 4}">${money(t)}</text>`).join('')}
+        <line class="trend-axis" x1="${pad.left}" x2="${width - pad.right}" y1="${zeroY}" y2="${zeroY}"></line>
+        ${dates.map((d, i) => `<text class="trend-label" x="${xDate(d)}" y="${height - 18}" text-anchor="middle">${htmlEscape(dateLabels[i])}</text>`).join('')}
+        ${revenuePoints.length ? `<path class="trend-line-revenue" d="${linePath(revenuePoints, xFor, yFor)}"></path>${circles(revenuePoints, 'var(--blue)')}` : ''}
+        ${netPoints.length ? `<path class="trend-line-profit" d="${linePath(netPoints, xFor, yFor)}"></path>${circles(netPoints, 'var(--green)')}` : ''}
+      </svg>
+      <div class="trend-legend"><span><span class="trend-swatch" style="background:var(--blue)"></span>Revenue</span><span><span class="trend-swatch" style="background:var(--green)"></span>Net Income</span><span>${htmlEscape(rangeLabel(range))}</span></div>`;
+    }
+
+    function renderProfitabilityTrend(summary, mode='graph', range=financialTrendRange()) {
+      const controls = `<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:10px;flex-wrap:wrap">
+        <div style="display:flex;align-items:end;gap:8px;flex-wrap:wrap">
+          <div><label style="margin:0 0 4px">Start</label><input type="date" data-financial-trend-start value="${htmlEscape(range.start || '')}"></div>
+          <div><label style="margin:0 0 4px">End</label><input type="date" data-financial-trend-end value="${htmlEscape(range.end || '')}"></div>
+          <button class="btn" type="button" data-financial-trend-reset>Current Year</button>
+          <button class="btn" type="button" data-financial-trend-expand>Expand Graph</button>
+        </div>
+        <div class="segmented" role="group" aria-label="Trend view">
+          <button type="button" data-financial-trend-mode="graph" class="${mode === 'graph' ? 'active' : ''}">Graph</button>
+          <button type="button" data-financial-trend-mode="bars" class="${mode === 'bars' ? 'active' : ''}">Bars</button>
+        </div>
+      </div>`;
+      const filteredNet = dateRangePoints(summary.history?.net_income || [], range);
+      const filteredRevenue = dateRangePoints(summary.history?.revenue || [], range);
+      const body = mode === 'bars'
+        ? `<h3>Net Income</h3>${trendBars(filteredNet)}<h3>Revenue</h3>${trendBars(filteredRevenue)}`
+        : trendLineGraph(summary, range);
+      const target = document.getElementById('financialProfitTrend');
+      target.innerHTML = controls + body;
+      target.querySelectorAll('[data-financial-trend-mode]').forEach(btn => btn.onclick = () => {
+        localStorage.setItem('financialTrendMode', btn.dataset.financialTrendMode);
+        renderProfitabilityTrend(summary, btn.dataset.financialTrendMode, financialTrendRange());
+      });
+      const startEl = target.querySelector('[data-financial-trend-start]');
+      const endEl = target.querySelector('[data-financial-trend-end]');
+      const updateRange = () => {
+        localStorage.setItem('financialTrendStart', startEl.value || '');
+        localStorage.setItem('financialTrendEnd', endEl.value || '');
+        renderProfitabilityTrend(summary, mode, financialTrendRange());
+      };
+      if (startEl) startEl.onchange = updateRange;
+      if (endEl) endEl.onchange = updateRange;
+      const resetBtn = target.querySelector('[data-financial-trend-reset]');
+      if (resetBtn) resetBtn.onclick = () => {
+        const defaults = defaultFinancialTrendRange();
+        localStorage.setItem('financialTrendStart', defaults.start);
+        localStorage.setItem('financialTrendEnd', defaults.end);
+        renderProfitabilityTrend(summary, mode, defaults);
+      };
+      const expandBtn = target.querySelector('[data-financial-trend-expand]');
+      if (expandBtn) expandBtn.onclick = () => openTrendModal(summary, mode, financialTrendRange());
+    }
+
+    function openTrendModal(summary, mode='graph', range=financialTrendRange()) {
+      const modal = document.getElementById('trendModal');
+      document.getElementById('trendModalSubtitle').textContent = `${rangeLabel(range)} / ${mode === 'bars' ? 'bar view' : 'graph view'}`;
+      const filteredNet = dateRangePoints(summary.history?.net_income || [], range);
+      const filteredRevenue = dateRangePoints(summary.history?.revenue || [], range);
+      document.getElementById('trendModalBody').innerHTML = mode === 'bars'
+        ? `<h3>Net Income</h3>${trendBars(filteredNet)}<h3>Revenue</h3>${trendBars(filteredRevenue)}`
+        : trendLineGraph(summary, range, { width: 1120, height: 560, large: true, pad: { left: 92, right: 34, top: 30, bottom: 60 } });
+      modal.classList.remove('hidden');
+    }
+
+    async function loadTexasOpsDashboard() {
+      const summary = await api('/api/texas-financial-summary');
+      const revenue = metricAmount(summary, 'revenue');
+      const expenses = metricAmount(summary, 'operating_expenses');
+      const netIncome = metricAmount(summary, 'net_income');
+      const cash = metricAmount(summary, 'cash');
+      const workingCapital = metricAmount(summary, 'working_capital');
+      const currentRatio = metricAmount(summary, 'current_ratio');
+      document.getElementById('financialKpis').innerHTML = `
+        <div class="panel kpi"><div class="label">Revenue</div><div class="value">${money(revenue)}</div><div class="hint">Latest P&L</div></div>
+        <div class="panel kpi"><div class="label">Operating Expenses</div><div class="value">${money(expenses)}</div><div class="hint">Latest P&L</div></div>
+        <div class="panel kpi"><div class="label">Net Income</div><div class="value ${netIncome >= 0 ? 'good' : 'bad'}">${money(netIncome)}</div><div class="hint">Revenue minus expenses</div></div>
+        <div class="panel kpi"><div class="label">Cash</div><div class="value">${money(cash)}</div><div class="hint">Latest balance sheet</div></div>`;
+      renderProfitabilityTrend(summary, localStorage.getItem('financialTrendMode') || 'graph');
+      document.getElementById('financialBalanceSnapshot').innerHTML = plainTable(['Metric','Value'], [
+        ['Cash', money(cash)],
+        ['Accounts Receivable', money(metricAmount(summary, 'accounts_receivable'))],
+        ['Accounts Payable', money(metricAmount(summary, 'accounts_payable'))],
+        ['Current Assets', money(metricAmount(summary, 'current_assets'))],
+        ['Current Liabilities', money(metricAmount(summary, 'current_liabilities'))],
+        ['Working Capital', `<span class="${workingCapital >= 0 ? 'good' : 'bad'}">${money(workingCapital)}</span>`],
+        ['Current Ratio', currentRatio ? currentRatio.toFixed(2) : ''],
+        ['Total Assets', money(metricAmount(summary, 'total_assets'))],
+        ['Total Liabilities', money(metricAmount(summary, 'total_liabilities'))],
+        ['Equity', money(metricAmount(summary, 'equity'))],
+      ]);
+      document.getElementById('financialReports').innerHTML = summary.reports.length
+        ? plainTable(['Week Ending','Type','File','Uploaded'], summary.reports.map(r => [r.report_date, r.report_type, htmlEscape(r.source_file || ''), r.uploaded_at || '']))
+        : '<div class="muted">No financial reports uploaded yet.</div>';
+    }
+
+    document.getElementById('financialUploadForm').onsubmit = async event => {
+      event.preventDefault();
+      const form = event.target;
+      const resultEl = document.getElementById('financialUploadResult');
+      resultEl.textContent = 'Uploading reports...';
+      const data = new FormData(form);
+      try {
+        const res = await fetch('/api/texas-financial-import', { method:'POST', body:data });
+        const payload = await res.json();
+        if (!res.ok) throw new Error(payload.error || 'Upload failed');
+        resultEl.textContent = `Imported ${payload.imported} report(s), ${payload.metric_count} metric(s).`;
+        form.reset();
+        markSaved();
+        await loadTexasOpsDashboard();
+      } catch (err) {
+        resultEl.textContent = `Import failed: ${err.message}`;
+      }
+    };
+
     async function loadProjects() {
-      state.projects = await api('/api/projects');
+      state.projects = await api('/api/projects?status=all');
       const sel = document.getElementById('projectSelect');
-      sel.innerHTML = state.projects.map(p => `<option value="${p.id}">${p.name}</option>`).join('');
+      const activeProjects = state.projects.filter(p => (p.status || 'Active') !== 'Archived');
+      const currentProject = state.projects.find(p => p.id === state.projectId);
+      const selectorProjects = currentProject && (currentProject.status || 'Active') === 'Archived'
+        ? [...activeProjects, currentProject]
+        : activeProjects;
+      sel.innerHTML = selectorProjects.map(p => `<option value="${p.id}">${htmlEscape(p.name)}${(p.status || 'Active') === 'Archived' ? ' (Archived)' : ''}</option>`).join('');
       const savedProjectId = Number(localStorage.getItem('selectedProjectId') || 0);
-      if (!state.projectId && savedProjectId && state.projects.some(p => p.id === savedProjectId)) state.projectId = savedProjectId;
-      if (!state.projectId && state.projects[0]) state.projectId = state.projects[0].id;
+      if (!state.projectId && savedProjectId && activeProjects.some(p => p.id === savedProjectId)) state.projectId = savedProjectId;
+      if (state.projectId && !selectorProjects.some(p => p.id === state.projectId)) state.projectId = null;
+      if (!state.projectId && activeProjects[0]) state.projectId = activeProjects[0].id;
       if (state.projectId) sel.value = state.projectId;
       sel.onchange = async () => {
         if (!(await confirmDiscard())) {
@@ -3044,6 +3594,40 @@ HTML = r"""
       await refresh();
     }
 
+    async function loadArchivedProjects() {
+      const archived = await api('/api/projects?status=archived');
+      const wrap = document.getElementById('archivedProjectsTable');
+      if (!archived.length) {
+        wrap.innerHTML = '<p class="muted">No archived projects yet.</p>';
+        return;
+      }
+      wrap.innerHTML = `<table><thead><tr><th>Project</th><th>Customer</th><th>Location</th><th>Closed</th><th></th></tr></thead><tbody>${archived.map(p => `
+        <tr>
+          <td><strong>${htmlEscape(p.name)}</strong><div class="muted">${htmlEscape(p.project_code || '')}</div></td>
+          <td>${htmlEscape(p.customer || '')}</td>
+          <td>${htmlEscape(p.location || '')}</td>
+          <td>${htmlEscape((p.archived_at || p.closed_at || '').slice(0, 10))}</td>
+          <td>
+            <button class="btn" data-open-archived-project="${p.id}" type="button">Open</button>
+            <button class="btn" data-restore-project="${p.id}" type="button">Restore</button>
+          </td>
+        </tr>`).join('')}</tbody></table>`;
+      document.querySelectorAll('[data-open-archived-project]').forEach(btn => btn.onclick = async () => {
+        if (!(await confirmDiscard())) return;
+        state.projectId = Number(btn.dataset.openArchivedProject);
+        localStorage.removeItem('selectedProjectId');
+        await loadProjects();
+        openTab('dashboard');
+      });
+      document.querySelectorAll('[data-restore-project]').forEach(btn => btn.onclick = async () => {
+        await api(`/api/projects/${btn.dataset.restoreProject}/restore`, { method:'POST', body: JSON.stringify({}) });
+        state.projectId = Number(btn.dataset.restoreProject);
+        localStorage.setItem('selectedProjectId', state.projectId);
+        await loadProjects();
+        openTab('dashboard');
+      });
+    }
+
     async function refresh() {
       if (!state.projectId) {
         document.getElementById('kpis').innerHTML = '<div class="panel">Create a master project to begin.</div>';
@@ -3056,6 +3640,7 @@ HTML = r"""
       fillSelects();
       await loadDashboard();
       loadSubprojectEditor();
+      loadChangeOrderEditor();
       loadInternalRateEditor();
       loadImportHistory();
       loadFieldTicketLines();
@@ -3090,6 +3675,11 @@ HTML = r"""
             const input = projectForm.querySelector(`[name="${field}"]`);
             if (input) input.value = project[field] || '';
           });
+        }
+        const archiveBtn = document.getElementById('archiveProjectBtn');
+        if (archiveBtn) {
+          const isArchived = (project.status || 'Active') === 'Archived';
+          archiveBtn.classList.toggle('hidden', isArchived);
         }
       }
     }
@@ -3965,6 +4555,37 @@ HTML = r"""
       });
     }
 
+    function loadChangeOrderEditor() {
+      const tableEl = document.getElementById('changeOrderEditTable');
+      if (!tableEl) return;
+      if (!state.changeOrders.length) {
+        tableEl.innerHTML = '<tbody><tr><td>No change orders have been added yet.</td></tr></tbody>';
+        return;
+      }
+      const subprojectOptions = subprojectId => '<option value="">Unassigned</option>' + state.subprojects.map(s => `<option value="${s.id}" ${String(subprojectId || '') === String(s.id) ? 'selected' : ''}>${htmlEscape([s.job_number, s.code, s.name].filter(Boolean).join(' - '))}</option>`).join('');
+      tableEl.innerHTML = `
+        <thead><tr><th>Subproject</th><th>CO Number</th><th>Job / Order #</th><th>Pricing</th><th>Status</th><th>Title</th><th>Quoted Value</th><th>Approved Value</th><th></th></tr></thead>
+        <tbody>${state.changeOrders.map(c => `<tr>
+          <td><select data-co-edit="${c.id}" data-field="subproject_id">${subprojectOptions(c.subproject_id)}</select></td>
+          <td><input data-co-edit="${c.id}" data-field="co_number" value="${htmlEscape(c.co_number || '')}"></td>
+          <td><input data-co-edit="${c.id}" data-field="job_number" value="${htmlEscape(c.job_number || '')}"></td>
+          <td><select data-co-edit="${c.id}" data-field="pricing_type"><option ${c.pricing_type === 'Fixed' ? 'selected' : ''}>Fixed</option><option ${c.pricing_type === 'T&M' ? 'selected' : ''}>T&M</option></select></td>
+          <td><select data-co-edit="${c.id}" data-field="status"><option ${c.status === 'Pending' ? 'selected' : ''}>Pending</option><option ${c.status === 'Approved' ? 'selected' : ''}>Approved</option><option ${c.status === 'Rejected' ? 'selected' : ''}>Rejected</option><option ${c.status === 'Billed' ? 'selected' : ''}>Billed</option></select></td>
+          <td><input data-co-edit="${c.id}" data-field="title" value="${htmlEscape(c.title || '')}"></td>
+          <td><input data-co-edit="${c.id}" data-field="quoted_value" type="number" step="0.01" value="${c.quoted_value || 0}"></td>
+          <td><input data-co-edit="${c.id}" data-field="approved_value" type="number" step="0.01" value="${c.approved_value || 0}"></td>
+          <td><button class="btn" data-save-co="${c.id}" type="button">Save</button></td>
+        </tr>`).join('')}</tbody>`;
+      document.querySelectorAll('[data-save-co]').forEach(btn => btn.onclick = async () => {
+        const id = btn.dataset.saveCo;
+        const fields = {};
+        document.querySelectorAll(`[data-co-edit="${id}"]`).forEach(el => fields[el.dataset.field] = el.value);
+        await api(`/api/change-orders/${id}`, { method:'PUT', body: JSON.stringify(fields) });
+        markSaved();
+        await refresh();
+      });
+    }
+
     function loadInternalRateEditor() {
       const tableEl = document.getElementById('rateEditTable');
       if (!tableEl) return;
@@ -4403,11 +5024,24 @@ HTML = r"""
       document.getElementById('setup').classList.remove('hidden');
       document.querySelector('#projectForm input[name="project_code"]').focus();
     };
+    document.getElementById('archiveProjectBtn').onclick = async () => {
+      if (!state.projectId || projectCreateMode) return;
+      const project = state.projects.find(p => p.id === state.projectId);
+      const ok = window.confirm(`Close and archive ${project?.name || 'this project'}? It will move out of the active project list.`);
+      if (!ok) return;
+      await api(`/api/projects/${state.projectId}/archive`, { method:'POST', body: JSON.stringify({}) });
+      localStorage.removeItem('selectedProjectId');
+      state.projectId = null;
+      markSaved();
+      await loadProjects();
+      openTab('archivedProjects');
+    };
     document.getElementById('cancelNewProjectBtn').onclick = async () => {
       setProjectCreateMode(false);
       markSaved();
       await refresh();
     };
+    document.getElementById('refreshArchivedProjects').onclick = () => loadArchivedProjects();
     document.getElementById('subprojectForm').onsubmit = async e => {
       e.preventDefault();
       await api('/api/subprojects', { method:'POST', body: JSON.stringify({ ...formDataObj(e.target), project_id: state.projectId }) });
@@ -4622,7 +5256,12 @@ class Handler(BaseHTTPRequestHandler):
                 content_types = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}
                 return file_response(self, path, content_types.get(path.suffix.lower(), "application/octet-stream"))
             if parsed.path == "/api/projects":
-                return json_response(self, rows("SELECT * FROM projects ORDER BY project_code"))
+                status_filter = (qs.get("status", ["active"])[0] or "active").lower()
+                if status_filter == "all":
+                    return json_response(self, rows("SELECT * FROM projects ORDER BY CASE WHEN status = 'Archived' THEN 1 ELSE 0 END, project_code"))
+                if status_filter == "archived":
+                    return json_response(self, rows("SELECT * FROM projects WHERE status = 'Archived' ORDER BY COALESCE(archived_at, closed_at, created_at) DESC, project_code"))
+                return json_response(self, rows("SELECT * FROM projects WHERE COALESCE(status, 'Active') <> 'Archived' ORDER BY project_code"))
             if parsed.path == "/api/me":
                 return json_response(self, user)
             if parsed.path == "/api/users":
@@ -4631,6 +5270,8 @@ class Handler(BaseHTTPRequestHandler):
                 return json_response(self, rows("SELECT id, username, display_name, role, active, created_at FROM users ORDER BY username"))
             if parsed.path == "/api/bid-summary":
                 return json_response(self, bid_summary())
+            if parsed.path == "/api/texas-financial-summary":
+                return json_response(self, texas_financial_summary())
             if parsed.path == "/api/bids":
                 return json_response(self, rows("SELECT * FROM bid_requests ORDER BY bid_due_date, rfq_no"))
             if parsed.path == "/api/rate-sets":
@@ -4771,6 +5412,28 @@ class Handler(BaseHTTPRequestHandler):
                         "existing_source_file": result.get("existing_source_file", ""),
                     },
                 )
+            if parsed.path == "/api/texas-financial-import":
+                form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": self.headers.get("Content-Type")})
+                report_date = form.getvalue("report_date") or datetime.now().date().isoformat()
+                report_type = form.getvalue("report_type") or "combined"
+                file_items = form["files"] if "files" in form else []
+                if not isinstance(file_items, list):
+                    file_items = [file_items]
+                imported = 0
+                metric_count = 0
+                details = []
+                for file_item in file_items:
+                    if not getattr(file_item, "filename", ""):
+                        continue
+                    safe_name = Path(file_item.filename).name
+                    path = UPLOAD_DIR / f"{datetime.now().strftime('%Y%m%d%H%M%S')}-{safe_name}"
+                    with open(path, "wb") as f:
+                        f.write(file_item.file.read())
+                    result = import_financial_report(path, report_date, report_type)
+                    imported += 1
+                    metric_count += result["count"]
+                    details.append({"file": safe_name, "metrics": result["count"]})
+                return json_response(self, {"imported": imported, "metric_count": metric_count, "details": details})
 
             data = parse_json(self)
             now = datetime.now().isoformat(timespec="seconds")
@@ -4782,9 +5445,23 @@ class Handler(BaseHTTPRequestHandler):
                     (data.get("username"), data.get("display_name"), hash_password(data.get("password")), clean_role(data.get("role")), now),
                 )
                 return json_response(self, {"id": new_id})
+            if parsed.path.startswith("/api/projects/") and parsed.path.endswith("/archive"):
+                project_id = parsed.path.split("/")[-2]
+                execute(
+                    "UPDATE projects SET status = 'Archived', closed_at = COALESCE(closed_at, ?), archived_at = ? WHERE id = ?",
+                    (now, now, project_id),
+                )
+                return json_response(self, {"ok": True})
+            if parsed.path.startswith("/api/projects/") and parsed.path.endswith("/restore"):
+                project_id = parsed.path.split("/")[-2]
+                execute(
+                    "UPDATE projects SET status = 'Active', closed_at = NULL, archived_at = NULL WHERE id = ?",
+                    (project_id,),
+                )
+                return json_response(self, {"ok": True})
             if parsed.path == "/api/projects":
                 new_id = execute(
-                    "INSERT INTO projects (project_code, name, customer, location, customer_po, description, rate_set_id, contract_value, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO projects (project_code, name, customer, location, customer_po, description, rate_set_id, contract_value, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Active', ?)",
                     (data.get("project_code"), data.get("name"), data.get("customer"), data.get("location"), data.get("customer_po"), data.get("description"), data.get("rate_set_id") or None, money(data.get("contract_value")), now),
                 )
                 return json_response(self, {"id": new_id})
@@ -5184,6 +5861,48 @@ class Handler(BaseHTTPRequestHandler):
                         "UPDATE projects SET contract_value = (SELECT COALESCE(SUM(contract_value), 0) FROM subprojects WHERE project_id = ?) WHERE id = ?",
                         (subproject["project_id"], subproject["project_id"]),
                     )
+                return json_response(self, {"ok": True})
+            if parsed.path.startswith("/api/change-orders/"):
+                change_order_id = parsed.path.rsplit("/", 1)[-1]
+                pricing_type = data.get("pricing_type") or "Fixed"
+                execute(
+                    """
+                    UPDATE change_orders
+                    SET subproject_id = ?, co_number = ?, job_number = ?, pricing_type = ?, title = ?, status = ?, quoted_value = ?, approved_value = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        data.get("subproject_id") or None,
+                        data.get("co_number"),
+                        data.get("job_number"),
+                        pricing_type,
+                        data.get("title"),
+                        data.get("status") or "Pending",
+                        money(data.get("quoted_value")),
+                        0 if pricing_type == "T&M" else money(data.get("approved_value")),
+                        change_order_id,
+                    ),
+                )
+                execute(
+                    """
+                    UPDATE cost_records
+                    SET subproject_id = ?,
+                        amount = CASE
+                          WHEN cost_type = 'Field Ticket Material' THEN COALESCE(sales_amount, 0) * ?
+                          ELSE amount
+                        END,
+                        raw_rate = CASE
+                          WHEN cost_type = 'Field Ticket Material' THEN COALESCE(sales_rate, rate, 0) * ?
+                          ELSE raw_rate
+                        END,
+                        raw_cost_source = CASE
+                          WHEN cost_type = 'Field Ticket Material' THEN 'CO T&M material estimate at 35% margin'
+                          ELSE raw_cost_source
+                        END
+                    WHERE change_order_id = ?
+                    """,
+                    (data.get("subproject_id") or None, CO_MATERIAL_COST_FACTOR, CO_MATERIAL_COST_FACTOR, change_order_id),
+                )
                 return json_response(self, {"ok": True})
             if parsed.path.startswith("/api/customer-invoices/"):
                 invoice_id = parsed.path.rsplit("/", 1)[-1]
