@@ -2942,6 +2942,8 @@ HTML = r"""
     body.read-only form .actions,
     body.read-only [data-save],
     body.read-only [data-save-sp],
+    body.read-only [data-delete-sp],
+    body.read-only [data-delete-co],
     body.read-only [data-save-rate],
     body.read-only [data-save-cost-group],
     body.read-only [data-save-bid],
@@ -3425,6 +3427,34 @@ HTML = r"""
       </form>
     </div>
   </div>
+  <div class="modal-backdrop hidden" id="copySubprojectModal">
+    <div class="modal">
+      <h2>Copy Subproject</h2>
+      <p id="copySubprojectMessage"></p>
+      <form id="copySubprojectForm">
+        <input type="hidden" name="subproject_id">
+        <label>New Job / Order #<input name="job_number" required></label>
+        <label>Code<input name="code"></label>
+        <label>Name<input name="name" required></label>
+        <label>Pricing
+          <select name="pricing_type">
+            <option>Fixed</option>
+            <option>T&amp;M</option>
+          </select>
+        </label>
+        <label>Contract Value<input name="contract_value" type="number" step="0.01"></label>
+        <label>Labor Hours Budget<input name="budget_labor_hours" type="number" step="0.01"></label>
+        <label>Labor $ Budget<input name="budget_labor" type="number" step="0.01"></label>
+        <label>Material Budget<input name="budget_material" type="number" step="0.01"></label>
+        <label>Equipment Budget<input name="budget_equipment" type="number" step="0.01"></label>
+        <div id="copySubprojectError" class="bad"></div>
+        <div class="actions">
+          <button class="btn primary" type="submit">Create Copy</button>
+          <button class="btn" id="closeCopySubprojectModal" type="button">Cancel</button>
+        </div>
+      </form>
+    </div>
+  </div>
   <div class="modal-backdrop hidden" id="vendorAllocationModal">
     <div class="modal large">
       <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px">
@@ -3576,11 +3606,19 @@ HTML = r"""
     document.getElementById('vendorAllocationModal').onclick = event => {
       if (event.target.id === 'vendorAllocationModal') closeVendorAllocationModal();
     };
+    function closeCopySubprojectModal() {
+      document.getElementById('copySubprojectModal').classList.add('hidden');
+    }
+    document.getElementById('closeCopySubprojectModal').onclick = closeCopySubprojectModal;
+    document.getElementById('copySubprojectModal').onclick = event => {
+      if (event.target.id === 'copySubprojectModal') closeCopySubprojectModal();
+    };
     document.addEventListener('keydown', event => {
       if (event.key === 'Escape') document.getElementById('trendModal').classList.add('hidden');
       if (event.key === 'Escape') document.getElementById('financialDuplicateModal').classList.add('hidden');
       if (event.key === 'Escape') closeAccountModal();
       if (event.key === 'Escape') closeVendorAllocationModal();
+      if (event.key === 'Escape') closeCopySubprojectModal();
     });
 
     document.querySelectorAll('nav button').forEach(btn => btn.addEventListener('click', async () => {
@@ -4883,11 +4921,12 @@ HTML = r"""
         const profit = Number(x.profit || 0);
         const margin = Number(x.margin || 0);
         const open = `<button class="btn" style="padding:4px 7px" data-open-subproject="${x.id}" type="button">Open</button>`;
+        const copy = `<button class="btn" style="padding:4px 7px" data-copy-subproject="${x.id}" onclick="event.preventDefault(); event.stopPropagation(); window.copySubprojectById('${x.id}')" type="button">Copy</button>`;
         const selected = String(selectedId || '') === String(x.id);
         return `<tr class="selectable-row ${selected ? 'selected' : ''}" data-select-subproject="${x.id}">
           <td>${x.job_number || ''}</td>
           <td>${x.code}</td>
-          <td>${open} ${x.name}</td>
+          <td>${open} ${copy} ${x.name}</td>
           <td>${x.pricing_type || 'Fixed'}</td>
           <td>${money(salesValue)}</td>
           <td>${laborUsed.toFixed(2)} / ${laborBudget.toFixed(2)}<br><div class="bar"><span style="width:${Math.min(100, laborPct*100)}%"></span></div></td>
@@ -4899,6 +4938,72 @@ HTML = r"""
         </tr>`;
       }).join('')}</tbody></table>`;
     }
+
+    async function copySubproject(id) {
+      const original = state.subprojects.find(s => String(s.id) === String(id));
+      const label = original ? [original.job_number, original.code, original.name].filter(Boolean).join(' - ') : 'this subproject';
+      const form = document.getElementById('copySubprojectForm');
+      form.reset();
+      form.elements.subproject_id.value = id;
+      if (original) {
+        form.elements.code.value = original.code || '';
+        form.elements.name.value = original.name || '';
+        form.elements.pricing_type.value = original.pricing_type || 'Fixed';
+        form.elements.contract_value.value = Number(original.contract_value || 0);
+        form.elements.budget_labor_hours.value = Number(original.budget_labor_hours || 0);
+        form.elements.budget_labor.value = Number(original.budget_labor || 0);
+        form.elements.budget_material.value = Number(original.budget_material || 0);
+        form.elements.budget_equipment.value = Number(original.budget_equipment || 0);
+      }
+      document.getElementById('copySubprojectMessage').textContent = `Copying ${label}. Enter the new job/order number, then adjust any copied setup information if needed.`;
+      document.getElementById('copySubprojectError').textContent = '';
+      document.getElementById('copySubprojectModal').classList.remove('hidden');
+      setTimeout(() => form.elements.job_number?.focus(), 50);
+    }
+
+    window.copySubprojectById = copySubproject;
+
+    document.getElementById('copySubprojectForm').onsubmit = async event => {
+      event.preventDefault();
+      const form = event.target;
+      const subprojectId = form.elements.subproject_id.value;
+      const jobNumber = form.elements.job_number.value.trim();
+      const error = document.getElementById('copySubprojectError');
+      error.textContent = '';
+      if (!jobNumber) {
+        error.textContent = 'Enter a job/order number before copying this subproject.';
+        return;
+      }
+      try {
+        await api(`/api/subprojects/${subprojectId}/copy`, {
+          method:'POST',
+          body: JSON.stringify({
+            job_number: jobNumber,
+            code: form.elements.code.value.trim(),
+            name: form.elements.name.value.trim(),
+            pricing_type: form.elements.pricing_type.value,
+            contract_value: form.elements.contract_value.value,
+            budget_labor_hours: form.elements.budget_labor_hours.value,
+            budget_labor: form.elements.budget_labor.value,
+            budget_material: form.elements.budget_material.value,
+            budget_equipment: form.elements.budget_equipment.value
+          })
+        });
+        closeCopySubprojectModal();
+        markSaved();
+        await refresh();
+      } catch (err) {
+        error.textContent = err.message || 'Could not copy subproject.';
+      }
+    };
+
+    document.addEventListener('click', event => {
+      const copyButton = event.target.closest('[data-copy-subproject], [data-copy-sp]');
+      if (!copyButton) return;
+      event.preventDefault();
+      event.stopPropagation();
+      copySubproject(copyButton.dataset.copySubproject || copyButton.dataset.copySp);
+    }, true);
 
     async function loadSubprojectDetail(subprojectId, shouldScroll=true, changeOrderId=null) {
       openSubprojectDetailId = subprojectId;
@@ -5043,13 +5148,27 @@ HTML = r"""
           <td><input data-sp="${s.id}" data-field="budget_labor" type="number" step="0.01" value="${s.budget_labor || 0}"></td>
           <td><input data-sp="${s.id}" data-field="budget_material" type="number" step="0.01" value="${s.budget_material || 0}"></td>
           <td><input data-sp="${s.id}" data-field="budget_equipment" type="number" step="0.01" value="${s.budget_equipment || 0}"></td>
-          <td><button class="btn" data-save-sp="${s.id}">Save</button></td>
+          <td class="actions-cell"><button class="btn" data-save-sp="${s.id}" type="button">Save</button><button class="btn" data-copy-sp="${s.id}" onclick="event.preventDefault(); event.stopPropagation(); window.copySubprojectById('${s.id}')" type="button">Copy</button><button class="btn danger" data-delete-sp="${s.id}" type="button">Delete</button></td>
         </tr>`).join('')}</tbody>`;
       document.querySelectorAll('[data-save-sp]').forEach(btn => btn.onclick = async () => {
         const id = btn.dataset.saveSp;
         const fields = {};
         document.querySelectorAll(`[data-sp="${id}"]`).forEach(el => fields[el.dataset.field] = el.value);
         await api(`/api/subprojects/${id}`, { method:'PUT', body: JSON.stringify(fields) });
+        markSaved();
+        await refresh();
+      });
+      document.querySelectorAll('[data-delete-sp]').forEach(btn => btn.onclick = async () => {
+        const id = btn.dataset.deleteSp;
+        const subproject = state.subprojects.find(s => String(s.id) === String(id));
+        const label = subproject ? [subproject.job_number, subproject.code, subproject.name].filter(Boolean).join(' - ') : 'this subproject';
+        if (!window.confirm(`Delete subproject ${label}?\n\nCost records, customer invoices, and change orders tied to it will be kept, but they will no longer be assigned to this subproject.`)) return;
+        await api(`/api/subprojects/${id}`, { method:'DELETE' });
+        if (String(selectedDashboardSubprojectId || '') === String(id)) selectedDashboardSubprojectId = null;
+        if (String(openSubprojectDetailId || '') === String(id)) {
+          openSubprojectDetailId = null;
+          document.getElementById('subprojectDetailPanel').classList.add('hidden');
+        }
         markSaved();
         await refresh();
       });
@@ -5074,13 +5193,23 @@ HTML = r"""
           <td><input data-co-edit="${c.id}" data-field="title" value="${htmlEscape(c.title || '')}"></td>
           <td><input data-co-edit="${c.id}" data-field="quoted_value" type="number" step="0.01" value="${c.quoted_value || 0}"></td>
           <td><input data-co-edit="${c.id}" data-field="approved_value" type="number" step="0.01" value="${c.approved_value || 0}"></td>
-          <td><button class="btn" data-save-co="${c.id}" type="button">Save</button></td>
+          <td class="actions-cell"><button class="btn" data-save-co="${c.id}" type="button">Save</button><button class="btn danger" data-delete-co="${c.id}" type="button">Delete</button></td>
         </tr>`).join('')}</tbody>`;
       document.querySelectorAll('[data-save-co]').forEach(btn => btn.onclick = async () => {
         const id = btn.dataset.saveCo;
         const fields = {};
         document.querySelectorAll(`[data-co-edit="${id}"]`).forEach(el => fields[el.dataset.field] = el.value);
         await api(`/api/change-orders/${id}`, { method:'PUT', body: JSON.stringify(fields) });
+        markSaved();
+        await refresh();
+      });
+      document.querySelectorAll('[data-delete-co]').forEach(btn => btn.onclick = async () => {
+        const id = btn.dataset.deleteCo;
+        const co = state.changeOrders.find(c => String(c.id) === String(id));
+        const label = co ? [co.co_number, co.job_number, co.title].filter(Boolean).join(' - ') : 'this change order';
+        if (!window.confirm(`Delete change order ${label}?\n\nCost records and customer invoices tied to it will be kept, but they will no longer be assigned to this change order.`)) return;
+        await api(`/api/change-orders/${id}`, { method:'DELETE' });
+        if (String(selectedDashboardChangeOrderId || '') === String(id)) selectedDashboardChangeOrderId = null;
         markSaved();
         await refresh();
       });
@@ -6127,6 +6256,60 @@ class Handler(BaseHTTPRequestHandler):
                     (data.get("project_id"), data.get("project_id")),
                 )
                 return json_response(self, {"id": new_id})
+            if parsed.path.startswith("/api/subprojects/") and parsed.path.endswith("/copy"):
+                subproject_id = parsed.path.split("/")[-2]
+                new_job_number = str(data.get("job_number") or "").strip()
+                if not new_job_number:
+                    return json_response(self, {"error": "New job/order number is required."}, 400)
+                with db() as con:
+                    original = con.execute("SELECT * FROM subprojects WHERE id = ?", (subproject_id,)).fetchone()
+                    if not original:
+                        return json_response(self, {"error": "Subproject not found."}, 404)
+                    copied_name = str(data.get("name") or original["name"] or "").strip()
+                    copied_pricing_type = data.get("pricing_type") or original["pricing_type"] or "Fixed"
+                    if not copied_name:
+                        return json_response(self, {"error": "Name is required."}, 400)
+                    existing_codes = {
+                        str(r["code"] or "").strip()
+                        for r in con.execute("SELECT code FROM subprojects WHERE project_id = ?", (original["project_id"],)).fetchall()
+                    }
+                    new_code = str(data.get("code") or original["code"] or "").strip()
+                    if not new_code or new_code in existing_codes:
+                        new_code = new_job_number
+                    base_code = new_code
+                    suffix = 2
+                    while new_code in existing_codes:
+                        new_code = f"{base_code}-{suffix}"
+                        suffix += 1
+                    cur = con.execute(
+                        """
+                        INSERT INTO subprojects (
+                          project_id, job_number, code, name, pricing_type, contract_value,
+                          budget_labor_hours, budget_labor, budget_material, budget_equipment,
+                          budget_vendor, budget_other
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            original["project_id"],
+                            new_job_number,
+                            new_code,
+                            copied_name,
+                            copied_pricing_type,
+                            money(data.get("contract_value") if "contract_value" in data else original["contract_value"]),
+                            money(data.get("budget_labor_hours") if "budget_labor_hours" in data else original["budget_labor_hours"]),
+                            money(data.get("budget_labor") if "budget_labor" in data else original["budget_labor"]),
+                            money(data.get("budget_material") if "budget_material" in data else original["budget_material"]),
+                            money(data.get("budget_equipment") if "budget_equipment" in data else original["budget_equipment"]),
+                            money(original["budget_vendor"]),
+                            money(original["budget_other"]),
+                        ),
+                    )
+                    con.execute(
+                        "UPDATE projects SET contract_value = (SELECT COALESCE(SUM(contract_value), 0) FROM subprojects WHERE project_id = ?) WHERE id = ?",
+                        (original["project_id"], original["project_id"]),
+                    )
+                    return json_response(self, {"id": cur.lastrowid, "code": new_code})
             if parsed.path == "/api/change-orders":
                 new_id = execute(
                     "INSERT INTO change_orders (project_id, subproject_id, co_number, job_number, pricing_type, title, status, quoted_value, approved_value) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -6653,6 +6836,87 @@ class Handler(BaseHTTPRequestHandler):
                 rate = one("SELECT rate_set_id FROM internal_rates WHERE id = ?", (rate_id,))
                 updated = apply_internal_rate(data.get("category_type"), data.get("category"), money(data.get("raw_rate")), rate["rate_set_id"] if rate else None)
                 return json_response(self, {"ok": True, "updated_cost_records": updated})
+            return json_response(self, {"error": "Not found"}, 404)
+        except Exception as e:
+            traceback.print_exc()
+            return json_response(self, {"error": str(e)}, 500)
+
+    def do_DELETE(self):
+        try:
+            parsed = urlparse(self.path)
+            if not current_user(self):
+                return json_response(self, {"error": "Login required"}, 401)
+            if not require_editor(self):
+                return json_response(self, {"error": "Read-only users cannot make changes."}, 403)
+            if parsed.path.startswith("/api/subprojects/"):
+                subproject_id = parsed.path.rsplit("/", 1)[-1]
+                with db() as con:
+                    subproject = con.execute("SELECT project_id FROM subprojects WHERE id = ?", (subproject_id,)).fetchone()
+                    if not subproject:
+                        return json_response(self, {"error": "Subproject not found."}, 404)
+                    con.execute("UPDATE change_orders SET subproject_id = NULL WHERE subproject_id = ?", (subproject_id,))
+                    con.execute("UPDATE customer_invoices SET subproject_id = NULL WHERE subproject_id = ?", (subproject_id,))
+                    con.execute(
+                        """
+                        UPDATE cost_records
+                        SET subproject_id = NULL,
+                            amount = CASE
+                              WHEN change_order_id IS NULL AND cost_type = 'Field Ticket Material' THEN 0
+                              ELSE amount
+                            END,
+                            raw_rate = CASE
+                              WHEN change_order_id IS NULL AND cost_type = 'Field Ticket Material' THEN 0
+                              ELSE raw_rate
+                            END,
+                            raw_cost_source = CASE
+                              WHEN change_order_id IS NULL AND cost_type = 'Field Ticket Material' THEN 'Usage only - not budget cost'
+                              ELSE raw_cost_source
+                            END
+                        WHERE subproject_id = ?
+                        """,
+                        (subproject_id,),
+                    )
+                    con.execute("DELETE FROM subprojects WHERE id = ?", (subproject_id,))
+                    con.execute(
+                        "UPDATE projects SET contract_value = (SELECT COALESCE(SUM(contract_value), 0) FROM subprojects WHERE project_id = ?) WHERE id = ?",
+                        (subproject["project_id"], subproject["project_id"]),
+                    )
+                return json_response(self, {"ok": True})
+            if parsed.path.startswith("/api/change-orders/"):
+                change_order_id = parsed.path.rsplit("/", 1)[-1]
+                with db() as con:
+                    change_order = con.execute("SELECT id FROM change_orders WHERE id = ?", (change_order_id,)).fetchone()
+                    if not change_order:
+                        return json_response(self, {"error": "Change order not found."}, 404)
+                    con.execute("UPDATE customer_invoices SET change_order_id = NULL WHERE change_order_id = ?", (change_order_id,))
+                    con.execute(
+                        """
+                        UPDATE cost_records
+                        SET change_order_id = NULL,
+                            amount = CASE
+                              WHEN cost_type = 'Field Ticket Material'
+                                THEN CASE WHEN COALESCE((SELECT pricing_type FROM subprojects WHERE id = cost_records.subproject_id), 'Fixed') = 'T&M'
+                                  THEN COALESCE(sales_amount, 0) * ? ELSE 0 END
+                              ELSE amount
+                            END,
+                            raw_rate = CASE
+                              WHEN cost_type = 'Field Ticket Material'
+                                THEN CASE WHEN COALESCE((SELECT pricing_type FROM subprojects WHERE id = cost_records.subproject_id), 'Fixed') = 'T&M'
+                                  THEN COALESCE(sales_rate, rate, 0) * ? ELSE 0 END
+                              ELSE raw_rate
+                            END,
+                            raw_cost_source = CASE
+                              WHEN cost_type = 'Field Ticket Material'
+                                THEN CASE WHEN COALESCE((SELECT pricing_type FROM subprojects WHERE id = cost_records.subproject_id), 'Fixed') = 'T&M'
+                                  THEN 'Subproject T&M material estimate at 35% margin' ELSE 'Usage only - not budget cost' END
+                              ELSE raw_cost_source
+                            END
+                        WHERE change_order_id = ?
+                        """,
+                        (CO_MATERIAL_COST_FACTOR, CO_MATERIAL_COST_FACTOR, change_order_id),
+                    )
+                    con.execute("DELETE FROM change_orders WHERE id = ?", (change_order_id,))
+                return json_response(self, {"ok": True})
             return json_response(self, {"error": "Not found"}, 404)
         except Exception as e:
             traceback.print_exc()
