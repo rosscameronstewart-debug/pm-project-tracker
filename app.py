@@ -7,6 +7,7 @@ import os
 import re
 import secrets
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import traceback
@@ -53,12 +54,29 @@ CO_MATERIAL_MARGIN = 0.35
 CO_MATERIAL_COST_FACTOR = 1 - CO_MATERIAL_MARGIN
 BID_TRACKER_SOURCE = Path(r"C:\Users\rossc\Twin Peaks Electrical\Project Manager WIP - General\Bid Request Management\_Bid Tracker\Bid Tracker.xlsx")
 SERVER_STARTED_AT = datetime.now().isoformat(timespec="seconds")
-REVISION_LABEL = "dev-revision-page"
+REVISION_LABEL = "server-health-version"
 SOURCE_PATH_AT_STARTUP = Path(__file__).resolve()
 SOURCE_STAT_AT_STARTUP = SOURCE_PATH_AT_STARTUP.stat()
 LOADED_SOURCE_SHA256 = hashlib.sha256(SOURCE_PATH_AT_STARTUP.read_bytes()).hexdigest()
 LOADED_SOURCE_MODIFIED_AT = datetime.fromtimestamp(SOURCE_STAT_AT_STARTUP.st_mtime).isoformat(timespec="seconds")
 LOADED_SOURCE_SIZE_BYTES = SOURCE_STAT_AT_STARTUP.st_size
+
+
+def git_output(*args):
+    try:
+        return subprocess.check_output(
+            ["git", *args],
+            cwd=ROOT,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=3,
+        ).strip()
+    except Exception:
+        return ""
+
+
+LOADED_GIT_COMMIT = git_output("rev-parse", "HEAD")
+LOADED_GIT_BRANCH = git_output("branch", "--show-current")
 
 
 def html_escape(value):
@@ -69,9 +87,30 @@ def app_revision_info():
     source = Path(__file__).resolve()
     stat = source.stat()
     disk_digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    db_stat = DB_PATH.stat() if DB_PATH.exists() else None
+    current_git_commit = git_output("rev-parse", "HEAD")
+    current_git_branch = git_output("branch", "--show-current")
+    upstream_git_commit = git_output("rev-parse", "@{u}")
+    git_dirty = bool(git_output("status", "--porcelain", "--untracked-files=no"))
+    source_matches_disk = disk_digest == LOADED_SOURCE_SHA256 and stat.st_size == LOADED_SOURCE_SIZE_BYTES
+    loaded_commit_matches_current = not LOADED_GIT_COMMIT or not current_git_commit or LOADED_GIT_COMMIT == current_git_commit
+    upstream_matches_current = not upstream_git_commit or not current_git_commit or upstream_git_commit == current_git_commit
+    running_latest_deployed_code = source_matches_disk and loaded_commit_matches_current and upstream_matches_current and not git_dirty
     return {
         "revision_label": REVISION_LABEL,
         "server_started_at": SERVER_STARTED_AT,
+        "loaded_git_branch": LOADED_GIT_BRANCH,
+        "loaded_git_commit": LOADED_GIT_COMMIT,
+        "loaded_git_commit_short": LOADED_GIT_COMMIT[:12],
+        "current_git_branch": current_git_branch,
+        "current_git_commit": current_git_commit,
+        "current_git_commit_short": current_git_commit[:12],
+        "upstream_git_commit": upstream_git_commit,
+        "upstream_git_commit_short": upstream_git_commit[:12],
+        "git_dirty": git_dirty,
+        "loaded_commit_matches_current": loaded_commit_matches_current,
+        "upstream_matches_current": upstream_matches_current,
+        "running_latest_deployed_code": running_latest_deployed_code,
         "loaded_source_modified_at": LOADED_SOURCE_MODIFIED_AT,
         "loaded_source_size_bytes": LOADED_SOURCE_SIZE_BYTES,
         "loaded_source_sha256": LOADED_SOURCE_SHA256,
@@ -80,23 +119,43 @@ def app_revision_info():
         "disk_source_size_bytes": stat.st_size,
         "disk_source_sha256": disk_digest,
         "disk_source_sha256_short": disk_digest[:12],
-        "source_matches_disk": disk_digest == LOADED_SOURCE_SHA256 and stat.st_size == LOADED_SOURCE_SIZE_BYTES,
+        "source_matches_disk": source_matches_disk,
         "source_path": str(source),
         "database_path": str(DB_PATH),
+        "database_exists": DB_PATH.exists(),
+        "database_modified_at": datetime.fromtimestamp(db_stat.st_mtime).isoformat(timespec="seconds") if db_stat else "Missing",
+        "database_size_bytes": db_stat.st_size if db_stat else 0,
+        "app_bind": f"http://{HOST}:{PORT}",
         "python_version": sys.version.split()[0],
     }
 
 
 def developer_revision_html(user):
     info = app_revision_info()
+    health_ok = info["running_latest_deployed_code"]
+    restart_ok = info["source_matches_disk"] and info["loaded_commit_matches_current"]
+    git_status = "Clean" if not info["git_dirty"] else "Uncommitted changes"
+    deployed_status = "Running latest deployed code" if health_ok else "Needs attention"
+    restart_status = "Running current app file" if restart_ok else "Restart needed after code update"
     rows_html = "".join(
         f"<tr><th>{html_escape(label)}</th><td>{html_escape(value)}</td></tr>"
         for label, value in [
             ("Revision Label", info["revision_label"]),
+            ("Deployment Status", deployed_status),
+            ("Running App Status", restart_status),
+            ("Server Started", info["server_started_at"]),
+            ("Loaded Git Branch", info["loaded_git_branch"] or "Not available"),
+            ("Loaded Git Commit", info["loaded_git_commit_short"] or "Not available"),
+            ("Current Git Branch", info["current_git_branch"] or "Not available"),
+            ("Current Git Commit", info["current_git_commit_short"] or "Not available"),
+            ("Upstream Commit", info["upstream_git_commit_short"] or "No upstream found"),
+            ("Git Working Copy", git_status),
             ("Loaded Source Hash", info["loaded_source_sha256_short"]),
             ("Current Disk Hash", info["disk_source_sha256_short"]),
             ("Server Matches Disk", "Yes" if info["source_matches_disk"] else "No - restart the app"),
-            ("Server Started", info["server_started_at"]),
+            ("Database Modified", info["database_modified_at"]),
+            ("Database Size", f"{info['database_size_bytes']:,} bytes"),
+            ("App Bind", info["app_bind"]),
             ("Loaded Source Modified", info["loaded_source_modified_at"]),
             ("Current Disk Modified", info["disk_source_modified_at"]),
             ("Loaded Source Size", f"{info['loaded_source_size_bytes']:,} bytes"),
@@ -115,34 +174,66 @@ def developer_revision_html(user):
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta http-equiv="Cache-Control" content="no-store">
-  <title>Developer Revision</title>
+  <title>Server Health / Version</title>
   <style>
-    :root {{ --ink:#17202a; --muted:#607080; --line:#d8dee5; --bg:#f6f8fa; --blue:#2266aa; }}
+    :root {{ --ink:#17202a; --muted:#607080; --line:#d8dee5; --bg:#f6f8fa; --blue:#2266aa; --green:#137a45; --red:#b42318; --amber:#a15c07; }}
     body {{ margin:0; font-family:"Segoe UI", Arial, sans-serif; color:var(--ink); background:var(--bg); }}
-    main {{ max-width:960px; margin:0 auto; padding:28px 24px 48px; }}
+    main {{ max-width:1120px; margin:0 auto; padding:28px 24px 48px; }}
     h1 {{ margin:0 0 6px; font-size:28px; }}
     p {{ color:var(--muted); margin:0 0 18px; }}
     .panel {{ background:white; border:1px solid var(--line); border-radius:8px; padding:16px; }}
+    .cards {{ display:grid; grid-template-columns:repeat(4, minmax(0, 1fr)); gap:12px; margin:16px 0; }}
+    .card {{ background:white; border:1px solid var(--line); border-radius:8px; padding:14px; min-height:96px; }}
+    .card-label {{ color:#526376; font-size:12px; font-weight:800; text-transform:uppercase; }}
+    .card-value {{ font-size:22px; font-weight:850; margin-top:10px; overflow-wrap:anywhere; }}
+    .card-note {{ color:var(--muted); font-size:13px; margin-top:8px; }}
+    .ok {{ color:var(--green); }}
+    .bad {{ color:var(--red); }}
+    .warn {{ color:var(--amber); }}
     table {{ width:100%; border-collapse:collapse; font-size:14px; }}
     th, td {{ text-align:left; vertical-align:top; padding:11px 10px; border-bottom:1px solid var(--line); }}
     th {{ width:210px; color:#34495e; background:#eef2f6; }}
     td {{ word-break:break-word; }}
-    .hash {{ font-size:32px; font-weight:800; letter-spacing:.04em; margin:14px 0 18px; }}
+    .status {{ display:inline-flex; align-items:center; border-radius:999px; padding:6px 10px; font-size:13px; font-weight:800; background:#e8f5ee; color:var(--green); }}
+    .status.bad {{ background:#fdecea; color:var(--red); }}
     .actions {{ display:flex; gap:8px; flex-wrap:wrap; margin-top:16px; }}
     a, button {{ border:1px solid var(--line); background:white; color:var(--ink); padding:9px 12px; border-radius:6px; cursor:pointer; font-weight:650; text-decoration:none; font:inherit; }}
     .primary {{ background:var(--blue); color:white; border-color:var(--blue); }}
+    @media (max-width: 860px) {{ .cards {{ grid-template-columns:1fr 1fr; }} }}
+    @media (max-width: 560px) {{ .cards {{ grid-template-columns:1fr; }} }}
   </style>
 </head>
 <body>
   <main>
-    <h1>Developer Revision</h1>
-    <p>Use this page to confirm which app file this server is running and when the server last restarted.</p>
+    <h1>Server Health / Version</h1>
+    <p>Use this page after a deploy to confirm the app restarted on the expected code and to see when the database file last changed.</p>
+    <span class="status {'ok' if health_ok else 'bad'}">{html_escape(deployed_status)}</span>
+    <div class="cards">
+      <div class="card">
+        <div class="card-label">Current Git Commit</div>
+        <div class="card-value">{html_escape(info['current_git_commit_short'] or 'N/A')}</div>
+        <div class="card-note">{html_escape(info['current_git_branch'] or 'No branch found')}</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Running App File</div>
+        <div class="card-value {'ok' if restart_ok else 'bad'}">{html_escape('Current' if restart_ok else 'Restart Needed')}</div>
+        <div class="card-note">Loaded {html_escape(info['loaded_source_sha256_short'])}</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Database File</div>
+        <div class="card-value">{html_escape(info['database_modified_at'])}</div>
+        <div class="card-note">{info['database_size_bytes']:,} bytes</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Git Working Copy</div>
+        <div class="card-value {'ok' if not info['git_dirty'] else 'warn'}">{html_escape(git_status)}</div>
+        <div class="card-note">Uncommitted app files can mean the server differs from GitHub.</div>
+      </div>
+    </div>
     <div class="panel">
-      <div>Loaded source hash</div>
-      <div class="hash">{html_escape(info['loaded_source_sha256_short'])}</div>
       <table>{rows_html}</table>
       <div class="actions">
-        <button class="primary" type="button" onclick="window.location.reload()">Refresh Revision</button>
+        <button class="primary" type="button" onclick="window.location.reload()">Refresh Health</button>
         <a href="/">Back to App</a>
       </div>
     </div>
@@ -235,6 +326,28 @@ def init_db():
               vendor TEXT,
               notes TEXT,
               created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS vendor_invoice_allocations (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+              source_file TEXT,
+              ticket_or_invoice TEXT,
+              vendor TEXT,
+              original_total REAL DEFAULT 0,
+              allocation_count INTEGER DEFAULT 0,
+              allocated_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+              allocated_by_username TEXT,
+              allocated_at TEXT NOT NULL,
+              notes TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS vendor_invoice_allocation_lines (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              allocation_id INTEGER NOT NULL REFERENCES vendor_invoice_allocations(id) ON DELETE CASCADE,
+              subproject_id INTEGER REFERENCES subprojects(id) ON DELETE SET NULL,
+              change_order_id INTEGER REFERENCES change_orders(id) ON DELETE SET NULL,
+              amount REAL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS customer_invoices (
@@ -1826,7 +1939,33 @@ def texas_financial_summary():
     history = {}
     for metric in metrics:
         history.setdefault(metric["metric_key"], []).append({"report_date": metric["report_date"], "amount": metric["amount"]})
-    return {"reports": reports[:24], "latest_metrics": latest, "history": history}
+    reports_by_week = {}
+    for report in reports:
+        date = report["report_date"] or ""
+        bucket = reports_by_week.setdefault(date, {"report_date": date, "pnl": [], "balance_sheet": [], "combined": [], "report_count": 0})
+        report_type = report["report_type"] or "combined"
+        if report_type not in bucket:
+            report_type = "combined"
+        bucket[report_type].append(report)
+        bucket["report_count"] += 1
+    week_status = []
+    for bucket in reports_by_week.values():
+        has_pnl = bool(bucket["pnl"] or bucket["combined"])
+        has_balance = bool(bucket["balance_sheet"] or bucket["combined"])
+        if has_pnl and has_balance:
+            status = "Complete"
+        elif has_pnl:
+            status = "Missing Balance Sheet"
+        elif has_balance:
+            status = "Missing P&L"
+        else:
+            status = "Missing Reports"
+        bucket["has_pnl"] = has_pnl
+        bucket["has_balance_sheet"] = has_balance
+        bucket["status"] = status
+        week_status.append(bucket)
+    week_status.sort(key=lambda x: x["report_date"], reverse=True)
+    return {"reports": reports[:24], "report_weeks": week_status[:24], "latest_metrics": latest, "history": history}
 
 
 def import_fieldwise_xlsx(path, project_id):
@@ -2811,8 +2950,10 @@ HTML = r"""
     body.read-only [data-toggle-user],
     body.read-only [data-save-invoice-subproject],
     body.read-only [data-save-customer-invoice],
+    body.read-only [data-allocate-invoice],
     body.read-only #addRate,
     body.read-only #importVendorInvoice { display: none !important; }
+    body.read-only #vendorAllocationForm .actions { display: none !important; }
     body.read-only #changePasswordForm .actions { display: flex !important; }
     .bar { height: 12px; background: #e8edf2; border-radius: 999px; overflow: hidden; }
     .bar span { display: block; height: 100%; background: var(--blue); }
@@ -2890,7 +3031,7 @@ HTML = r"""
         <div class="system-menu hidden" id="systemMenu">
           <button id="systemAccountBtn" type="button">My Account</button>
           <button id="systemAdminBtn" type="button" class="hidden">Admin</button>
-          <button id="systemRevisionBtn" type="button" class="hidden">Developer Revision</button>
+          <button id="systemRevisionBtn" type="button" class="hidden">Server Health</button>
           <button id="systemLogoutBtn" type="button">Logout</button>
         </div>
       </div>
@@ -3146,6 +3287,10 @@ HTML = r"""
         <div id="vendorInvoiceLineFilters"></div>
         <div class="table-wrap"><table id="vendorInvoiceLinesTable"></table></div>
       </div>
+      <div class="panel" style="margin-top:14px">
+        <h2>Vendor Allocation History</h2>
+        <div class="table-wrap"><table id="vendorAllocationHistoryTable"></table></div>
+      </div>
     </section>
 
     <section id="billing" class="tab hidden">
@@ -3280,6 +3425,24 @@ HTML = r"""
       </form>
     </div>
   </div>
+  <div class="modal-backdrop hidden" id="vendorAllocationModal">
+    <div class="modal large">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px">
+        <div>
+          <h2 style="margin:0">Allocate Vendor Invoice</h2>
+          <p id="vendorAllocationSubtitle" class="muted"></p>
+        </div>
+        <button class="btn" id="closeVendorAllocationModal" type="button">Close</button>
+      </div>
+      <form id="vendorAllocationForm">
+        <div id="vendorAllocationTargets"></div>
+        <div class="error" id="vendorAllocationError"></div>
+        <div class="actions">
+          <button class="btn primary" type="submit">Split Evenly</button>
+        </div>
+      </form>
+    </div>
+  </div>
 
   <script>
     let state = { projects: [], projectId: null, subprojects: [], changeOrders: [], internalRates: [], rateSets: [], currentUser: null };
@@ -3291,6 +3454,7 @@ HTML = r"""
     let selectedDashboardChangeOrderId = null;
     let invoiceGroupSeq = 0;
     let costFilterSeq = 0;
+    let vendorAllocationGroups = {};
     const collapsedHierarchyNodes = new Set();
     const initializedHierarchyNodes = new Set();
     const money = v => Number(v || 0).toLocaleString(undefined, { style: 'currency', currency: 'USD' });
@@ -3405,10 +3569,18 @@ HTML = r"""
     document.getElementById('accountModal').onclick = event => {
       if (event.target.id === 'accountModal') closeAccountModal();
     };
+    function closeVendorAllocationModal() {
+      document.getElementById('vendorAllocationModal').classList.add('hidden');
+    }
+    document.getElementById('closeVendorAllocationModal').onclick = closeVendorAllocationModal;
+    document.getElementById('vendorAllocationModal').onclick = event => {
+      if (event.target.id === 'vendorAllocationModal') closeVendorAllocationModal();
+    };
     document.addEventListener('keydown', event => {
       if (event.key === 'Escape') document.getElementById('trendModal').classList.add('hidden');
       if (event.key === 'Escape') document.getElementById('financialDuplicateModal').classList.add('hidden');
       if (event.key === 'Escape') closeAccountModal();
+      if (event.key === 'Escape') closeVendorAllocationModal();
     });
 
     document.querySelectorAll('nav button').forEach(btn => btn.addEventListener('click', async () => {
@@ -3437,7 +3609,7 @@ HTML = r"""
       if (tabName === 'dashboard') refreshOpenDetails();
       if (tabName === 'review') loadCosts();
       if (tabName === 'import') { loadImportHistory(); loadFieldTicketLines(); }
-      if (tabName === 'invoices') loadVendorInvoiceLines();
+      if (tabName === 'invoices') { loadVendorInvoiceLines(); loadVendorAllocationHistory(); }
       if (tabName === 'billing') loadCustomerInvoices();
       if (tabName === 'bids') loadBidDashboard();
       if (tabName === 'admin') loadUsers();
@@ -3480,7 +3652,7 @@ HTML = r"""
     document.getElementById('systemRevisionBtn').onclick = async () => {
       document.getElementById('systemMenu').classList.add('hidden');
       if (!(await confirmDiscard())) return;
-      window.location.href = '/developer-revision';
+      window.location.href = '/server-health';
     };
     document.getElementById('systemLogoutBtn').onclick = async () => {
       await fetch('/api/logout', { method:'POST' });
@@ -3512,6 +3684,38 @@ HTML = r"""
       } catch (err) {
         error.textContent = err.message;
       }
+    };
+    document.getElementById('vendorAllocationForm').onsubmit = async event => {
+      event.preventDefault();
+      const form = event.target;
+      const groupId = form.dataset.groupId;
+      const group = vendorAllocationGroups[groupId];
+      const error = document.getElementById('vendorAllocationError');
+      error.textContent = '';
+      const targets = [...form.querySelectorAll('input[name="allocation_target"]:checked')].map(input => input.value);
+      if (!group) {
+        error.textContent = 'Invoice group is no longer available. Refresh and try again.';
+        return;
+      }
+      if (targets.length < 2) {
+        error.textContent = 'Choose at least two jobs to split across.';
+        return;
+      }
+      await api('/api/vendor-invoice/allocate', {
+        method: 'POST',
+        body: JSON.stringify({
+          project_id: state.projectId,
+          source_file: group.source_file,
+          ticket_or_invoice: group.ticket_or_invoice,
+          vendor: group.vendor,
+          targets
+        })
+      });
+      closeVendorAllocationModal();
+      markSaved();
+      await refresh();
+      await loadVendorInvoiceLines();
+      await loadVendorAllocationHistory();
     };
 
     function metricAmount(summary, key) {
@@ -3662,6 +3866,29 @@ HTML = r"""
       document.getElementById('financialDuplicateModal').classList.remove('hidden');
     }
 
+    function financialReportActions(reports) {
+      return (reports || []).map(r => `<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin:4px 0">
+        <span>${htmlEscape(r.source_file || '')}</span>
+        <button class="btn danger" style="padding:5px 8px" type="button" data-delete-financial-report="${r.id}">Remove</button>
+      </div>`).join('') || '<span class="muted">Missing</span>';
+    }
+
+    function renderFinancialReportHistory(summary) {
+      const weeks = summary.report_weeks || [];
+      if (!weeks.length) return '<div class="muted">No financial reports uploaded yet.</div>';
+      return `<table><thead><tr><th>Week Ending</th><th>Status</th><th>P&L</th><th>Balance Sheet</th><th>Other</th><th>Reports</th></tr></thead><tbody>${weeks.map(w => {
+        const statusClass = w.status === 'Complete' ? 'good' : 'warn';
+        return `<tr>
+          <td>${htmlEscape(w.report_date || '')}</td>
+          <td><strong class="${statusClass}">${htmlEscape(w.status || '')}</strong></td>
+          <td>${financialReportActions(w.pnl)}</td>
+          <td>${financialReportActions(w.balance_sheet)}</td>
+          <td>${financialReportActions(w.combined)}</td>
+          <td>${Number(w.report_count || 0)}</td>
+        </tr>`;
+      }).join('')}</tbody></table>`;
+    }
+
     async function loadTexasOpsDashboard() {
       const summary = await api('/api/texas-financial-summary');
       const revenue = metricAmount(summary, 'revenue');
@@ -3689,15 +3916,7 @@ HTML = r"""
         financialRow('Total Liabilities', money(metricAmount(summary, 'total_liabilities')), 'Total Liabilities comes from the latest Balance Sheet total liabilities line.'),
         financialRow('Equity', money(metricAmount(summary, 'equity')), 'Equity comes from the latest Balance Sheet equity or total equity line.'),
       ]);
-      document.getElementById('financialReports').innerHTML = summary.reports.length
-        ? plainTable(['Week Ending','Type','File','Uploaded',''], summary.reports.map(r => [
-            htmlEscape(r.report_date || ''),
-            htmlEscape(r.report_type || ''),
-            htmlEscape(r.source_file || ''),
-            htmlEscape(r.uploaded_at || ''),
-            `<button class="btn danger" type="button" data-delete-financial-report="${r.id}">Remove</button>`
-          ]))
-        : '<div class="muted">No financial reports uploaded yet.</div>';
+      document.getElementById('financialReports').innerHTML = renderFinancialReportHistory(summary);
       document.querySelectorAll('[data-delete-financial-report]').forEach(btn => btn.onclick = async () => {
         const report = summary.reports.find(r => String(r.id) === String(btn.dataset.deleteFinancialReport));
         const label = [report?.report_date, report?.source_file].filter(Boolean).join(' / ') || 'this report';
@@ -3811,6 +4030,7 @@ HTML = r"""
       loadImportHistory();
       loadFieldTicketLines();
       loadVendorInvoiceLines();
+      loadVendorAllocationHistory();
       loadCustomerInvoices();
       refreshOpenDetails();
     }
@@ -4191,10 +4411,44 @@ HTML = r"""
     function invoiceSubprojectSelect(group) {
       const first = group.rows[0] || {};
       const options = '<option value="">Unassigned</option>' + state.subprojects.map(s => `<option value="${s.id}" ${String(first.subproject_id || '') === String(s.id) ? 'selected' : ''}>${s.job_number || ''} ${s.code} - ${s.name}</option>`).join('');
-      return `<div style="display:flex;gap:6px;align-items:center;min-width:220px" onclick="event.stopPropagation()">
+      return `<div style="display:flex;gap:6px;align-items:center;min-width:320px;flex-wrap:wrap" onclick="event.stopPropagation()">
         <select data-invoice-subproject="${group.id}" style="min-width:160px">${options}</select>
         <button class="btn" style="padding:7px 9px" type="button" data-save-invoice-subproject="${group.id}" data-source-file="${first.source_file || ''}" data-invoice="${first.ticket_or_invoice || ''}" data-vendor="${first.vendor || ''}">Save</button>
+        <button class="btn" style="padding:7px 9px" type="button" data-allocate-invoice="${group.id}">Allocate</button>
       </div>`;
+    }
+
+    function openVendorAllocationModal(groupId) {
+      const group = vendorAllocationGroups[groupId];
+      if (!group) return;
+      const total = group.rows.reduce((sum, r) => sum + Number(r.amount || 0), 0);
+      const targets = [
+        ...state.subprojects.map(sp => ({
+          value: `sp:${sp.id}`,
+          label: `${[sp.job_number, sp.code].filter(Boolean).join(' ')} - ${sp.name || 'Subproject'}`,
+          meta: 'Subproject base'
+        })),
+        ...state.changeOrders.map(co => {
+          const sp = state.subprojects.find(s => String(s.id) === String(co.subproject_id || ''));
+          return {
+            value: `co:${co.id}`,
+            label: `${[co.co_number, co.job_number].filter(Boolean).join(' / ')} - ${co.title || 'Change Order'}`,
+            meta: `Change order${sp ? ' under ' + [sp.job_number, sp.code].filter(Boolean).join(' ') : ''}`
+          };
+        })
+      ];
+      document.getElementById('vendorAllocationSubtitle').textContent = `${group.vendor || 'Vendor'} / ${group.ticket_or_invoice || 'Invoice'} / ${money(total)} total`;
+      document.getElementById('vendorAllocationTargets').innerHTML = targets.length
+        ? `<div class="table-wrap" style="max-height:420px"><table><thead><tr><th></th><th>Target</th><th>Type</th></tr></thead><tbody>${targets.map(t => `<tr>
+            <td><input type="checkbox" name="allocation_target" value="${htmlEscape(t.value)}" style="width:auto"></td>
+            <td>${htmlEscape(t.label)}</td>
+            <td>${htmlEscape(t.meta)}</td>
+          </tr>`).join('')}</tbody></table></div>`
+        : '<p class="muted">Add subprojects or change orders before allocating invoices.</p>';
+      document.getElementById('vendorAllocationError').textContent = '';
+      const form = document.getElementById('vendorAllocationForm');
+      form.dataset.groupId = groupId;
+      document.getElementById('vendorAllocationModal').classList.remove('hidden');
     }
 
     function commonGroupValue(rows, field) {
@@ -4275,6 +4529,12 @@ HTML = r"""
           });
           markSaved();
           await refresh();
+        };
+      });
+      scope.querySelectorAll('[data-allocate-invoice]').forEach(btn => {
+        btn.onclick = event => {
+          event.stopPropagation();
+          openVendorAllocationModal(btn.dataset.allocateInvoice);
         };
       });
     }
@@ -4511,6 +4771,7 @@ HTML = r"""
     }
 
     function vendorInvoiceLinesTableHtml(lines) {
+      vendorAllocationGroups = {};
       if (!lines.length) {
         return '<tbody><tr><td>No vendor invoice lines match these filters.</td></tr></tbody>';
       }
@@ -4533,6 +4794,12 @@ HTML = r"""
         const first = group.rows[0];
         const total = group.rows.reduce((sum, r) => sum + Number(r.amount || 0), 0);
         const qtyTotal = group.rows.reduce((sum, r) => sum + Number(r.qty || 0), 0);
+        vendorAllocationGroups[group.id] = {
+          rows: group.rows,
+          source_file: first.source_file || '',
+          ticket_or_invoice: first.ticket_or_invoice || '',
+          vendor: first.vendor || ''
+        };
         const summary = `<tr class="invoice-summary" data-toggle-invoice="${group.id}">
           <td>${invoiceSummaryButton(group, first.ticket_or_invoice || 'Invoice')}</td>
           <td>${pdfLink(first)}</td>
@@ -5062,6 +5329,25 @@ HTML = r"""
       draw();
     }
 
+    async function loadVendorAllocationHistory() {
+      const tableEl = document.getElementById('vendorAllocationHistoryTable');
+      if (!tableEl || !state.projectId) return;
+      const allocations = await api(`/api/vendor-invoice-allocations?project_id=${state.projectId}`);
+      if (!allocations.length) {
+        tableEl.innerHTML = '<tbody><tr><td>No vendor invoice allocations have been recorded yet.</td></tr></tbody>';
+        return;
+      }
+      tableEl.innerHTML = `<thead><tr><th>Allocated</th><th>Invoice</th><th>Vendor</th><th>Original Total</th><th>Split By</th><th>Targets</th></tr></thead>
+        <tbody>${allocations.map(a => `<tr>
+          <td>${htmlEscape(a.allocated_at || '')}</td>
+          <td>${htmlEscape(a.ticket_or_invoice || '')}<div class="muted">${htmlEscape(a.source_file || '')}</div></td>
+          <td>${htmlEscape(a.vendor || '')}</td>
+          <td>${money(a.original_total)}</td>
+          <td>${htmlEscape(a.allocated_by_username || '')}</td>
+          <td>${(a.lines || []).map(line => `<div style="display:flex;justify-content:space-between;gap:12px;margin:3px 0"><span>${htmlEscape(line.target_label || '')}</span><strong>${money(line.amount)}</strong></div>`).join('')}</td>
+        </tr>`).join('')}</tbody>`;
+    }
+
     async function loadCustomerInvoices() {
       const tableEl = document.getElementById('customerInvoiceTable');
       const summaryEl = document.getElementById('customerInvoiceSummary');
@@ -5448,11 +5734,11 @@ class Handler(BaseHTTPRequestHandler):
                 if parsed.path.startswith("/api/"):
                     return json_response(self, {"error": "Login required"}, 401)
                 return redirect_response(self, "/login")
-            if parsed.path == "/developer-revision":
+            if parsed.path in ("/developer-revision", "/server-health"):
                 if user.get("role") != "Admin":
                     return text_response(self, "Admin required", "text/plain", 403)
                 return text_response(self, developer_revision_html(user))
-            if parsed.path == "/api/developer-revision":
+            if parsed.path in ("/api/developer-revision", "/api/server-health"):
                 if user.get("role") != "Admin":
                     return json_response(self, {"error": "Admin required"}, 403)
                 return json_response(self, app_revision_info())
@@ -5569,6 +5855,49 @@ class Handler(BaseHTTPRequestHandler):
                         (qs.get("project_id", [""])[0],),
                     ),
                 )
+            if parsed.path == "/api/vendor-invoice-allocations":
+                allocation_rows = rows(
+                    """
+                    SELECT *
+                    FROM vendor_invoice_allocations
+                    WHERE project_id = ?
+                    ORDER BY allocated_at DESC, id DESC
+                    """,
+                    (qs.get("project_id", [""])[0],),
+                )
+                line_rows = rows(
+                    """
+                    SELECT
+                      vl.*,
+                      sp.job_number,
+                      sp.code AS subproject_code,
+                      sp.name AS subproject_name,
+                      co.co_number,
+                      co.job_number AS co_job_number,
+                      co.title AS co_title
+                    FROM vendor_invoice_allocation_lines vl
+                    LEFT JOIN subprojects sp ON sp.id = vl.subproject_id
+                    LEFT JOIN change_orders co ON co.id = vl.change_order_id
+                    WHERE vl.allocation_id IN (
+                      SELECT id FROM vendor_invoice_allocations WHERE project_id = ?
+                    )
+                    ORDER BY vl.id
+                    """,
+                    (qs.get("project_id", [""])[0],),
+                )
+                by_allocation = {}
+                for allocation in allocation_rows:
+                    item = dict(allocation)
+                    item["lines"] = []
+                    by_allocation[item["id"]] = item
+                for line in line_rows:
+                    label = [line.get("job_number"), line.get("subproject_code")].filter(Boolean)
+                    if line.get("change_order_id"):
+                        co_label = [line.get("co_number"), line.get("co_job_number")].filter(Boolean)
+                        label = [" / ".join(co_label) or "Change Order", line.get("co_title") or ""]
+                    target_label = " - ".join(str(x) for x in label if x) or "Unassigned"
+                    by_allocation.get(line["allocation_id"], {}).get("lines", []).append({**dict(line), "target_label": target_label})
+                return json_response(self, list(by_allocation.values()))
             if parsed.path == "/api/summary":
                 summary = project_summary(qs.get("project_id", [""])[0])
                 return json_response(self, summary or {"error": "Project not found"}, 200 if summary else 404)
@@ -5941,6 +6270,119 @@ class Handler(BaseHTTPRequestHandler):
                         ),
                     ).rowcount
                 return json_response(self, {"updated": updated})
+            if parsed.path == "/api/vendor-invoice/allocate":
+                actor = current_user(self)
+                project_id = data.get("project_id")
+                targets = [str(t) for t in data.get("targets", []) if str(t).startswith(("sp:", "co:"))]
+                targets = list(dict.fromkeys(targets))
+                if len(targets) < 2:
+                    return json_response(self, {"error": "Choose at least two allocation targets."}, 400)
+                with db() as con:
+                    invoice_rows = con.execute(
+                        """
+                        SELECT *
+                        FROM cost_records
+                        WHERE project_id = ?
+                          AND source = 'Vendor Invoice'
+                          AND source_file = ?
+                          AND ticket_or_invoice = ?
+                          AND COALESCE(vendor, '') = COALESCE(?, '')
+                        ORDER BY id
+                        """,
+                        (project_id, data.get("source_file"), data.get("ticket_or_invoice"), data.get("vendor") or ""),
+                    ).fetchall()
+                    if not invoice_rows:
+                        return json_response(self, {"error": "Invoice was not found."}, 404)
+                    total_amount = sum(money(r["amount"]) for r in invoice_rows)
+                    if not total_amount:
+                        return json_response(self, {"error": "Invoice amount is zero."}, 400)
+                    target_rows = []
+                    for target in targets:
+                        target_type, target_id = target.split(":", 1)
+                        if target_type == "sp":
+                            sp = con.execute("SELECT id FROM subprojects WHERE id = ? AND project_id = ?", (target_id, project_id)).fetchone()
+                            if sp:
+                                target_rows.append({"subproject_id": sp["id"], "change_order_id": None})
+                        elif target_type == "co":
+                            co = con.execute("SELECT id, subproject_id FROM change_orders WHERE id = ? AND project_id = ?", (target_id, project_id)).fetchone()
+                            if co:
+                                target_rows.append({"subproject_id": co["subproject_id"], "change_order_id": co["id"]})
+                    if len(target_rows) < 2:
+                        return json_response(self, {"error": "At least two selected targets must belong to this master project."}, 400)
+                    first = invoice_rows[0]
+                    now_alloc = datetime.now().isoformat(timespec="seconds")
+                    allocation_cursor = con.execute(
+                        """
+                        INSERT INTO vendor_invoice_allocations (
+                          project_id, source_file, ticket_or_invoice, vendor, original_total,
+                          allocation_count, allocated_by_user_id, allocated_by_username, allocated_at, notes
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            project_id,
+                            first["source_file"],
+                            first["ticket_or_invoice"],
+                            first["vendor"],
+                            total_amount,
+                            len(target_rows),
+                            actor["id"] if actor else None,
+                            actor["username"] if actor else "",
+                            now_alloc,
+                            json.dumps({"source_line_count": len(invoice_rows)}, default=str),
+                        ),
+                    )
+                    allocation_id = allocation_cursor.lastrowid
+                    con.execute(
+                        """
+                        DELETE FROM cost_records
+                        WHERE project_id = ?
+                          AND source = 'Vendor Invoice'
+                          AND source_file = ?
+                          AND ticket_or_invoice = ?
+                          AND COALESCE(vendor, '') = COALESCE(?, '')
+                        """,
+                        (project_id, data.get("source_file"), data.get("ticket_or_invoice"), data.get("vendor") or ""),
+                    )
+                    base_share = round(total_amount / len(target_rows), 2)
+                    allocated_total = 0
+                    for idx, target in enumerate(target_rows):
+                        amount = round(total_amount - allocated_total, 2) if idx == len(target_rows) - 1 else base_share
+                        allocated_total += amount
+                        con.execute(
+                            """
+                            INSERT INTO vendor_invoice_allocation_lines (allocation_id, subproject_id, change_order_id, amount)
+                            VALUES (?, ?, ?, ?)
+                            """,
+                            (allocation_id, target["subproject_id"], target["change_order_id"], amount),
+                        )
+                        con.execute(
+                            """
+                            INSERT INTO cost_records (
+                              project_id, subproject_id, change_order_id, source, source_file, ticket_or_invoice,
+                              record_date, status, cost_type, item, description, qty, rate, amount,
+                              sales_rate, sales_amount, raw_rate, raw_cost_source, vendor, notes, created_at
+                            )
+                            VALUES (?, ?, ?, 'Vendor Invoice', ?, ?, ?, 'Allocated', 'Material', ?, ?, 1, ?, ?, 0, 0, ?, 'Vendor invoice even allocation', ?, ?, ?)
+                            """,
+                            (
+                                project_id,
+                                target["subproject_id"],
+                                target["change_order_id"],
+                                first["source_file"],
+                                first["ticket_or_invoice"],
+                                first["record_date"],
+                                "Allocated Material",
+                                f"Even allocation of invoice {first['ticket_or_invoice'] or ''} across {len(target_rows)} jobs",
+                                amount,
+                                amount,
+                                amount,
+                                first["vendor"],
+                                json.dumps({"allocation_id": allocation_id, "allocated_from_line_count": len(invoice_rows), "allocated_total": total_amount, "allocation_count": len(target_rows), "allocated_by": actor["username"] if actor else ""}, default=str),
+                                now_alloc,
+                            ),
+                        )
+                return json_response(self, {"allocated": len(target_rows), "total_amount": total_amount, "share": round(total_amount / len(target_rows), 2)})
             if parsed.path == "/api/invoices":
                 new_id = execute(
                     """
