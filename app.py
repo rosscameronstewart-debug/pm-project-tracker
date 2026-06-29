@@ -295,6 +295,7 @@ def init_db():
               subproject_id INTEGER REFERENCES subprojects(id) ON DELETE SET NULL,
               co_number TEXT NOT NULL,
               job_number TEXT,
+              order_type TEXT DEFAULT 'Change Order',
               pricing_type TEXT DEFAULT 'Fixed',
               title TEXT,
               status TEXT DEFAULT 'Pending',
@@ -362,6 +363,7 @@ def init_db():
               status TEXT DEFAULT 'Draft',
               amount REAL DEFAULT 0,
               paid_amount REAL DEFAULT 0,
+              invoice_file TEXT,
               notes TEXT,
               created_at TEXT NOT NULL
             );
@@ -504,6 +506,9 @@ def init_db():
             con.execute("ALTER TABLE change_orders ADD COLUMN job_number TEXT")
         if "pricing_type" not in co_cols:
             con.execute("ALTER TABLE change_orders ADD COLUMN pricing_type TEXT DEFAULT 'Fixed'")
+        if "order_type" not in co_cols:
+            con.execute("ALTER TABLE change_orders ADD COLUMN order_type TEXT DEFAULT 'Change Order'")
+        con.execute("UPDATE change_orders SET order_type = COALESCE(order_type, 'Change Order')")
         co_schema = con.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'change_orders'").fetchone()
         if co_schema and "UNIQUE(project_id, co_number)" in (co_schema["sql"] or ""):
             con.execute("PRAGMA foreign_keys = OFF")
@@ -515,6 +520,7 @@ def init_db():
                   subproject_id INTEGER REFERENCES subprojects(id) ON DELETE SET NULL,
                   co_number TEXT NOT NULL,
                   job_number TEXT,
+                  order_type TEXT DEFAULT 'Change Order',
                   pricing_type TEXT DEFAULT 'Fixed',
                   title TEXT,
                   status TEXT DEFAULT 'Pending',
@@ -523,10 +529,10 @@ def init_db():
                   UNIQUE(project_id, subproject_id, co_number)
                 );
                 INSERT INTO change_orders_new (
-                  id, project_id, subproject_id, co_number, job_number, pricing_type, title, status, quoted_value, approved_value
+                  id, project_id, subproject_id, co_number, job_number, order_type, pricing_type, title, status, quoted_value, approved_value
                 )
                 SELECT
-                  id, project_id, subproject_id, co_number, job_number, COALESCE(pricing_type, 'Fixed'), title, status, quoted_value, approved_value
+                  id, project_id, subproject_id, co_number, job_number, COALESCE(order_type, 'Change Order'), COALESCE(pricing_type, 'Fixed'), title, status, quoted_value, approved_value
                 FROM change_orders;
                 DROP TABLE change_orders;
                 ALTER TABLE change_orders_new RENAME TO change_orders;
@@ -535,6 +541,9 @@ def init_db():
             con.execute("PRAGMA foreign_keys = ON")
         if "rate_set_id" not in project_cols:
             con.execute("ALTER TABLE projects ADD COLUMN rate_set_id INTEGER")
+        customer_invoice_cols = [r["name"] for r in con.execute("PRAGMA table_info(customer_invoices)").fetchall()]
+        if "invoice_file" not in customer_invoice_cols:
+            con.execute("ALTER TABLE customer_invoices ADD COLUMN invoice_file TEXT")
         cost_cols = [r["name"] for r in con.execute("PRAGMA table_info(cost_records)").fetchall()]
         if "sales_rate" not in cost_cols:
             con.execute("ALTER TABLE cost_records ADD COLUMN sales_rate REAL DEFAULT 0")
@@ -714,6 +723,11 @@ def require_editor(handler):
 def clean_role(role):
     role = str(role or "User").strip()
     return role if role in ("Admin", "User", "Read Only") else "User"
+
+
+def clean_order_type(order_type):
+    order_type = str(order_type or "Change Order").strip()
+    return order_type if order_type in ("Change Order", "Child Project") else "Change Order"
 
 
 def seed_bid_tracker_from_workbook():
@@ -1388,6 +1402,7 @@ def project_summary(project_id):
           co.id,
           co.co_number,
           co.job_number,
+          COALESCE(co.order_type, 'Change Order') order_type,
           co.title,
           co.status,
           COALESCE(co.pricing_type, 'Fixed') pricing_type,
@@ -2915,6 +2930,16 @@ HTML = r"""
     #bidTable tr.bid-dirty td:first-child { box-shadow: inset 4px 0 0 var(--gold); }
     #bidTable tr.bid-dirty input, #bidTable tr.bid-dirty select { background: #fffdf3; border-color: #d6a700; }
     #bidTable tr.bid-dirty [data-save-bid] { background: var(--gold); color: white; border-color: var(--gold); }
+    #subprojectEditTable tr.setup-dirty td,
+    #changeOrderEditTable tr.setup-dirty td { background: #fff8e1; }
+    #subprojectEditTable tr.setup-dirty td:first-child,
+    #changeOrderEditTable tr.setup-dirty td:first-child { box-shadow: inset 4px 0 0 var(--gold); }
+    #subprojectEditTable tr.setup-dirty input,
+    #subprojectEditTable tr.setup-dirty select,
+    #changeOrderEditTable tr.setup-dirty input,
+    #changeOrderEditTable tr.setup-dirty select { background: #fffdf3; border-color: #d6a700; }
+    #subprojectEditTable tr.setup-dirty [data-save-sp],
+    #changeOrderEditTable tr.setup-dirty [data-save-co] { background: var(--gold); color: white; border-color: var(--gold); }
     .dashboard-split { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; margin-top: 14px; }
     .dashboard-table-wrap { overflow: auto; max-height: 360px; }
     .dashboard-table-wrap table { min-width: 760px; }
@@ -3059,7 +3084,6 @@ HTML = r"""
       <button data-tab="review" data-nav-area="project" class="hidden">Review Exceptions</button>
       <button data-tab="invoices" data-nav-area="project" class="hidden">Vendor Invoices</button>
       <button data-tab="billing" data-nav-area="project" class="hidden">Customer Billing</button>
-      <button data-tab="archivedProjects" data-nav-area="home">Archived Projects</button>
       <button data-tab="texasOps" data-nav-area="texas" class="hidden">Texas Ops</button>
     </nav>
 
@@ -3146,7 +3170,7 @@ HTML = r"""
         <div class="panel"><h2>Subprojects</h2><div class="dashboard-table-wrap" id="subprojectSummary"></div></div>
         <div class="panel">
           <div style="display:flex;align-items:center;justify-content:space-between;gap:10px">
-            <h2 id="coSummaryTitle">Change Orders</h2>
+            <h2 id="coSummaryTitle">Change Orders / Child Projects</h2>
             <button class="btn hidden" id="showAllCos" type="button">Show All</button>
           </div>
           <div class="dashboard-table-wrap" id="coSummary"></div>
@@ -3197,9 +3221,10 @@ HTML = r"""
         </form>
       </div>
       <form class="panel" id="coForm" style="margin-top:14px">
-        <h2>Change Order</h2>
+        <h2>Change Order / Child Project</h2>
         <div class="grid cols-4">
           <div><label>Subproject</label><select name="subproject_id" id="coSubproject"></select></div>
+          <div><label>Type</label><select name="order_type"><option>Change Order</option><option>Child Project</option></select></div>
           <div><label>CO Number</label><input name="co_number" placeholder="CO-001"></div>
           <div><label>Job / Order #</label><input name="job_number" placeholder="304-CO1"></div>
           <div><label>Pricing Method</label><select name="pricing_type" id="coPricingType"><option>Fixed</option><option>T&M</option></select></div>
@@ -3210,14 +3235,14 @@ HTML = r"""
         </div>
         <label>Title</label><input name="title" placeholder="Added instruments / wiring">
         <label>Quoted Value</label><input name="quoted_value" type="number" step="0.01" value="0">
-        <div class="actions"><button class="btn primary" type="submit">Add Change Order</button></div>
+        <div class="actions"><button class="btn primary" type="submit">Add Change Order / Child Project</button></div>
       </form>
       <div class="panel" style="margin-top:14px">
         <h2>Edit Subprojects</h2>
         <div class="table-wrap"><table id="subprojectEditTable"></table></div>
       </div>
       <div class="panel" style="margin-top:14px">
-        <h2>Edit Change Orders</h2>
+        <h2>Edit Change Orders / Child Projects</h2>
         <div class="table-wrap"><table id="changeOrderEditTable"></table></div>
       </div>
       <div class="panel" style="margin-top:14px">
@@ -3313,6 +3338,7 @@ HTML = r"""
         <div class="grid cols-4">
           <div><label>Paid Amount</label><input name="paid_amount" type="number" step="0.01" value="0"></div>
         </div>
+        <label>Our Invoice PDF</label><input name="invoice_file" type="file" accept=".pdf" required>
         <label>Notes</label><textarea name="notes" placeholder="Billing notes, customer comments, payment reference"></textarea>
         <div class="actions"><button class="btn primary" type="submit">Add Customer Invoice</button></div>
       </form>
@@ -3451,6 +3477,46 @@ HTML = r"""
         <div class="actions">
           <button class="btn primary" type="submit">Create Copy</button>
           <button class="btn" id="closeCopySubprojectModal" type="button">Cancel</button>
+        </div>
+      </form>
+    </div>
+  </div>
+  <div class="modal-backdrop hidden" id="copyChangeOrderModal">
+    <div class="modal">
+      <h2>Copy Change Order / Child Project</h2>
+      <p id="copyChangeOrderMessage"></p>
+      <form id="copyChangeOrderForm">
+        <input type="hidden" name="change_order_id">
+        <label>Subproject<select name="subproject_id"></select></label>
+        <label>Type
+          <select name="order_type">
+            <option>Change Order</option>
+            <option>Child Project</option>
+          </select>
+        </label>
+        <label>New CO Number<input name="co_number" required></label>
+        <label>New Job / Order #<input name="job_number" required></label>
+        <label>Pricing
+          <select name="pricing_type">
+            <option>Fixed</option>
+            <option>T&amp;M</option>
+          </select>
+        </label>
+        <label>Status
+          <select name="status">
+            <option>Pending</option>
+            <option>Approved</option>
+            <option>Rejected</option>
+            <option>Billed</option>
+          </select>
+        </label>
+        <label>Title<input name="title"></label>
+        <label>Quoted Value<input name="quoted_value" type="number" step="0.01"></label>
+        <label>Approved Value<input name="approved_value" type="number" step="0.01"></label>
+        <div id="copyChangeOrderError" class="bad"></div>
+        <div class="actions">
+          <button class="btn primary" type="submit">Create Copy</button>
+          <button class="btn" id="closeCopyChangeOrderModal" type="button">Cancel</button>
         </div>
       </form>
     </div>
@@ -3613,12 +3679,20 @@ HTML = r"""
     document.getElementById('copySubprojectModal').onclick = event => {
       if (event.target.id === 'copySubprojectModal') closeCopySubprojectModal();
     };
+    function closeCopyChangeOrderModal() {
+      document.getElementById('copyChangeOrderModal').classList.add('hidden');
+    }
+    document.getElementById('closeCopyChangeOrderModal').onclick = closeCopyChangeOrderModal;
+    document.getElementById('copyChangeOrderModal').onclick = event => {
+      if (event.target.id === 'copyChangeOrderModal') closeCopyChangeOrderModal();
+    };
     document.addEventListener('keydown', event => {
       if (event.key === 'Escape') document.getElementById('trendModal').classList.add('hidden');
       if (event.key === 'Escape') document.getElementById('financialDuplicateModal').classList.add('hidden');
       if (event.key === 'Escape') closeAccountModal();
       if (event.key === 'Escape') closeVendorAllocationModal();
       if (event.key === 'Escape') closeCopySubprojectModal();
+      if (event.key === 'Escape') closeCopyChangeOrderModal();
     });
 
     document.querySelectorAll('nav button').forEach(btn => btn.addEventListener('click', async () => {
@@ -4217,9 +4291,9 @@ HTML = r"""
       const isCollapsed = key => collapsedHierarchyNodes.has(key);
       const toggleGlyph = key => isCollapsed(key) ? '+' : '-';
       const coNode = co => `<div class="hierarchy-node change-order">
-        <div class="node-title"><span>${htmlEscape([co.co_number, co.job_number].filter(Boolean).join(' / ') || 'Change Order')}</span><span>${money(co.sales_value || co.approved_value || 0)}</span></div>
+        <div class="node-title"><span>${htmlEscape([co.co_number, co.job_number].filter(Boolean).join(' / ') || co.order_type || 'Change Order')}</span><span>${money(co.sales_value || co.approved_value || 0)}</span></div>
         <div class="node-meta">${htmlEscape(co.title || '')}</div>
-        <div class="node-values"><span>Status: ${htmlEscape(co.status || '')}</span><span>Pricing: ${htmlEscape(co.pricing_type || 'Fixed')}</span><span>Actual: ${money(co.actual_cost || 0)}</span></div>
+        <div class="node-values"><span>Type: ${htmlEscape(co.order_type || 'Change Order')}</span><span>Status: ${htmlEscape(co.status || '')}</span><span>Pricing: ${htmlEscape(co.pricing_type || 'Fixed')}</span><span>Actual: ${money(co.actual_cost || 0)}</span></div>
       </div>`;
       const subprojectNodes = (summary.subprojects || []).map(sp => {
         const nodeKey = `sp:${sp.id}`;
@@ -4245,7 +4319,7 @@ HTML = r"""
         <div class="hierarchy-node master collapsible" data-hierarchy-toggle="${masterKey}" role="button" tabindex="0">
           <div class="node-title"><span class="hierarchy-title-left"><span class="hierarchy-toggle">${toggleGlyph(masterKey)}</span><span>${htmlEscape(summary.project?.name || 'Master Project')}</span></span><span>${money(summary.contract_value || 0)}</span></div>
           <div class="node-meta">${htmlEscape(summary.project?.customer || '')}${summary.project?.location ? ' / ' + htmlEscape(summary.project.location) : ''}</div>
-          <div class="node-values"><span>Subprojects: ${(summary.subprojects || []).length}</span><span>Change Orders: ${(summary.change_orders || []).length}</span><span>Actual: ${money(summary.actual_cost || 0)}</span></div>
+          <div class="node-values"><span>Subprojects: ${(summary.subprojects || []).length}</span><span>Change Orders / Child Projects: ${(summary.change_orders || []).length}</span><span>Actual: ${money(summary.actual_cost || 0)}</span></div>
         </div>
         <div class="hierarchy-children ${isCollapsed(masterKey) ? 'collapsed' : ''}">
           ${subprojectNodes || '<div class="muted">No subprojects yet.</div>'}
@@ -4278,7 +4352,7 @@ HTML = r"""
       let contractValue = Number(summary.contract_value || 0);
       let invoices = summary.customer_invoices || [];
       if (selectedCo) {
-        label = `CO ${selectedCo.co_number || ''}${selectedCo.job_number ? ' / ' + selectedCo.job_number : ''}`;
+        label = `${selectedCo.order_type || 'Change Order'} ${selectedCo.co_number || ''}${selectedCo.job_number ? ' / ' + selectedCo.job_number : ''}`;
         contractValue = Number(selectedCo.sales_value || 0);
         invoices = invoices.filter(i => String(i.change_order_id || '') === String(selectedCo.id));
       } else if (selectedSubproject) {
@@ -4352,12 +4426,13 @@ HTML = r"""
       const orders = selected ? summary.change_orders.filter(x => String(x.subproject_id || '') === String(selected.id)) : summary.change_orders;
       const title = document.getElementById('coSummaryTitle');
       const showAll = document.getElementById('showAllCos');
-      if (title) title.textContent = selected ? `Change Orders - ${selected.job_number || ''} ${selected.code}` : 'Change Orders';
+      if (title) title.textContent = selected ? `Change Orders / Child Projects - ${selected.job_number || ''} ${selected.code}` : 'Change Orders / Child Projects';
       if (showAll) showAll.classList.toggle('hidden', !selected);
       document.getElementById('coSummary').innerHTML = orders.length
-        ? `<table><thead><tr><th>CO</th><th>Job / Order #</th><th>Pricing</th><th>Subproject</th><th>Status</th><th>Labor Hrs</th><th>Sales Value</th><th>Raw Actual</th><th>Profit</th></tr></thead><tbody>${orders.map(x => {
+        ? `<table><thead><tr><th>Type</th><th>CO</th><th>Job / Order #</th><th>Pricing</th><th>Subproject</th><th>Status</th><th>Labor Hrs</th><th>Sales Value</th><th>Raw Actual</th><th>Profit</th></tr></thead><tbody>${orders.map(x => {
             const isSelected = String(selectedDashboardChangeOrderId || '') === String(x.id);
             return `<tr class="selectable-row ${isSelected ? 'selected' : ''}" data-select-co="${x.id}">
+              <td>${htmlEscape(x.order_type || 'Change Order')}</td>
               <td>${x.co_number || ''}</td>
               <td>${x.job_number || ''}</td>
               <td>${x.pricing_type || 'Fixed'}</td>
@@ -4921,12 +4996,11 @@ HTML = r"""
         const profit = Number(x.profit || 0);
         const margin = Number(x.margin || 0);
         const open = `<button class="btn" style="padding:4px 7px" data-open-subproject="${x.id}" type="button">Open</button>`;
-        const copy = `<button class="btn" style="padding:4px 7px" data-copy-subproject="${x.id}" onclick="event.preventDefault(); event.stopPropagation(); window.copySubprojectById('${x.id}')" type="button">Copy</button>`;
         const selected = String(selectedId || '') === String(x.id);
         return `<tr class="selectable-row ${selected ? 'selected' : ''}" data-select-subproject="${x.id}">
           <td>${x.job_number || ''}</td>
           <td>${x.code}</td>
-          <td>${open} ${copy} ${x.name}</td>
+          <td>${open} ${x.name}</td>
           <td>${x.pricing_type || 'Fixed'}</td>
           <td>${money(salesValue)}</td>
           <td>${laborUsed.toFixed(2)} / ${laborBudget.toFixed(2)}<br><div class="bar"><span style="width:${Math.min(100, laborPct*100)}%"></span></div></td>
@@ -5003,6 +5077,77 @@ HTML = r"""
       event.preventDefault();
       event.stopPropagation();
       copySubproject(copyButton.dataset.copySubproject || copyButton.dataset.copySp);
+    }, true);
+
+    function copyChangeOrder(id) {
+      const original = state.changeOrders.find(c => String(c.id) === String(id));
+      const label = original ? [original.co_number, original.job_number, original.title].filter(Boolean).join(' - ') : 'this change order';
+      const form = document.getElementById('copyChangeOrderForm');
+      form.reset();
+      form.elements.change_order_id.value = id;
+      form.elements.subproject_id.innerHTML = '<option value="">Unassigned</option>' + state.subprojects.map(s => `<option value="${s.id}">${htmlEscape([s.job_number, s.code, s.name].filter(Boolean).join(' - '))}</option>`).join('');
+      if (original) {
+        form.elements.subproject_id.value = original.subproject_id || '';
+        form.elements.order_type.value = original.order_type || 'Change Order';
+        form.elements.pricing_type.value = original.pricing_type || 'Fixed';
+        form.elements.status.value = original.status || 'Pending';
+        form.elements.title.value = original.title || '';
+        form.elements.quoted_value.value = Number(original.quoted_value || 0);
+        form.elements.approved_value.value = Number(original.approved_value || 0);
+      }
+      document.getElementById('copyChangeOrderMessage').textContent = `Copying ${label}. Enter the new CO number and job/order number, then adjust any copied setup information if needed.`;
+      document.getElementById('copyChangeOrderError').textContent = '';
+      document.getElementById('copyChangeOrderModal').classList.remove('hidden');
+      setTimeout(() => form.elements.co_number?.focus(), 50);
+    }
+
+    window.copyChangeOrderById = copyChangeOrder;
+
+    document.getElementById('copyChangeOrderForm').onsubmit = async event => {
+      event.preventDefault();
+      const form = event.target;
+      const changeOrderId = form.elements.change_order_id.value;
+      const coNumber = form.elements.co_number.value.trim();
+      const jobNumber = form.elements.job_number.value.trim();
+      const error = document.getElementById('copyChangeOrderError');
+      error.textContent = '';
+      if (!coNumber) {
+        error.textContent = 'Enter a new CO number before copying this change order.';
+        return;
+      }
+      if (!jobNumber) {
+        error.textContent = 'Enter a new job/order number before copying this change order.';
+        return;
+      }
+      try {
+        await api(`/api/change-orders/${changeOrderId}/copy`, {
+          method:'POST',
+          body: JSON.stringify({
+            subproject_id: form.elements.subproject_id.value,
+            order_type: form.elements.order_type.value,
+            co_number: coNumber,
+            job_number: jobNumber,
+            pricing_type: form.elements.pricing_type.value,
+            status: form.elements.status.value,
+            title: form.elements.title.value.trim(),
+            quoted_value: form.elements.quoted_value.value,
+            approved_value: form.elements.approved_value.value
+          })
+        });
+        closeCopyChangeOrderModal();
+        markSaved();
+        await refresh();
+      } catch (err) {
+        error.textContent = err.message || 'Could not copy change order.';
+      }
+    };
+
+    document.addEventListener('click', event => {
+      const copyButton = event.target.closest('[data-copy-co]');
+      if (!copyButton) return;
+      event.preventDefault();
+      event.stopPropagation();
+      copyChangeOrder(copyButton.dataset.copyCo);
     }, true);
 
     async function loadSubprojectDetail(subprojectId, shouldScroll=true, changeOrderId=null) {
@@ -5150,11 +5295,17 @@ HTML = r"""
           <td><input data-sp="${s.id}" data-field="budget_equipment" type="number" step="0.01" value="${s.budget_equipment || 0}"></td>
           <td class="actions-cell"><button class="btn" data-save-sp="${s.id}" type="button">Save</button><button class="btn" data-copy-sp="${s.id}" onclick="event.preventDefault(); event.stopPropagation(); window.copySubprojectById('${s.id}')" type="button">Copy</button><button class="btn danger" data-delete-sp="${s.id}" type="button">Delete</button></td>
         </tr>`).join('')}</tbody>`;
+      tableEl.querySelectorAll('[data-sp]').forEach(el => {
+        const markRowDirty = () => el.closest('tr')?.classList.add('setup-dirty');
+        el.oninput = markRowDirty;
+        el.onchange = markRowDirty;
+      });
       document.querySelectorAll('[data-save-sp]').forEach(btn => btn.onclick = async () => {
         const id = btn.dataset.saveSp;
         const fields = {};
         document.querySelectorAll(`[data-sp="${id}"]`).forEach(el => fields[el.dataset.field] = el.value);
         await api(`/api/subprojects/${id}`, { method:'PUT', body: JSON.stringify(fields) });
+        btn.closest('tr')?.classList.remove('setup-dirty');
         markSaved();
         await refresh();
       });
@@ -5183,9 +5334,10 @@ HTML = r"""
       }
       const subprojectOptions = subprojectId => '<option value="">Unassigned</option>' + state.subprojects.map(s => `<option value="${s.id}" ${String(subprojectId || '') === String(s.id) ? 'selected' : ''}>${htmlEscape([s.job_number, s.code, s.name].filter(Boolean).join(' - '))}</option>`).join('');
       tableEl.innerHTML = `
-        <thead><tr><th>Subproject</th><th>CO Number</th><th>Job / Order #</th><th>Pricing</th><th>Status</th><th>Title</th><th>Quoted Value</th><th>Approved Value</th><th></th></tr></thead>
+        <thead><tr><th>Subproject</th><th>Type</th><th>CO Number</th><th>Job / Order #</th><th>Pricing</th><th>Status</th><th>Title</th><th>Quoted Value</th><th>Approved Value</th><th></th></tr></thead>
         <tbody>${state.changeOrders.map(c => `<tr>
           <td><select data-co-edit="${c.id}" data-field="subproject_id">${subprojectOptions(c.subproject_id)}</select></td>
+          <td><select data-co-edit="${c.id}" data-field="order_type"><option ${c.order_type === 'Change Order' || !c.order_type ? 'selected' : ''}>Change Order</option><option ${c.order_type === 'Child Project' ? 'selected' : ''}>Child Project</option></select></td>
           <td><input data-co-edit="${c.id}" data-field="co_number" value="${htmlEscape(c.co_number || '')}"></td>
           <td><input data-co-edit="${c.id}" data-field="job_number" value="${htmlEscape(c.job_number || '')}"></td>
           <td><select data-co-edit="${c.id}" data-field="pricing_type"><option ${c.pricing_type === 'Fixed' ? 'selected' : ''}>Fixed</option><option ${c.pricing_type === 'T&M' ? 'selected' : ''}>T&M</option></select></td>
@@ -5193,13 +5345,19 @@ HTML = r"""
           <td><input data-co-edit="${c.id}" data-field="title" value="${htmlEscape(c.title || '')}"></td>
           <td><input data-co-edit="${c.id}" data-field="quoted_value" type="number" step="0.01" value="${c.quoted_value || 0}"></td>
           <td><input data-co-edit="${c.id}" data-field="approved_value" type="number" step="0.01" value="${c.approved_value || 0}"></td>
-          <td class="actions-cell"><button class="btn" data-save-co="${c.id}" type="button">Save</button><button class="btn danger" data-delete-co="${c.id}" type="button">Delete</button></td>
+          <td class="actions-cell"><button class="btn" data-save-co="${c.id}" type="button">Save</button><button class="btn" data-copy-co="${c.id}" onclick="event.preventDefault(); event.stopPropagation(); window.copyChangeOrderById('${c.id}')" type="button">Copy</button><button class="btn danger" data-delete-co="${c.id}" type="button">Delete</button></td>
         </tr>`).join('')}</tbody>`;
+      tableEl.querySelectorAll('[data-co-edit]').forEach(el => {
+        const markRowDirty = () => el.closest('tr')?.classList.add('setup-dirty');
+        el.oninput = markRowDirty;
+        el.onchange = markRowDirty;
+      });
       document.querySelectorAll('[data-save-co]').forEach(btn => btn.onclick = async () => {
         const id = btn.dataset.saveCo;
         const fields = {};
         document.querySelectorAll(`[data-co-edit="${id}"]`).forEach(el => fields[el.dataset.field] = el.value);
         await api(`/api/change-orders/${id}`, { method:'PUT', body: JSON.stringify(fields) });
+        btn.closest('tr')?.classList.remove('setup-dirty');
         markSaved();
         await refresh();
       });
@@ -5498,11 +5656,13 @@ HTML = r"""
       const spOpts = '<option value="">Unassigned</option>' + state.subprojects.map(s => `<option value="${s.id}">${s.job_number || ''} ${s.code}</option>`).join('');
       const coOpts = '<option value="">Base Contract</option>' + state.changeOrders.map(c => `<option value="${c.id}">${[c.co_number, c.job_number].filter(Boolean).join(' / ')}</option>`).join('');
       tableEl.innerHTML = `
-        <thead><tr><th>Invoice #</th><th>Type</th><th>Subproject</th><th>CO</th><th>Invoice Date</th><th>Due Date</th><th>Status</th><th>Amount</th><th>Paid</th><th>Open</th><th>Notes</th><th></th></tr></thead>
+        <thead><tr><th>Invoice #</th><th>File</th><th>Type</th><th>Subproject</th><th>CO</th><th>Invoice Date</th><th>Due Date</th><th>Status</th><th>Amount</th><th>Paid</th><th>Open</th><th>Notes</th><th></th></tr></thead>
         <tbody>${invoices.map(i => {
           const openAmount = Math.max(0, Number(i.amount || 0) - Number(i.paid_amount || 0));
+          const invoiceFile = i.invoice_file ? pdfLink({ source_file: i.invoice_file }) : '<span class="muted">Missing</span>';
           return `<tr>
             <td><input data-cinv="${i.id}" data-field="invoice_number" value="${htmlEscape(i.invoice_number || '')}"></td>
+            <td>${invoiceFile}</td>
             <td><select data-cinv="${i.id}" data-field="billing_type">${['Progress','Base Contract','Change Order','T&M','Retainage','Final'].map(v => `<option ${i.billing_type === v ? 'selected' : ''}>${v}</option>`).join('')}</select></td>
             <td><select data-cinv="${i.id}" data-field="subproject_id">${spOpts}</select></td>
             <td><select data-cinv="${i.id}" data-field="change_order_id">${coOpts}</select></td>
@@ -5717,7 +5877,9 @@ HTML = r"""
     };
     document.getElementById('customerInvoiceForm').onsubmit = async e => {
       e.preventDefault();
-      await api('/api/customer-invoices', { method:'POST', body: JSON.stringify({ ...formDataObj(e.target), project_id: state.projectId }) });
+      const data = new FormData(e.target);
+      data.append('project_id', state.projectId);
+      await api('/api/customer-invoices', { method:'POST', body: data });
       e.target.reset();
       markSaved();
       fillSelects();
@@ -6161,6 +6323,45 @@ class Handler(BaseHTTPRequestHandler):
                     details.append({"file": safe_name, "duplicate": False, "metrics": result["count"], "report_date": result.get("report_date")})
                 return json_response(self, {"imported": imported, "metric_count": metric_count, "details": details, "duplicates": duplicates, "skipped_duplicates": len(duplicates)})
 
+            if parsed.path == "/api/customer-invoices":
+                now = datetime.now().isoformat(timespec="seconds")
+                form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": self.headers.get("Content-Type")})
+                file_item = form["invoice_file"] if "invoice_file" in form else None
+                if file_item is None or not getattr(file_item, "filename", ""):
+                    return json_response(self, {"error": "Attach our invoice PDF before adding the customer invoice."}, 400)
+                safe_name = Path(file_item.filename).name
+                if not safe_name.lower().endswith(".pdf"):
+                    return json_response(self, {"error": "Our invoice attachment must be a PDF."}, 400)
+                saved_name = f"{datetime.now().strftime('%Y%m%d%H%M%S')}-{safe_name}"
+                path = UPLOAD_DIR / saved_name
+                with open(path, "wb") as f:
+                    f.write(file_item.file.read())
+                new_id = execute(
+                    """
+                    INSERT INTO customer_invoices (
+                      project_id, subproject_id, change_order_id, invoice_number, billing_type,
+                      invoice_date, due_date, status, amount, paid_amount, invoice_file, notes, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        form.getvalue("project_id"),
+                        form.getvalue("subproject_id") or None,
+                        form.getvalue("change_order_id") or None,
+                        form.getvalue("invoice_number"),
+                        form.getvalue("billing_type") or "Progress",
+                        form.getvalue("invoice_date"),
+                        form.getvalue("due_date"),
+                        form.getvalue("status") or "Draft",
+                        money(form.getvalue("amount")),
+                        money(form.getvalue("paid_amount")),
+                        saved_name,
+                        form.getvalue("notes"),
+                        now,
+                    ),
+                )
+                return json_response(self, {"id": new_id})
+
             data = parse_json(self)
             now = datetime.now().isoformat(timespec="seconds")
             if parsed.path == "/api/texas-financial-delete":
@@ -6312,12 +6513,13 @@ class Handler(BaseHTTPRequestHandler):
                     return json_response(self, {"id": cur.lastrowid, "code": new_code})
             if parsed.path == "/api/change-orders":
                 new_id = execute(
-                    "INSERT INTO change_orders (project_id, subproject_id, co_number, job_number, pricing_type, title, status, quoted_value, approved_value) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO change_orders (project_id, subproject_id, co_number, job_number, order_type, pricing_type, title, status, quoted_value, approved_value) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         data.get("project_id"),
                         data.get("subproject_id") or None,
                         data.get("co_number"),
                         data.get("job_number"),
+                        clean_order_type(data.get("order_type")),
                         data.get("pricing_type") or "Fixed",
                         data.get("title"),
                         data.get("status"),
@@ -6326,31 +6528,52 @@ class Handler(BaseHTTPRequestHandler):
                     ),
                 )
                 return json_response(self, {"id": new_id})
-            if parsed.path == "/api/customer-invoices":
-                new_id = execute(
-                    """
-                    INSERT INTO customer_invoices (
-                      project_id, subproject_id, change_order_id, invoice_number, billing_type,
-                      invoice_date, due_date, status, amount, paid_amount, notes, created_at
+            if parsed.path.startswith("/api/change-orders/") and parsed.path.endswith("/copy"):
+                change_order_id = parsed.path.split("/")[-2]
+                new_co_number = str(data.get("co_number") or "").strip()
+                new_job_number = str(data.get("job_number") or "").strip()
+                if not new_co_number:
+                    return json_response(self, {"error": "New CO number is required."}, 400)
+                if not new_job_number:
+                    return json_response(self, {"error": "New job/order number is required."}, 400)
+                with db() as con:
+                    original = con.execute("SELECT * FROM change_orders WHERE id = ?", (change_order_id,)).fetchone()
+                    if not original:
+                        return json_response(self, {"error": "Change order not found."}, 404)
+                    subproject_id = data.get("subproject_id") or original["subproject_id"]
+                    if subproject_id:
+                        subproject = con.execute("SELECT id FROM subprojects WHERE id = ? AND project_id = ?", (subproject_id, original["project_id"])).fetchone()
+                        if not subproject:
+                            return json_response(self, {"error": "Selected subproject does not belong to this master project."}, 400)
+                    duplicate = con.execute(
+                        "SELECT id FROM change_orders WHERE project_id = ? AND COALESCE(subproject_id, '') = COALESCE(?, '') AND co_number = ?",
+                        (original["project_id"], subproject_id, new_co_number),
+                    ).fetchone()
+                    if duplicate:
+                        return json_response(self, {"error": "A change order with that CO number already exists for the selected subproject."}, 400)
+                    pricing_type = data.get("pricing_type") or original["pricing_type"] or "Fixed"
+                    cur = con.execute(
+                        """
+                        INSERT INTO change_orders (
+                          project_id, subproject_id, co_number, job_number, order_type, pricing_type,
+                          title, status, quoted_value, approved_value
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            original["project_id"],
+                            subproject_id or None,
+                            new_co_number,
+                            new_job_number,
+                            clean_order_type(data.get("order_type") if "order_type" in data else original["order_type"]),
+                            pricing_type,
+                            str(data.get("title") if "title" in data else original["title"] or "").strip(),
+                            data.get("status") or original["status"] or "Pending",
+                            money(data.get("quoted_value") if "quoted_value" in data else original["quoted_value"]),
+                            0 if pricing_type == "T&M" else money(data.get("approved_value") if "approved_value" in data else original["approved_value"]),
+                        ),
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        data.get("project_id"),
-                        data.get("subproject_id") or None,
-                        data.get("change_order_id") or None,
-                        data.get("invoice_number"),
-                        data.get("billing_type") or "Progress",
-                        data.get("invoice_date"),
-                        data.get("due_date"),
-                        data.get("status") or "Draft",
-                        money(data.get("amount")),
-                        money(data.get("paid_amount")),
-                        data.get("notes"),
-                        now,
-                    ),
-                )
-                return json_response(self, {"id": new_id})
+                    return json_response(self, {"id": cur.lastrowid})
             if parsed.path == "/api/internal-rates":
                 existing_rate = one(
                     "SELECT id FROM internal_rates WHERE rate_set_id = ? AND category_type = ? AND category = ?",
@@ -6767,11 +6990,12 @@ class Handler(BaseHTTPRequestHandler):
                 execute(
                     """
                     UPDATE change_orders
-                    SET subproject_id = ?, co_number = ?, job_number = ?, pricing_type = ?, title = ?, status = ?, quoted_value = ?, approved_value = ?
+                    SET subproject_id = ?, order_type = ?, co_number = ?, job_number = ?, pricing_type = ?, title = ?, status = ?, quoted_value = ?, approved_value = ?
                     WHERE id = ?
                     """,
                     (
                         data.get("subproject_id") or None,
+                        clean_order_type(data.get("order_type")),
                         data.get("co_number"),
                         data.get("job_number"),
                         pricing_type,
