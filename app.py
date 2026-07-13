@@ -242,6 +242,146 @@ def developer_revision_html(user):
 </html>"""
 
 
+def pwa_manifest_json():
+    return json.dumps(
+        {
+            "name": "Twin Peaks Project Dashboard",
+            "short_name": "TPE Field PO",
+            "description": "Twin Peaks Electrical project tracking and field PO requests.",
+            "start_url": "/",
+            "scope": "/",
+            "display": "standalone",
+            "background_color": "#f6f8fa",
+            "theme_color": "#152332",
+            "orientation": "portrait-primary",
+            "icons": [
+                {
+                    "src": "/brand/twin-peaks-logo.png",
+                    "sizes": "192x192 512x512",
+                    "type": "image/png",
+                    "purpose": "any maskable",
+                }
+            ],
+        }
+    )
+
+
+def service_worker_js():
+    return """
+const CACHE_NAME = 'tpe-no-po-v2';
+const SHELL_ASSETS = [
+  '/offline',
+  '/brand/twin-peaks-logo.png'
+];
+
+self.addEventListener('install', event => {
+  event.waitUntil(caches.open(CACHE_NAME).then(cache => cache.addAll(SHELL_ASSETS)));
+  self.skipWaiting();
+});
+
+self.addEventListener('activate', event => {
+  event.waitUntil(
+    caches.keys().then(keys => Promise.all(keys.filter(key => key !== CACHE_NAME).map(key => caches.delete(key))))
+  );
+  self.clients.claim();
+});
+
+self.addEventListener('fetch', event => {
+  const request = event.request;
+  const url = new URL(request.url);
+  if (request.method !== 'GET') return;
+  if (url.pathname.startsWith('/api/')) return;
+  if (request.mode === 'navigate') {
+    event.respondWith(fetch(request).catch(() => caches.match('/offline')));
+    return;
+  }
+  if (url.pathname.startsWith('/brand/')) {
+    event.respondWith(caches.match(request).then(cached => cached || fetch(request)));
+  }
+});
+""".strip()
+
+
+def offline_html():
+    return """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#152332">
+  <title>TPE Field PO Offline</title>
+  <style>
+    body { margin:0; min-height:100vh; display:grid; place-items:center; font-family:"Segoe UI", Arial, sans-serif; background:#f6f8fa; color:#17202a; padding:22px; }
+    .card { max-width:460px; background:white; border:1px solid #d8dee5; border-radius:8px; padding:24px; box-shadow:0 14px 34px rgba(15,35,55,.12); text-align:center; }
+    img { width:110px; max-width:70%; margin-bottom:14px; }
+    h1 { margin:0 0 8px; font-size:24px; }
+    p { color:#607080; line-height:1.45; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <img src="/brand/twin-peaks-logo.png" alt="Twin Peaks Electrical">
+    <h1>Connection needed</h1>
+    <p>This app needs a connection before creating or updating POs so PO numbers stay accurate. Reconnect and try again.</p>
+  </div>
+</body>
+</html>"""
+
+
+def purchase_order_html(po):
+    attachment = ""
+    if po["attachment_file"]:
+        safe_name = quote(po["attachment_file"])
+        attachment = f'<p><strong>Attachment:</strong> <a href="/uploads/{safe_name}" target="_blank" rel="noopener">{html_escape(po["attachment_file"])}</a></p>'
+    pickup = ""
+    if po["pickup_file"]:
+        safe_name = quote(po["pickup_file"])
+        pickup = f'<p><strong>Pickup Ticket:</strong> <a href="/uploads/{safe_name}" target="_blank" rel="noopener">{html_escape(po["pickup_file"])}</a></p>'
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{html_escape(po["po_number"])} Purchase Order</title>
+  <style>
+    body {{ margin:0; font-family:"Segoe UI", Arial, sans-serif; color:#17202a; background:#f6f8fa; }}
+    main {{ max-width:860px; margin:0 auto; padding:28px 22px 44px; }}
+    .po {{ background:white; border:1px solid #d8dee5; border-radius:8px; padding:28px; }}
+    h1 {{ margin:0; font-size:28px; }}
+    .meta {{ color:#607080; margin-top:5px; }}
+    .grid {{ display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-top:22px; }}
+    .box {{ border:1px solid #d8dee5; border-radius:8px; padding:14px; }}
+    .label {{ color:#607080; font-size:12px; font-weight:700; text-transform:uppercase; margin-bottom:5px; }}
+    .value {{ font-size:18px; font-weight:700; }}
+    .desc {{ white-space:pre-wrap; line-height:1.45; }}
+    .actions {{ margin:0 0 16px; display:flex; gap:8px; }}
+    button, a.btn {{ border:1px solid #d8dee5; background:white; color:#17202a; padding:9px 12px; border-radius:6px; cursor:pointer; font-weight:700; text-decoration:none; }}
+    .primary {{ background:#2266aa; color:white; border-color:#2266aa; }}
+    @media print {{ body {{ background:white; }} main {{ padding:0; }} .actions {{ display:none; }} .po {{ border:0; }} }}
+    @media (max-width:720px) {{ .grid {{ grid-template-columns:1fr; }} .po {{ padding:18px; }} }}
+  </style>
+</head>
+<body>
+  <main>
+    <div class="actions"><button class="primary" onclick="window.print()">Print / Save PDF</button><a class="btn" href="/">Back to App</a></div>
+    <div class="po">
+      <h1>Purchase Order {html_escape(po["po_number"])}</h1>
+      <div class="meta">Status: {html_escape(po["status"])} / Created {html_escape((po["created_at"] or "").replace("T", " "))}</div>
+      <div class="grid">
+        <div class="box"><div class="label">Vendor</div><div class="value">{html_escape(po["vendor"])}</div></div>
+        <div class="box"><div class="label">Estimated Amount</div><div class="value">${money(po["estimated_amount"]):,.2f}</div></div>
+        <div class="box"><div class="label">Job / Order #</div><div class="value">{html_escape(po["job_number"])}</div><div class="meta">{html_escape(po["job_label"])}</div></div>
+        <div class="box"><div class="label">Requested By</div><div class="value">{html_escape(po["requested_by_username"])}</div></div>
+      </div>
+      <div class="box" style="margin-top:14px"><div class="label">Request Details</div><div class="desc">{html_escape(po["description"])}</div></div>
+      {attachment}
+      {pickup}
+    </div>
+  </main>
+</body>
+</html>"""
+
+
 def db():
     DATA_DIR.mkdir(exist_ok=True)
     UPLOAD_DIR.mkdir(exist_ok=True)
@@ -472,6 +612,26 @@ def init_db():
               amount REAL DEFAULT 0,
               UNIQUE(report_id, metric_key)
             );
+
+            CREATE TABLE IF NOT EXISTS purchase_orders (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              po_number TEXT NOT NULL UNIQUE,
+              project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+              subproject_id INTEGER REFERENCES subprojects(id) ON DELETE SET NULL,
+              change_order_id INTEGER REFERENCES change_orders(id) ON DELETE SET NULL,
+              job_number TEXT NOT NULL,
+              job_label TEXT,
+              vendor TEXT NOT NULL,
+              description TEXT NOT NULL,
+              estimated_amount REAL DEFAULT 0,
+              attachment_file TEXT,
+              pickup_file TEXT,
+              status TEXT DEFAULT 'Pending Review',
+              requested_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+              requested_by_username TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT
+            );
             """
         )
         existing_cols = [r["name"] for r in con.execute("PRAGMA table_info(subprojects)").fetchall()]
@@ -581,6 +741,9 @@ def init_db():
         user_cols = [r["name"] for r in con.execute("PRAGMA table_info(users)").fetchall()]
         if "must_change_password" not in user_cols:
             con.execute("ALTER TABLE users ADD COLUMN must_change_password INTEGER DEFAULT 0")
+        po_cols = [r["name"] for r in con.execute("PRAGMA table_info(purchase_orders)").fetchall()]
+        if "pickup_file" not in po_cols:
+            con.execute("ALTER TABLE purchase_orders ADD COLUMN pickup_file TEXT")
         default_rate_set = con.execute("SELECT id FROM rate_sets WHERE name = 'Current'").fetchone()
         if not default_rate_set:
             cur = con.execute("INSERT INTO rate_sets (name, effective_date, active) VALUES ('Current', '', 1)")
@@ -720,14 +883,339 @@ def require_editor(handler):
     return user if user and user.get("role") in ("Admin", "User") else None
 
 
+def can_use_field_po(user):
+    return bool(user and user.get("role") in ("Admin", "User", "Field PO"))
+
+
+def is_texas_read_only(user):
+    return bool(user and user.get("role") == "TX/Read Only")
+
+
+def is_field_po_only(user):
+    return bool(user and user.get("role") == "Field PO")
+
+
 def clean_role(role):
     role = str(role or "User").strip()
-    return role if role in ("Admin", "User", "Read Only") else "User"
+    return role if role in ("Admin", "User", "Read Only", "TX/Read Only", "Field PO") else "User"
 
 
 def clean_order_type(order_type):
     order_type = str(order_type or "Change Order").strip()
     return order_type if order_type in ("Change Order", "Child Project") else "Change Order"
+
+
+def duplicate_job_order_message(con, project_id, job_number, exclude_change_order_id=None):
+    job_number = str(job_number or "").strip()
+    if not job_number:
+        return None
+    subproject = con.execute(
+        """
+        SELECT job_number, code, name
+        FROM subprojects
+        WHERE project_id = ?
+          AND LOWER(TRIM(COALESCE(job_number, ''))) = LOWER(TRIM(?))
+        LIMIT 1
+        """,
+        (project_id, job_number),
+    ).fetchone()
+    if subproject:
+        label = " ".join(str(part or "").strip() for part in (subproject["job_number"], subproject["code"], subproject["name"]) if str(part or "").strip())
+        return f"Job / Order # {job_number} is already used by subproject {label}."
+    params = [project_id, job_number]
+    exclude_clause = ""
+    if exclude_change_order_id:
+        exclude_clause = " AND id != ?"
+        params.append(exclude_change_order_id)
+    change_order = con.execute(
+        f"""
+        SELECT order_type, co_number, job_number, title
+        FROM change_orders
+        WHERE project_id = ?
+          AND LOWER(TRIM(COALESCE(job_number, ''))) = LOWER(TRIM(?))
+          {exclude_clause}
+        LIMIT 1
+        """,
+        params,
+    ).fetchone()
+    if change_order:
+        label = " / ".join(str(part or "").strip() for part in (change_order["co_number"], change_order["job_number"]) if str(part or "").strip())
+        title = str(change_order["title"] or "").strip()
+        if title:
+            label = f"{label} - {title}" if label else title
+        return f"Job / Order # {job_number} is already used by {clean_order_type(change_order['order_type']).lower()} {label}."
+    return None
+
+
+def parse_fieldwise_audit_export(path):
+    if openpyxl is None:
+        raise RuntimeError("Excel import needs openpyxl, but it is not available.")
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    ws = wb["LineItems"] if "LineItems" in wb.sheetnames else wb[wb.sheetnames[0]]
+    rows_iter = ws.iter_rows(values_only=True)
+    try:
+        headers = [str(v or "").strip() for v in next(rows_iter)]
+    except StopIteration:
+        return {}
+    header_map = {h.lower(): i for i, h in enumerate(headers)}
+    required = ["customer name", "ticket date", "ticket number", "order number", "status", "sub total"]
+    missing = [h for h in required if h not in header_map]
+    if missing:
+        raise RuntimeError(f"Missing required Field Wise export columns: {', '.join(missing)}")
+
+    def cell(row, name):
+        idx = header_map.get(name.lower())
+        if idx is None or idx >= len(row):
+            return ""
+        return row[idx]
+
+    tickets = {}
+    line_count = 0
+    for row in rows_iter:
+        if not row or not any(row):
+            continue
+        ticket_number = str(cell(row, "ticket number") or "").strip()
+        if not ticket_number:
+            continue
+        order_number = str(cell(row, "order number") or "").strip()
+        key = f"{ticket_number}|{order_number}"
+        ticket = tickets.setdefault(
+            key,
+            {
+                "ticket_number": ticket_number,
+                "order_number": order_number,
+                "customer": str(cell(row, "customer name") or "").strip(),
+                "ticket_date": date_text(cell(row, "ticket date")),
+                "status": str(cell(row, "status") or "").strip(),
+                "line_count": 0,
+                "export_total": 0,
+            },
+        )
+        ticket["line_count"] += 1
+        ticket["export_total"] += money(cell(row, "sub total"))
+        if not ticket["customer"]:
+            ticket["customer"] = str(cell(row, "customer name") or "").strip()
+        if not ticket["ticket_date"]:
+            ticket["ticket_date"] = date_text(cell(row, "ticket date"))
+        if not ticket["status"]:
+            ticket["status"] = str(cell(row, "status") or "").strip()
+        line_count += 1
+    return {"line_count": line_count, "tickets": tickets}
+
+
+def fieldwise_audit_result(path):
+    export = parse_fieldwise_audit_export(path)
+    export_tickets = export.get("tickets", {})
+    with db() as con:
+        tracked_rows = con.execute(
+            """
+            SELECT
+              'Subproject' AS item_type,
+              sp.job_number,
+              p.name AS project_name,
+              p.customer,
+              sp.code AS reference_code
+            FROM subprojects sp
+            JOIN projects p ON p.id = sp.project_id
+            WHERE COALESCE(p.status, 'Active') <> 'Archived'
+              AND TRIM(COALESCE(sp.job_number, '')) <> ''
+            UNION ALL
+            SELECT
+              COALESCE(co.order_type, 'Change Order') AS item_type,
+              co.job_number,
+              p.name AS project_name,
+              p.customer,
+              co.co_number AS reference_code
+            FROM change_orders co
+            JOIN projects p ON p.id = co.project_id
+            WHERE COALESCE(p.status, 'Active') <> 'Archived'
+              AND TRIM(COALESCE(co.job_number, '')) <> ''
+            """
+        ).fetchall()
+        tracked_jobs = {str(r["job_number"] or "").strip(): dict(r) for r in tracked_rows}
+        imported_rows = con.execute(
+            """
+            SELECT
+              cr.ticket_or_invoice,
+              COALESCE(sp.job_number, co.job_number) AS job_number,
+              COUNT(*) AS line_count,
+              COALESCE(SUM(cr.sales_amount), 0) AS imported_sales_total,
+              COALESCE(SUM(cr.amount), 0) AS imported_raw_total,
+              MAX(cr.record_date) AS last_record_date
+            FROM cost_records cr
+            LEFT JOIN subprojects sp ON sp.id = cr.subproject_id
+            LEFT JOIN change_orders co ON co.id = cr.change_order_id
+            WHERE cr.source IN ('Field Wise', 'Field Wise PDF')
+              AND TRIM(COALESCE(cr.ticket_or_invoice, '')) <> ''
+            GROUP BY cr.ticket_or_invoice, COALESCE(sp.job_number, co.job_number)
+            """
+        ).fetchall()
+
+    imported_by_key = {}
+    for row in imported_rows:
+        ticket_number = str(row["ticket_or_invoice"] or "").strip()
+        job_number = str(row["job_number"] or "").strip()
+        if not ticket_number or not job_number:
+            continue
+        imported_by_key[f"{ticket_number}|{job_number}"] = dict(row)
+
+    missing = []
+    matched = []
+    mismatches = []
+    untracked = []
+    no_order = []
+    for key, ticket in export_tickets.items():
+        order_number = str(ticket["order_number"] or "").strip()
+        if not order_number:
+            no_order.append(ticket)
+            continue
+        job = tracked_jobs.get(order_number)
+        if not job:
+            untracked.append(ticket)
+            continue
+        imported = imported_by_key.get(key)
+        row = {**ticket, **job, "imported_total": money(imported["imported_sales_total"]) if imported else 0, "imported_line_count": imported["line_count"] if imported else 0}
+        if not imported:
+            missing.append(row)
+        else:
+            matched.append(row)
+            if abs(money(ticket["export_total"]) - money(imported["imported_sales_total"])) > 0.01:
+                mismatches.append(row)
+
+    extra = []
+    for key, imported in imported_by_key.items():
+        job_number = str(imported["job_number"] or "").strip()
+        if job_number not in tracked_jobs:
+            continue
+        if key in export_tickets:
+            continue
+        job = tracked_jobs[job_number]
+        ticket_number = str(imported["ticket_or_invoice"] or "").strip()
+        extra.append({
+            "ticket_number": ticket_number,
+            "order_number": job_number,
+            "customer": job.get("customer") or "",
+            "ticket_date": imported.get("last_record_date") or "",
+            "status": "",
+            "line_count": 0,
+            "export_total": 0,
+            "imported_total": money(imported["imported_sales_total"]),
+            "imported_line_count": imported["line_count"],
+            **job,
+        })
+
+    sort_key = lambda r: (str(r.get("project_name") or ""), str(r.get("order_number") or ""), str(r.get("ticket_number") or ""))
+    missing.sort(key=sort_key)
+    matched.sort(key=sort_key)
+    mismatches.sort(key=sort_key)
+    extra.sort(key=sort_key)
+    untracked.sort(key=lambda r: (str(r.get("order_number") or ""), str(r.get("ticket_number") or "")))
+    no_order.sort(key=lambda r: str(r.get("ticket_number") or ""))
+    return {
+        "summary": {
+            "export_line_count": export.get("line_count", 0),
+            "export_ticket_count": len(export_tickets),
+            "tracked_job_count": len(tracked_jobs),
+            "matched_count": len(matched),
+            "missing_count": len(missing),
+            "mismatch_count": len(mismatches),
+            "extra_imported_count": len(extra),
+            "untracked_count": len(untracked),
+            "no_order_count": len(no_order),
+        },
+        "missing": missing,
+        "mismatches": mismatches,
+        "extra_imported": extra,
+        "untracked": untracked,
+        "no_order": no_order,
+    }
+
+
+def next_po_number(con):
+    year = datetime.now().year
+    prefix = f"PO-{year}-"
+    row = con.execute(
+        "SELECT po_number FROM purchase_orders WHERE po_number LIKE ? ORDER BY po_number DESC LIMIT 1",
+        (f"{prefix}%",),
+    ).fetchone()
+    seq = 1
+    if row:
+        try:
+            seq = int(str(row["po_number"]).rsplit("-", 1)[-1]) + 1
+        except Exception:
+            seq = 1
+    return f"{prefix}{seq:04d}"
+
+
+def job_reference_for_po(con, job_key):
+    parts = str(job_key or "").split(":", 1)
+    if len(parts) != 2:
+        return None
+    kind, raw_id = parts
+    try:
+        item_id = int(raw_id)
+    except Exception:
+        return None
+    if kind == "subproject":
+        row = con.execute(
+            """
+            SELECT
+              sp.id AS subproject_id,
+              NULL AS change_order_id,
+              sp.project_id,
+              sp.job_number,
+              'Subproject' AS item_type,
+              p.customer,
+              p.name AS project_name,
+              p.project_code,
+              sp.code AS reference_code,
+              sp.name AS description
+            FROM subprojects sp
+            JOIN projects p ON p.id = sp.project_id
+            WHERE sp.id = ?
+              AND COALESCE(p.status, 'Active') <> 'Archived'
+            """,
+            (item_id,),
+        ).fetchone()
+    elif kind == "change_order":
+        row = con.execute(
+            """
+            SELECT
+              co.subproject_id,
+              co.id AS change_order_id,
+              co.project_id,
+              co.job_number,
+              COALESCE(co.order_type, 'Change Order') AS item_type,
+              p.customer,
+              p.name AS project_name,
+              p.project_code,
+              CASE
+                WHEN sp.code IS NOT NULL THEN co.co_number || ' / ' || sp.code
+                ELSE co.co_number
+              END AS reference_code,
+              co.title AS description
+            FROM change_orders co
+            JOIN projects p ON p.id = co.project_id
+            LEFT JOIN subprojects sp ON sp.id = co.subproject_id
+            WHERE co.id = ?
+              AND COALESCE(p.status, 'Active') <> 'Archived'
+            """,
+            (item_id,),
+        ).fetchone()
+    else:
+        return None
+    if not row or not str(row["job_number"] or "").strip():
+        return None
+    label_parts = [
+        row["job_number"],
+        row["item_type"],
+        row["customer"],
+        row["project_name"],
+        row["reference_code"],
+    ]
+    result = dict(row)
+    result["job_label"] = " - ".join(str(part or "").strip() for part in label_parts if str(part or "").strip())
+    return result
 
 
 def seed_bid_tracker_from_workbook():
@@ -1218,6 +1706,15 @@ def upload_pdf_path(file_name):
     path = (UPLOAD_DIR / safe_name).resolve()
     upload_root = UPLOAD_DIR.resolve()
     if upload_root not in path.parents or not path.exists() or path.suffix.lower() != ".pdf":
+        return None
+    return path
+
+
+def upload_attachment_path(file_name):
+    safe_name = Path(unquote(file_name)).name
+    path = (UPLOAD_DIR / safe_name).resolve()
+    upload_root = UPLOAD_DIR.resolve()
+    if upload_root not in path.parents or not path.exists():
         return None
     return path
 
@@ -2790,6 +3287,12 @@ LOGIN_HTML = r"""
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#152332">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="TPE Field PO">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <link rel="manifest" href="/manifest.json">
+  <link rel="apple-touch-icon" href="/brand/twin-peaks-logo.png">
   <title>Twin Peaks Login</title>
   <style>
     :root { --blue:#2f69b1; --ink:#17202a; --muted:#5b6b7f; --line:#d5dde6; --yellow:#ffc20e; }
@@ -2819,6 +3322,9 @@ LOGIN_HTML = r"""
     <div class="error" id="loginError"></div>
   </form>
   <script>
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => navigator.serviceWorker.register('/service-worker.js').catch(() => {}));
+    }
     document.getElementById('loginForm').onsubmit = async event => {
       event.preventDefault();
       const data = Object.fromEntries(new FormData(event.target).entries());
@@ -2840,6 +3346,12 @@ HTML = r"""
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#152332">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="TPE Field PO">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <link rel="manifest" href="/manifest.json">
+  <link rel="apple-touch-icon" href="/brand/twin-peaks-logo.png">
   <title>Twin Peaks Project Dashboard</title>
   <style>
     :root {
@@ -2903,6 +3415,9 @@ HTML = r"""
     table { width: 100%; border-collapse: collapse; font-size: 14px; background: white; }
     th, td { padding: 9px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
     th { color: #34495e; font-size: 12px; text-transform: uppercase; background: #eef2f6; position: sticky; top: 0; }
+    .sort-header { width: 100%; border: 0; background: transparent; color: inherit; cursor: pointer; font: inherit; font-weight: 800; text-align: left; text-transform: uppercase; padding: 0; }
+    .sort-header:hover, .sort-header:focus-visible { color: var(--blue); outline: none; }
+    .sort-indicator { color: var(--blue); font-size: 11px; margin-left: 4px; }
     .table-wrap { max-height: 520px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; }
     #bidTable { min-width: 1780px; table-layout: fixed; }
     #bidTable th, #bidTable td { white-space: nowrap; }
@@ -2962,6 +3477,10 @@ HTML = r"""
     .bad { color: var(--red); }
     .warn { color: var(--gold); }
     .hidden { display: none; }
+    .po-feature-disabled,
+    .home-card[data-open-tab="fieldPo"],
+    .home-card[data-open-tab="officePo"],
+    nav [data-tab="projectPo"] { display: none !important; }
     body.read-only form input, body.read-only form select, body.read-only form textarea { pointer-events: none; background: #f6f8fa; color: #607080; }
     body.read-only #changePasswordForm input { pointer-events: auto; background: white; color: var(--ink); }
     body.read-only form .actions,
@@ -2978,10 +3497,29 @@ HTML = r"""
     body.read-only [data-save-invoice-subproject],
     body.read-only [data-save-customer-invoice],
     body.read-only [data-allocate-invoice],
+    body.read-only [data-delete-financial-report],
+    body.read-only [data-save-office-po],
     body.read-only #addRate,
     body.read-only #importVendorInvoice { display: none !important; }
+    body.read-only .home-card[data-open-tab="officePo"] { display: none !important; }
     body.read-only #vendorAllocationForm .actions { display: none !important; }
     body.read-only #changePasswordForm .actions { display: flex !important; }
+    body.tx-read-only .project-switcher,
+    body.tx-read-only nav [data-tab="home"],
+    body.tx-read-only nav [data-nav-area="project"],
+    body.tx-read-only .home-card:not([data-open-tab="texasOps"]),
+    body.tx-read-only #financialUploadForm,
+    body.tx-read-only [data-delete-financial-report] { display: none !important; }
+    body.field-po-only .project-switcher,
+    body.field-po-only nav,
+    body.field-po-only .home-card:not([data-open-tab="fieldPo"]) { display: none !important; }
+    .field-po-panel { max-width: 760px; margin: 0 auto; }
+    .field-po-panel label { font-size: 15px; color: var(--ink); margin-top: 16px; }
+    .field-po-panel input,
+    .field-po-panel select,
+    .field-po-panel textarea { font-size: 18px; padding: 14px 13px; min-height: 52px; }
+    .field-po-panel textarea { min-height: 132px; }
+    .field-po-submit { width: 100%; min-height: 58px; font-size: 18px; }
     .bar { height: 12px; background: #e8edf2; border-radius: 999px; overflow: hidden; }
     .bar span { display: block; height: 100%; background: var(--blue); }
     .invoice-summary { background: #fbfcfd; cursor: pointer; }
@@ -3084,6 +3622,7 @@ HTML = r"""
       <button data-tab="review" data-nav-area="project" class="hidden">Review Exceptions</button>
       <button data-tab="invoices" data-nav-area="project" class="hidden">Vendor Invoices</button>
       <button data-tab="billing" data-nav-area="project" class="hidden">Customer Billing</button>
+      <button data-tab="projectPo" data-nav-area="project" class="hidden po-feature-disabled">POs</button>
       <button data-tab="texasOps" data-nav-area="texas" class="hidden">Texas Ops</button>
     </nav>
 
@@ -3104,11 +3643,73 @@ HTML = r"""
           <p class="muted">Upload weekly Balance Sheet and P&L reports and review a financial overview with trends.</p>
           <div class="actions"><button class="btn primary" data-open-tab="texasOps" type="button">Open Texas Ops</button></div>
         </div>
+        <div class="panel home-card" data-open-tab="jobOrderReport" role="button" tabindex="0">
+          <h2>Job Order Quick Reference</h2>
+          <p class="muted">Look up active job/order numbers with their customer, master project, and description.</p>
+          <div class="actions"><button class="btn primary" data-open-tab="jobOrderReport" type="button">Open Job Orders</button></div>
+        </div>
+        <div class="panel home-card po-feature-disabled" data-open-tab="fieldPo" role="button" tabindex="0">
+          <h2>Create PO</h2>
+          <p class="muted">Fast field purchase order requests tied to active job/order numbers.</p>
+          <div class="actions"><button class="btn primary" data-open-tab="fieldPo" type="button">Create PO</button></div>
+        </div>
+        <div class="panel home-card po-feature-disabled" data-open-tab="officePo" role="button" tabindex="0">
+          <h2>Office PO Review</h2>
+          <p class="muted">Review, issue, receive, close, or void purchase order requests from the field.</p>
+          <div class="actions"><button class="btn primary" data-open-tab="officePo" type="button">Open PO Review</button></div>
+        </div>
         <div class="panel home-card" data-open-tab="archivedProjects" role="button" tabindex="0">
           <h2>Archived Projects</h2>
           <p class="muted">Open closed projects for reference or restore them back to the active project list.</p>
           <div class="actions"><button class="btn primary" data-open-tab="archivedProjects" type="button">Open Archive</button></div>
         </div>
+      </div>
+    </section>
+
+    <section id="fieldPo" class="tab hidden">
+      <div class="panel field-po-panel">
+        <h2>Create PO</h2>
+        <form id="fieldPoForm" enctype="multipart/form-data">
+          <label>Job / Order #</label>
+          <select name="job_key" id="fieldPoJobSelect" required></select>
+          <label>Vendor</label>
+          <input name="vendor" id="fieldPoVendor" placeholder="Vendor name" autocomplete="organization" required>
+          <label>What are you buying?</label>
+          <textarea name="description" id="fieldPoDescription" placeholder="Example: 2 boxes 3/4 EMT, 20 couplings, lift rental" required></textarea>
+          <label>Estimated Amount</label>
+          <input name="estimated_amount" id="fieldPoAmount" type="number" min="0" step="0.01" placeholder="Optional">
+          <label>Photo / Quote</label>
+          <input name="attachment" id="fieldPoAttachment" type="file" accept=".pdf,.png,.jpg,.jpeg,.webp">
+          <div class="actions field-po-actions">
+            <button class="btn primary field-po-submit" type="submit">Submit PO Request</button>
+          </div>
+          <div id="fieldPoResult" class="muted"></div>
+        </form>
+      </div>
+      <div class="panel" style="margin-top:14px">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px">
+          <h2>My POs</h2>
+          <button class="btn" id="refreshFieldPos" type="button">Refresh</button>
+        </div>
+        <div class="table-wrap"><table id="fieldPoTable"></table></div>
+      </div>
+    </section>
+
+    <section id="officePo" class="tab hidden">
+      <div class="panel">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
+          <div>
+            <h2>Office PO Review</h2>
+            <p class="muted">Use status to close the loop after the PO is issued, received, closed, or voided.</p>
+          </div>
+          <button class="btn" id="refreshOfficePos" type="button">Refresh</button>
+        </div>
+        <div class="grid cols-4">
+          <div><label>Status</label><select id="officePoStatusFilter"><option value="">All statuses</option><option>Pending Review</option><option>Issued</option><option>Received</option><option>Closed</option><option>Void</option></select></div>
+          <div style="grid-column:span 3"><label>Search</label><input id="officePoSearch" placeholder="Search PO, job/order, vendor, requester, or description"></div>
+        </div>
+        <div class="muted" id="officePoCount" style="margin-top:8px"></div>
+        <div class="table-wrap" style="margin-top:10px"><table id="officePoTable"></table></div>
       </div>
     </section>
 
@@ -3119,6 +3720,30 @@ HTML = r"""
           <button class="btn" id="refreshArchivedProjects" type="button">Refresh</button>
         </div>
         <div class="table-wrap" id="archivedProjectsTable"></div>
+      </div>
+    </section>
+
+    <section id="jobOrderReport" class="tab hidden">
+      <div class="panel">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
+          <div>
+            <h2>Job Order Quick Reference</h2>
+            <p class="muted">Active master projects only. Includes subprojects, change orders, and child projects.</p>
+          </div>
+          <button class="btn" id="refreshJobOrderReport" type="button">Refresh</button>
+        </div>
+        <div class="grid cols-4">
+          <div><label>Search</label><input id="jobOrderSearch" placeholder="Search job/order, customer, project, description, or status"></div>
+          <div><label>Customer</label><select id="jobOrderCustomerFilter"><option value="">All customers</option></select></div>
+          <div><label>Master Project</label><select id="jobOrderProjectFilter"><option value="">All master projects</option></select></div>
+          <div><label>Type</label><select id="jobOrderTypeFilter"><option value="">All types</option></select></div>
+        </div>
+        <div class="actions">
+          <label style="min-width:220px;margin-top:0">Status<select id="jobOrderStatusFilter"><option value="">All statuses</option></select></label>
+          <button class="btn" id="clearJobOrderFilters" type="button">Clear Filters</button>
+        </div>
+        <div class="muted" id="jobOrderReportCount" style="margin-top:8px"></div>
+        <div class="table-wrap" style="margin-top:10px"><table id="jobOrderReportTable"></table></div>
       </div>
     </section>
 
@@ -3266,6 +3891,19 @@ HTML = r"""
         <div class="actions"><button class="btn primary" type="submit">Import</button></div>
         <p id="importResult" class="muted"></p>
       </form>
+      <form class="panel" id="fieldWiseAuditForm" style="margin-top:14px">
+        <h2>Field Wise Ticket Audit</h2>
+        <p class="muted">Upload the all-customer Field Wise line-item export to check tracked job/order numbers against tickets already imported here.</p>
+        <label>Field Wise Ticket Export</label><input type="file" name="file" accept=".xlsx,.xlsm" required>
+        <label style="display:flex;align-items:center;gap:8px"><input id="omitUntrackedAuditTickets" type="checkbox" style="width:auto" checked> Omit tickets that do not match a tracked job/order number</label>
+        <div class="actions">
+          <button class="btn primary" type="submit">Run Audit</button>
+          <button class="btn" id="exportMissingTickets" type="button" disabled>Export Missing Tickets</button>
+        </div>
+        <p id="fieldWiseAuditResult" class="muted"></p>
+        <div id="fieldWiseAuditSummary" class="grid cols-4" style="margin-top:12px"></div>
+        <div id="fieldWiseAuditTables" style="margin-top:12px"></div>
+      </form>
       <div class="panel" style="margin-top:14px">
         <h2>Imported Files</h2>
         <div class="table-wrap"><table id="importHistoryTable"></table></div>
@@ -3349,6 +3987,24 @@ HTML = r"""
       </div>
     </section>
 
+    <section id="projectPo" class="tab hidden">
+      <div class="panel">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
+          <div>
+            <h2>Project POs</h2>
+            <p class="muted">Purchase orders tied to the selected master project.</p>
+          </div>
+          <button class="btn" id="refreshProjectPos" type="button">Refresh</button>
+        </div>
+        <div class="grid cols-4">
+          <div><label>Status</label><select id="projectPoStatusFilter"><option value="">All statuses</option><option>Pending Review</option><option>Issued</option><option>Received</option><option>Closed</option><option>Void</option></select></div>
+          <div style="grid-column:span 3"><label>Search</label><input id="projectPoSearch" placeholder="Search PO, job/order, vendor, requester, or description"></div>
+        </div>
+        <div class="muted" id="projectPoCount" style="margin-top:8px"></div>
+        <div class="table-wrap" style="margin-top:10px"><table id="projectPoTable"></table></div>
+      </div>
+    </section>
+
     <section id="bids" class="tab hidden">
       <div class="panel">
         <h2>Bid Tracking</h2>
@@ -3394,7 +4050,7 @@ HTML = r"""
           <h2>Add User</h2>
           <label>Username</label><input name="username" required>
           <label>Display Name</label><input name="display_name">
-          <label>Role</label><select name="role"><option>User</option><option>Read Only</option><option>Admin</option></select>
+          <label>Role</label><select name="role"><option>User</option><option>Read Only</option><option>TX/Read Only</option><option>Field PO</option><option>Admin</option></select>
           <p class="muted">New users start with temporary password TPE1776 and must change it at first login.</p>
           <div class="actions"><button class="btn primary" type="submit">Add User</button></div>
         </form>
@@ -3541,6 +4197,7 @@ HTML = r"""
   </div>
 
   <script>
+    const PO_FEATURE_ENABLED = false;
     let state = { projects: [], projectId: null, subprojects: [], changeOrders: [], internalRates: [], rateSets: [], currentUser: null };
     let openSubprojectDetailId = null;
     let masterDetailIsOpen = false;
@@ -3551,6 +4208,11 @@ HTML = r"""
     let invoiceGroupSeq = 0;
     let costFilterSeq = 0;
     let vendorAllocationGroups = {};
+    let jobOrderReportRows = [];
+    let jobOrderSort = { field: 'job_number', direction: 'asc' };
+    let officePoRows = [];
+    let projectPoRows = [];
+    let fieldWiseAuditData = null;
     const collapsedHierarchyNodes = new Set();
     const initializedHierarchyNodes = new Set();
     const money = v => Number(v || 0).toLocaleString(undefined, { style: 'currency', currency: 'USD' });
@@ -3570,6 +4232,8 @@ HTML = r"""
     };
     const formDataObj = form => Object.fromEntries(new FormData(form).entries());
     const markSaved = () => { hasUnsavedChanges = false; };
+    const isTexasReadOnly = () => state.currentUser?.role === 'TX/Read Only';
+    const isFieldPoOnly = () => state.currentUser?.role === 'Field PO';
     const setProjectCreateMode = enabled => {
       projectCreateMode = enabled;
       const form = document.getElementById('projectForm');
@@ -3701,16 +4365,20 @@ HTML = r"""
     }));
 
     function updateNavForTab(tabName) {
-      const projectTabs = ['dashboard','setup','import','review','invoices','billing'];
+      const projectTabs = ['dashboard','setup','import','review','invoices','billing','projectPo'];
       const inProjectArea = projectTabs.includes(tabName);
       document.querySelectorAll('nav button').forEach(btn => {
         const area = btn.dataset.navArea || '';
-        const shouldHide = (area === 'project' && !inProjectArea) || (area === 'texas' && tabName !== 'texasOps');
+        let shouldHide = (area === 'project' && !inProjectArea) || (area === 'texas' && tabName !== 'texasOps');
+        if (isTexasReadOnly()) shouldHide = btn.dataset.tab !== 'texasOps';
         btn.classList.toggle('hidden', shouldHide);
       });
     }
 
     async function openTab(tabName) {
+      if (isTexasReadOnly() && tabName !== 'texasOps') tabName = 'texasOps';
+      if (isFieldPoOnly() && tabName !== 'fieldPo') tabName = 'fieldPo';
+      if (!PO_FEATURE_ENABLED && ['fieldPo', 'officePo', 'projectPo'].includes(tabName)) tabName = 'home';
       markSaved();
       updateNavForTab(tabName);
       document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
@@ -3723,10 +4391,14 @@ HTML = r"""
       if (tabName === 'import') { loadImportHistory(); loadFieldTicketLines(); }
       if (tabName === 'invoices') { loadVendorInvoiceLines(); loadVendorAllocationHistory(); }
       if (tabName === 'billing') loadCustomerInvoices();
+      if (tabName === 'projectPo') loadProjectPos();
       if (tabName === 'bids') loadBidDashboard();
       if (tabName === 'admin') loadUsers();
       if (tabName === 'texasOps') loadTexasOpsDashboard();
       if (tabName === 'archivedProjects') loadArchivedProjects();
+      if (tabName === 'jobOrderReport') loadJobOrderReport();
+      if (tabName === 'fieldPo') loadFieldPo();
+      if (tabName === 'officePo') loadOfficePos();
     }
 
     document.querySelectorAll('[data-open-tab]').forEach(btn => btn.onclick = async () => {
@@ -4125,6 +4797,244 @@ HTML = r"""
       });
     }
 
+    function jobOrderFilterValue(id) {
+      return String(document.getElementById(id)?.value || '').trim();
+    }
+
+    function jobOrderOptionValues(field) {
+      return [...new Set(jobOrderReportRows.map(row => String(row[field] || '').trim()).filter(Boolean))]
+        .sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
+    }
+
+    function setJobOrderFilterOptions(id, field, allLabel) {
+      const select = document.getElementById(id);
+      if (!select) return;
+      const current = select.value;
+      const values = jobOrderOptionValues(field);
+      select.innerHTML = `<option value="">${allLabel}</option>` + values.map(value => `<option value="${htmlEscape(value)}">${htmlEscape(value)}</option>`).join('');
+      if (values.includes(current)) select.value = current;
+    }
+
+    function refreshJobOrderFilterOptions() {
+      setJobOrderFilterOptions('jobOrderCustomerFilter', 'customer', 'All customers');
+      setJobOrderFilterOptions('jobOrderProjectFilter', 'project_name', 'All master projects');
+      setJobOrderFilterOptions('jobOrderTypeFilter', 'item_type', 'All types');
+      setJobOrderFilterOptions('jobOrderStatusFilter', 'status', 'All statuses');
+    }
+
+    function sortJobOrderRows(rowsToSort) {
+      const field = jobOrderSort.field || 'job_number';
+      const direction = jobOrderSort.direction === 'desc' ? -1 : 1;
+      return [...rowsToSort].sort((a, b) => {
+        const left = String(a[field] || '').trim();
+        const right = String(b[field] || '').trim();
+        return left.localeCompare(right, undefined, { numeric: true, sensitivity: 'base' }) * direction;
+      });
+    }
+
+    function jobOrderSortableHeader(field, label) {
+      const active = jobOrderSort.field === field;
+      const indicator = active ? `<span class="sort-indicator">${jobOrderSort.direction === 'asc' ? '▲' : '▼'}</span>` : '';
+      return `<th><button class="sort-header" type="button" data-job-order-sort="${field}">${label}${indicator}</button></th>`;
+    }
+
+    function renderJobOrderReport() {
+      const search = jobOrderFilterValue('jobOrderSearch').toLowerCase();
+      const customer = jobOrderFilterValue('jobOrderCustomerFilter');
+      const project = jobOrderFilterValue('jobOrderProjectFilter');
+      const type = jobOrderFilterValue('jobOrderTypeFilter');
+      const status = jobOrderFilterValue('jobOrderStatusFilter');
+      const filtered = sortJobOrderRows(jobOrderReportRows.filter(row => {
+        if (customer && String(row.customer || '') !== customer) return false;
+        if (project && String(row.project_name || '') !== project) return false;
+        if (type && String(row.item_type || '') !== type) return false;
+        if (status && String(row.status || '') !== status) return false;
+        if (!search) return true;
+        return [
+          row.job_number,
+          row.item_type,
+          row.customer,
+          row.project_name,
+          row.project_code,
+          row.reference_code,
+          row.description,
+          row.project_description,
+          row.location,
+          row.status
+        ].some(value => String(value || '').toLowerCase().includes(search));
+      }));
+      const headers = [
+        ['job_number', 'Job / Order #'],
+        ['item_type', 'Type'],
+        ['customer', 'Customer'],
+        ['project_name', 'Master Project'],
+        ['reference_code', 'Ref'],
+        ['description', 'Description'],
+        ['project_description', 'Project Description'],
+        ['status', 'Status']
+      ].map(([field, label]) => jobOrderSortableHeader(field, label)).join('');
+      document.getElementById('jobOrderReportCount').textContent = `${filtered.length} of ${jobOrderReportRows.length} active job/order reference(s) shown`;
+      document.getElementById('jobOrderReportTable').innerHTML = filtered.length
+        ? `<thead><tr>${headers}</tr></thead><tbody>${filtered.map(row => `
+          <tr>
+            <td><strong>${htmlEscape(row.job_number || '')}</strong></td>
+            <td>${htmlEscape(row.item_type || '')}</td>
+            <td>${htmlEscape(row.customer || '')}</td>
+            <td>${htmlEscape(row.project_name || '')}<div class="muted">${htmlEscape([row.project_code, row.location].filter(Boolean).join(' / '))}</div></td>
+            <td>${htmlEscape(row.reference_code || '')}</td>
+            <td>${htmlEscape(row.description || '')}</td>
+            <td>${htmlEscape(row.project_description || '')}</td>
+            <td>${htmlEscape(row.status || '')}</td>
+          </tr>`).join('')}</tbody>`
+        : '<tbody><tr><td>No active job/order references match that search.</td></tr></tbody>';
+      document.querySelectorAll('[data-job-order-sort]').forEach(btn => btn.onclick = () => {
+        const field = btn.dataset.jobOrderSort;
+        if (jobOrderSort.field === field) {
+          jobOrderSort.direction = jobOrderSort.direction === 'asc' ? 'desc' : 'asc';
+        } else {
+          jobOrderSort = { field, direction: 'asc' };
+        }
+        renderJobOrderReport();
+      });
+    }
+
+    async function loadJobOrderReport() {
+      jobOrderReportRows = await api('/api/job-order-report');
+      refreshJobOrderFilterOptions();
+      renderJobOrderReport();
+    }
+
+    async function loadFieldPoJobs() {
+      if (!jobOrderReportRows.length) jobOrderReportRows = await api('/api/job-order-report');
+      const select = document.getElementById('fieldPoJobSelect');
+      const rowsWithKeys = jobOrderReportRows.filter(row => row.job_key);
+      select.innerHTML = '<option value="">Choose job/order...</option>' + rowsWithKeys.map(row => {
+        const label = [row.job_number, row.customer, row.project_name, row.reference_code].filter(Boolean).join(' - ');
+        return `<option value="${htmlEscape(row.job_key)}">${htmlEscape(label)}</option>`;
+      }).join('');
+    }
+
+    function officePoJobOptions(po) {
+      const currentValue = po.change_order_id ? `change_order:${po.change_order_id}` : (po.subproject_id ? `subproject:${po.subproject_id}` : '');
+      return '<option value="">Choose job/order...</option>' + jobOrderReportRows.filter(row => row.job_key).map(row => {
+        const label = [row.job_number, row.customer, row.project_name, row.reference_code].filter(Boolean).join(' - ');
+        return `<option value="${htmlEscape(row.job_key)}" ${row.job_key === currentValue ? 'selected' : ''}>${htmlEscape(label)}</option>`;
+      }).join('');
+    }
+
+    async function loadFieldPos() {
+      const poRows = await api('/api/purchase-orders');
+      document.getElementById('fieldPoTable').innerHTML = poRows.length
+        ? `<thead><tr><th>PO</th><th>Job / Order</th><th>Vendor</th><th>Amount</th><th>Status</th><th>Pickup Ticket</th><th>Requested</th><th></th></tr></thead><tbody>${poRows.map(po => `
+          <tr>
+            <td><strong>${htmlEscape(po.po_number || '')}</strong></td>
+            <td>${htmlEscape(po.job_number || '')}<div class="muted">${htmlEscape(po.job_label || '')}</div></td>
+            <td>${htmlEscape(po.vendor || '')}</td>
+            <td>${money(po.estimated_amount || 0)}</td>
+            <td>${htmlEscape(po.status || '')}</td>
+            <td>
+              ${po.pickup_file ? `<a class="pdf-link" href="/uploads/${encodeURIComponent(po.pickup_file)}" target="_blank" rel="noopener">Open pickup ticket</a>` : '<span class="muted">Not uploaded</span>'}
+              <form data-pickup-form="${po.id}" style="margin-top:8px">
+                <input name="pickup_file" type="file" accept=".pdf,.png,.jpg,.jpeg,.webp" required>
+                <button class="btn" type="submit" style="margin-top:6px">Upload</button>
+              </form>
+            </td>
+            <td>${htmlEscape((po.created_at || '').slice(0, 16).replace('T', ' '))}</td>
+            <td><a class="btn" href="/po/${po.id}" target="_blank" rel="noopener">Open</a></td>
+          </tr>`).join('')}</tbody>`
+        : '<tbody><tr><td>No PO requests yet.</td></tr></tbody>';
+      document.querySelectorAll('[data-pickup-form]').forEach(form => form.onsubmit = async event => {
+        event.preventDefault();
+        const poId = form.dataset.pickupForm;
+        const data = new FormData(form);
+        try {
+          await api(`/api/purchase-orders/${poId}/pickup`, { method: 'POST', body: data });
+          await loadFieldPos();
+        } catch (err) {
+          window.alert(err.message || 'Could not upload pickup ticket.');
+        }
+      });
+    }
+
+    async function loadFieldPo() {
+      await loadFieldPoJobs();
+      await loadFieldPos();
+    }
+
+    function renderPoReviewTable(rows, config) {
+      const search = String(document.getElementById(config.searchId)?.value || '').trim().toLowerCase();
+      const status = String(document.getElementById(config.statusId)?.value || '').trim();
+      const filtered = rows.filter(po => {
+        if (status && String(po.status || '') !== status) return false;
+        if (!search) return true;
+        return [
+          po.po_number,
+          po.job_number,
+          po.job_label,
+          po.vendor,
+          po.description,
+          po.requested_by_username,
+          po.status
+        ].some(value => String(value || '').toLowerCase().includes(search));
+      });
+      document.getElementById(config.countId).textContent = `${filtered.length} of ${rows.length} PO request(s) shown`;
+      document.getElementById(config.tableId).innerHTML = filtered.length
+        ? `<thead><tr><th>PO</th><th>Job / Order</th><th>Vendor</th><th>Amount</th><th>Requested By</th><th>Status</th><th>Details</th><th></th></tr></thead><tbody>${filtered.map(po => `
+          <tr>
+            <td><strong>${htmlEscape(po.po_number || '')}</strong><div class="muted">${htmlEscape((po.created_at || '').slice(0, 16).replace('T', ' '))}</div></td>
+            <td><select data-office-po-field="${po.id}" data-field="job_key">${officePoJobOptions(po)}</select></td>
+            <td><input data-office-po-field="${po.id}" data-field="vendor" value="${htmlEscape(po.vendor || '')}"></td>
+            <td><input data-office-po-field="${po.id}" data-field="estimated_amount" type="number" min="0" step="0.01" value="${Number(po.estimated_amount || 0)}"></td>
+            <td>${htmlEscape(po.requested_by_username || '')}</td>
+            <td><select data-office-po-field="${po.id}" data-field="status">${['Pending Review','Issued','Received','Closed','Void'].map(statusOption => `<option ${po.status === statusOption ? 'selected' : ''}>${statusOption}</option>`).join('')}</select></td>
+            <td><textarea data-office-po-field="${po.id}" data-field="description">${htmlEscape(po.description || '')}</textarea>${po.attachment_file ? `<div><a class="pdf-link" href="/uploads/${encodeURIComponent(po.attachment_file)}" target="_blank" rel="noopener">Attachment</a></div>` : ''}${po.pickup_file ? `<div><a class="pdf-link" href="/uploads/${encodeURIComponent(po.pickup_file)}" target="_blank" rel="noopener">Pickup ticket</a></div>` : '<div class="muted">No pickup ticket</div>'}</td>
+            <td class="actions-cell"><a class="btn" href="/po/${po.id}" target="_blank" rel="noopener">Open</a><button class="btn" data-save-office-po="${po.id}" type="button">Save</button></td>
+          </tr>`).join('')}</tbody>`
+        : '<tbody><tr><td>No PO requests match those filters.</td></tr></tbody>';
+      document.querySelectorAll(`#${config.tableId} [data-save-office-po]`).forEach(btn => btn.onclick = async () => {
+        const id = btn.dataset.saveOfficePo;
+        const fields = {};
+        document.querySelectorAll(`#${config.tableId} [data-office-po-field="${id}"]`).forEach(el => fields[el.dataset.field] = el.value);
+        await api(`/api/purchase-orders/${id}`, {
+          method: 'PUT',
+          body: JSON.stringify(fields)
+        });
+        await config.reload();
+      });
+    }
+
+    function renderOfficePos() {
+      renderPoReviewTable(officePoRows, {
+        searchId: 'officePoSearch',
+        statusId: 'officePoStatusFilter',
+        countId: 'officePoCount',
+        tableId: 'officePoTable',
+        reload: loadOfficePos
+      });
+    }
+
+    async function loadOfficePos() {
+      if (!jobOrderReportRows.length) jobOrderReportRows = await api('/api/job-order-report');
+      officePoRows = await api('/api/purchase-orders');
+      renderOfficePos();
+    }
+
+    async function loadProjectPos() {
+      if (!jobOrderReportRows.length) jobOrderReportRows = await api('/api/job-order-report');
+      projectPoRows = await api(`/api/purchase-orders?project_id=${state.projectId}`);
+      renderProjectPos();
+    }
+
+    function renderProjectPos() {
+      renderPoReviewTable(projectPoRows, {
+        searchId: 'projectPoSearch',
+        statusId: 'projectPoStatusFilter',
+        countId: 'projectPoCount',
+        tableId: 'projectPoTable',
+        reload: loadProjectPos
+      });
+    }
+
     async function refresh() {
       if (!state.projectId) {
         document.getElementById('kpis').innerHTML = '<div class="panel">Create a master project to begin.</div>';
@@ -4458,6 +5368,94 @@ HTML = r"""
 
     function table(headers, data) {
       return `<table><thead><tr>${headers.map(h => `<th>${h}</th>`).join('')}</tr></thead><tbody>${data.map(r => `<tr>${r.map(c => `<td>${c}</td>`).join('')}</tr>`).join('')}</tbody></table>`;
+    }
+
+    function fieldWiseAuditRowsTable(title, rows, emptyText) {
+      const shown = rows.slice(0, 250);
+      return `<div class="panel" style="margin-top:14px">
+        <h2>${htmlEscape(title)}</h2>
+        <div class="muted">${rows.length} item(s)${rows.length > shown.length ? `, showing first ${shown.length}` : ''}</div>
+        <div class="table-wrap" style="margin-top:10px"><table>${shown.length ? `<thead><tr><th>Ticket</th><th>Order #</th><th>Customer</th><th>Project</th><th>Type</th><th>Status</th><th>Date</th><th>Export Total</th><th>Imported Total</th><th>Lines</th></tr></thead><tbody>${shown.map(r => `
+          <tr>
+            <td><strong>${htmlEscape(r.ticket_number || '')}</strong></td>
+            <td>${htmlEscape(r.order_number || '')}</td>
+            <td>${htmlEscape(r.customer || '')}</td>
+            <td>${htmlEscape(r.project_name || '')}<div class="muted">${htmlEscape(r.reference_code || '')}</div></td>
+            <td>${htmlEscape(r.item_type || '')}</td>
+            <td>${htmlEscape(r.status || '')}</td>
+            <td>${htmlEscape(r.ticket_date || '')}</td>
+            <td>${money(r.export_total || 0)}</td>
+            <td>${money(r.imported_total || 0)}</td>
+            <td>${Number(r.line_count || 0)}</td>
+          </tr>`).join('')}</tbody>` : `<tbody><tr><td>${htmlEscape(emptyText)}</td></tr></tbody>`}</table></div>
+      </div>`;
+    }
+
+    function renderFieldWiseAudit() {
+      const result = fieldWiseAuditData;
+      const summaryEl = document.getElementById('fieldWiseAuditSummary');
+      const tablesEl = document.getElementById('fieldWiseAuditTables');
+      const exportBtn = document.getElementById('exportMissingTickets');
+      if (!result) {
+        summaryEl.innerHTML = '';
+        tablesEl.innerHTML = '';
+        exportBtn.disabled = true;
+        return;
+      }
+      const s = result.summary || {};
+      summaryEl.innerHTML = [
+        ['Export Tickets', s.export_ticket_count || 0, `${s.export_line_count || 0} line(s)`],
+        ['Missing Tracked', s.missing_count || 0, 'Export has it, app does not'],
+        ['Total Mismatches', s.mismatch_count || 0, 'Same ticket/order, different total'],
+        ['Untracked / No Order', Number(s.untracked_count || 0) + Number(s.no_order_count || 0), 'Can be omitted']
+      ].map(([label, value, hint]) => `<div class="kpi"><div class="label">${htmlEscape(label)}</div><div class="value">${value}</div><div class="hint">${htmlEscape(hint)}</div></div>`).join('');
+      const omitUntracked = document.getElementById('omitUntrackedAuditTickets').checked;
+      const parts = [
+        fieldWiseAuditRowsTable('Missing Tickets For Tracked Jobs', result.missing || [], 'No missing tracked tickets found.'),
+        fieldWiseAuditRowsTable('Imported Here But Not In This Export', result.extra_imported || [], 'No extra imported tickets found.'),
+        fieldWiseAuditRowsTable('Total Mismatches', result.mismatches || [], 'No total mismatches found.')
+      ];
+      if (!omitUntracked) {
+        parts.push(fieldWiseAuditRowsTable('Untracked Order Numbers', result.untracked || [], 'No untracked order-number tickets found.'));
+        parts.push(fieldWiseAuditRowsTable('Tickets With Blank Order Number', result.no_order || [], 'No blank order-number tickets found.'));
+      }
+      tablesEl.innerHTML = parts.join('');
+      exportBtn.disabled = !(result.missing || []).length;
+    }
+
+    function csvCell(value) {
+      const text = String(value ?? '');
+      return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+    }
+
+    function downloadMissingTicketCsv() {
+      if (!fieldWiseAuditData?.missing?.length) return;
+      const headers = ['Ticket Number','Order Number','Customer','Project','Type','Reference','Status','Ticket Date','Export Total','Imported Total','Line Count'];
+      const lines = [headers.map(csvCell).join(',')];
+      fieldWiseAuditData.missing.forEach(r => {
+        lines.push([
+          r.ticket_number,
+          r.order_number,
+          r.customer,
+          r.project_name,
+          r.item_type,
+          r.reference_code,
+          r.status,
+          r.ticket_date,
+          Number(r.export_total || 0).toFixed(2),
+          Number(r.imported_total || 0).toFixed(2),
+          r.line_count || 0
+        ].map(csvCell).join(','));
+      });
+      const blob = new Blob([lines.join('\r\n')], { type: 'text/csv' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `missing-fieldwise-tickets-${new Date().toISOString().slice(0,10)}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
     }
 
     function invoiceKey(row) {
@@ -5356,10 +6354,14 @@ HTML = r"""
         const id = btn.dataset.saveCo;
         const fields = {};
         document.querySelectorAll(`[data-co-edit="${id}"]`).forEach(el => fields[el.dataset.field] = el.value);
-        await api(`/api/change-orders/${id}`, { method:'PUT', body: JSON.stringify(fields) });
-        btn.closest('tr')?.classList.remove('setup-dirty');
-        markSaved();
-        await refresh();
+        try {
+          await api(`/api/change-orders/${id}`, { method:'PUT', body: JSON.stringify(fields) });
+          btn.closest('tr')?.classList.remove('setup-dirty');
+          markSaved();
+          await refresh();
+        } catch (err) {
+          window.alert(err.message || 'Could not save this change order / child project.');
+        }
       });
       document.querySelectorAll('[data-delete-co]').forEach(btn => btn.onclick = async () => {
         const id = btn.dataset.deleteCo;
@@ -5767,8 +6769,11 @@ HTML = r"""
     async function loadCurrentUser() {
       const me = await api('/api/me');
       state.currentUser = me;
-      document.body.classList.toggle('read-only', me.role === 'Read Only');
-      document.getElementById('currentUser').textContent = `${me.display_name || me.username}${me.role === 'Read Only' ? ' / Read Only' : ''}`;
+      const readOnly = me.role === 'Read Only' || me.role === 'TX/Read Only';
+      document.body.classList.toggle('read-only', readOnly);
+      document.body.classList.toggle('tx-read-only', me.role === 'TX/Read Only');
+      document.body.classList.toggle('field-po-only', me.role === 'Field PO');
+      document.getElementById('currentUser').textContent = `${me.display_name || me.username}${readOnly || me.role === 'Field PO' ? ' / ' + me.role : ''}`;
       document.getElementById('systemAdminBtn').classList.toggle('hidden', me.role !== 'Admin');
       document.getElementById('systemRevisionBtn').classList.toggle('hidden', me.role !== 'Admin');
       if (Number(me.must_change_password || 0)) openAccountModal(true);
@@ -5782,7 +6787,7 @@ HTML = r"""
         <tbody>${users.map(u => `<tr>
           <td>${u.username}</td>
           <td>${u.display_name || ''}</td>
-          <td><select data-user-role="${u.id}"><option ${u.role === 'User' ? 'selected' : ''}>User</option><option ${u.role === 'Read Only' ? 'selected' : ''}>Read Only</option><option ${u.role === 'Admin' ? 'selected' : ''}>Admin</option></select></td>
+          <td><select data-user-role="${u.id}"><option ${u.role === 'User' ? 'selected' : ''}>User</option><option ${u.role === 'Read Only' ? 'selected' : ''}>Read Only</option><option ${u.role === 'TX/Read Only' ? 'selected' : ''}>TX/Read Only</option><option ${u.role === 'Field PO' ? 'selected' : ''}>Field PO</option><option ${u.role === 'Admin' ? 'selected' : ''}>Admin</option></select></td>
           <td>${u.active ? 'Active' : 'Inactive'}${Number(u.must_change_password || 0) ? '<div class="muted">Must change password</div>' : ''}</td>
           <td><input data-user-password="${u.id}" type="password" placeholder="TPE1776"></td>
           <td>
@@ -5850,6 +6855,41 @@ HTML = r"""
       await refresh();
     };
     document.getElementById('refreshArchivedProjects').onclick = () => loadArchivedProjects();
+    document.getElementById('refreshJobOrderReport').onclick = () => loadJobOrderReport();
+    document.getElementById('refreshFieldPos').onclick = () => loadFieldPos();
+    document.getElementById('refreshOfficePos').onclick = () => loadOfficePos();
+    document.getElementById('officePoSearch').oninput = () => renderOfficePos();
+    document.getElementById('officePoStatusFilter').onchange = () => renderOfficePos();
+    document.getElementById('refreshProjectPos').onclick = () => loadProjectPos();
+    document.getElementById('projectPoSearch').oninput = () => renderProjectPos();
+    document.getElementById('projectPoStatusFilter').onchange = () => renderProjectPos();
+    document.getElementById('jobOrderSearch').oninput = () => renderJobOrderReport();
+    ['jobOrderCustomerFilter','jobOrderProjectFilter','jobOrderTypeFilter','jobOrderStatusFilter'].forEach(id => {
+      document.getElementById(id).onchange = () => renderJobOrderReport();
+    });
+    document.getElementById('clearJobOrderFilters').onclick = () => {
+      ['jobOrderSearch','jobOrderCustomerFilter','jobOrderProjectFilter','jobOrderTypeFilter','jobOrderStatusFilter'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.value = '';
+      });
+      renderJobOrderReport();
+    };
+    document.getElementById('fieldPoForm').onsubmit = async e => {
+      e.preventDefault();
+      const resultEl = document.getElementById('fieldPoResult');
+      resultEl.textContent = 'Submitting PO request...';
+      const form = e.target;
+      const data = new FormData(form);
+      try {
+        const saved = await api('/api/purchase-orders', { method:'POST', body: data });
+        resultEl.innerHTML = `<strong class="good">PO Created: ${htmlEscape(saved.po_number)}</strong>`;
+        form.reset();
+        await loadFieldPoJobs();
+        await loadFieldPos();
+      } catch (err) {
+        resultEl.innerHTML = `<span class="bad">${htmlEscape(err.message || 'Could not create PO request.')}</span>`;
+      }
+    };
     document.getElementById('subprojectForm').onsubmit = async e => {
       e.preventDefault();
       await api('/api/subprojects', { method:'POST', body: JSON.stringify({ ...formDataObj(e.target), project_id: state.projectId }) });
@@ -5857,9 +6897,13 @@ HTML = r"""
     };
     document.getElementById('coForm').onsubmit = async e => {
       e.preventDefault();
-      await api('/api/change-orders', { method:'POST', body: JSON.stringify({ ...formDataObj(e.target), project_id: state.projectId }) });
-      e.target.reset(); markSaved(); await refresh();
-      updateCoPricingFields();
+      try {
+        await api('/api/change-orders', { method:'POST', body: JSON.stringify({ ...formDataObj(e.target), project_id: state.projectId }) });
+        e.target.reset(); markSaved(); await refresh();
+        updateCoPricingFields();
+      } catch (err) {
+        window.alert(err.message || 'Could not add this change order / child project.');
+      }
     };
     function updateCoPricingFields() {
       const pricing = document.getElementById('coPricingType')?.value || 'Fixed';
@@ -5939,6 +6983,30 @@ HTML = r"""
       await loadImportHistory();
       await loadFieldTicketLines();
     };
+    document.getElementById('fieldWiseAuditForm').onsubmit = async e => {
+      e.preventDefault();
+      const fileInput = e.target.querySelector('input[type="file"]');
+      const resultEl = document.getElementById('fieldWiseAuditResult');
+      if (!fileInput.files.length) {
+        resultEl.textContent = 'Choose the Field Wise ticket export first.';
+        return;
+      }
+      resultEl.textContent = 'Running Field Wise audit...';
+      const data = new FormData();
+      data.append('file', fileInput.files[0]);
+      try {
+        fieldWiseAuditData = await api('/api/fieldwise-audit', { method: 'POST', body: data });
+        const s = fieldWiseAuditData.summary || {};
+        resultEl.textContent = `Audit complete. Missing tracked tickets: ${s.missing_count || 0}. Untracked/blank order tickets: ${Number(s.untracked_count || 0) + Number(s.no_order_count || 0)}.`;
+        renderFieldWiseAudit();
+      } catch (err) {
+        fieldWiseAuditData = null;
+        renderFieldWiseAudit();
+        resultEl.textContent = `Audit failed: ${err.message}`;
+      }
+    };
+    document.getElementById('omitUntrackedAuditTickets').onchange = () => renderFieldWiseAudit();
+    document.getElementById('exportMissingTickets').onclick = () => downloadMissingTicketCsv();
     document.getElementById('addRate').onclick = async () => {
       await api('/api/internal-rates', {
         method: 'POST',
@@ -5997,9 +7065,18 @@ HTML = r"""
     };
 
     updateCoPricingFields();
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => navigator.serviceWorker.register('/service-worker.js').catch(() => {}));
+    }
     (async () => {
       await loadCurrentUser();
-      await loadProjects();
+      if (isTexasReadOnly()) {
+        openTab('texasOps');
+      } else if (state.currentUser?.role === 'Field PO') {
+        openTab('fieldPo');
+      } else {
+        await loadProjects();
+      }
     })();
   </script>
 </body>
@@ -6015,16 +7092,34 @@ class Handler(BaseHTTPRequestHandler):
         try:
             parsed = urlparse(self.path)
             qs = parse_qs(parsed.query)
+            if parsed.path == "/manifest.json":
+                return text_response(self, pwa_manifest_json(), "application/manifest+json")
+            if parsed.path == "/service-worker.js":
+                return text_response(self, service_worker_js(), "application/javascript; charset=utf-8")
+            if parsed.path == "/offline":
+                return text_response(self, offline_html())
             if parsed.path == "/login":
                 if current_user(self):
                     return redirect_response(self, "/")
                 return text_response(self, LOGIN_HTML)
-            public_paths = ("/brand/",)
+            public_paths = ("/brand/", "/manifest.json", "/service-worker.js", "/offline")
             user = current_user(self)
             if not user and not parsed.path.startswith(public_paths):
                 if parsed.path.startswith("/api/"):
                     return json_response(self, {"error": "Login required"}, 401)
                 return redirect_response(self, "/login")
+            if is_texas_read_only(user):
+                allowed_paths = ("/", "/api/me", "/api/texas-financial-summary")
+                if parsed.path not in allowed_paths and not parsed.path.startswith(public_paths):
+                    if parsed.path.startswith("/api/"):
+                        return json_response(self, {"error": "Texas Operations access only."}, 403)
+                    return redirect_response(self, "/")
+            if is_field_po_only(user):
+                allowed_paths = ("/", "/api/me", "/api/job-order-report", "/api/purchase-orders")
+                if parsed.path not in allowed_paths and not parsed.path.startswith(public_paths) and not parsed.path.startswith("/po/") and not parsed.path.startswith("/uploads/"):
+                    if parsed.path.startswith("/api/"):
+                        return json_response(self, {"error": "PO access only."}, 403)
+                    return redirect_response(self, "/")
             if parsed.path in ("/developer-revision", "/server-health"):
                 if user.get("role") != "Admin":
                     return text_response(self, "Admin required", "text/plain", 403)
@@ -6035,11 +7130,39 @@ class Handler(BaseHTTPRequestHandler):
                 return json_response(self, app_revision_info())
             if parsed.path == "/":
                 return text_response(self, HTML)
+            if parsed.path.startswith("/po/"):
+                po_id = parsed.path.rsplit("/", 1)[-1]
+                po = one("SELECT * FROM purchase_orders WHERE id = ?", (po_id,))
+                if not po:
+                    return text_response(self, "PO not found", "text/plain", 404)
+                if is_field_po_only(user) and po["requested_by_user_id"] != user["id"]:
+                    return text_response(self, "Not found", "text/plain", 404)
+                return text_response(self, purchase_order_html(po))
             if parsed.path.startswith("/uploads/"):
-                path = upload_pdf_path(parsed.path.removeprefix("/uploads/"))
+                requested_upload = Path(unquote(parsed.path.removeprefix("/uploads/"))).name
+                if is_field_po_only(user):
+                    allowed_attachment = one(
+                        """
+                        SELECT id
+                        FROM purchase_orders
+                        WHERE requested_by_user_id = ?
+                          AND (attachment_file = ? OR pickup_file = ?)
+                        """,
+                        (user["id"], requested_upload, requested_upload),
+                    )
+                    if not allowed_attachment:
+                        return text_response(self, "Not found", "text/plain", 404)
+                path = upload_attachment_path(requested_upload)
                 if not path:
                     return text_response(self, "Not found", "text/plain", 404)
-                return file_response(self, path, "application/pdf")
+                content_types = {
+                    ".pdf": "application/pdf",
+                    ".png": "image/png",
+                    ".jpg": "image/jpeg",
+                    ".jpeg": "image/jpeg",
+                    ".webp": "image/webp",
+                }
+                return file_response(self, path, content_types.get(path.suffix.lower(), "application/octet-stream"))
             if parsed.path.startswith("/pdf-viewer/"):
                 html = pdf_viewer_html(parsed.path.removeprefix("/pdf-viewer/"))
                 if not html:
@@ -6065,6 +7188,52 @@ class Handler(BaseHTTPRequestHandler):
                     return text_response(self, "Not found", "text/plain", 404)
                 content_types = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}
                 return file_response(self, path, content_types.get(path.suffix.lower(), "application/octet-stream"))
+            if parsed.path == "/api/job-order-report":
+                return json_response(
+                    self,
+                    rows(
+                        """
+                        SELECT
+                          'subproject:' || sp.id AS job_key,
+                          sp.job_number,
+                          'Subproject' AS item_type,
+                          p.customer,
+                          p.name AS project_name,
+                          p.project_code,
+                          sp.code AS reference_code,
+                          sp.name AS description,
+                          p.description AS project_description,
+                          p.location,
+                          COALESCE(p.status, 'Active') AS status
+                        FROM subprojects sp
+                        JOIN projects p ON p.id = sp.project_id
+                        WHERE COALESCE(p.status, 'Active') <> 'Archived'
+                          AND TRIM(COALESCE(sp.job_number, '')) <> ''
+                        UNION ALL
+                        SELECT
+                          'change_order:' || co.id AS job_key,
+                          co.job_number,
+                          COALESCE(co.order_type, 'Change Order') AS item_type,
+                          p.customer,
+                          p.name AS project_name,
+                          p.project_code,
+                          CASE
+                            WHEN sp.code IS NOT NULL THEN co.co_number || ' / ' || sp.code
+                            ELSE co.co_number
+                          END AS reference_code,
+                          co.title AS description,
+                          p.description AS project_description,
+                          p.location,
+                          COALESCE(co.status, 'Pending') AS status
+                        FROM change_orders co
+                        JOIN projects p ON p.id = co.project_id
+                        LEFT JOIN subprojects sp ON sp.id = co.subproject_id
+                        WHERE COALESCE(p.status, 'Active') <> 'Archived'
+                          AND TRIM(COALESCE(co.job_number, '')) <> ''
+                        ORDER BY customer, project_name, job_number, item_type
+                        """
+                    ),
+                )
             if parsed.path == "/api/projects":
                 status_filter = (qs.get("status", ["active"])[0] or "active").lower()
                 if status_filter == "all":
@@ -6078,6 +7247,21 @@ class Handler(BaseHTTPRequestHandler):
                 if not require_admin(self):
                     return json_response(self, {"error": "Admin required"}, 403)
                 return json_response(self, rows("SELECT id, username, display_name, role, active, COALESCE(must_change_password, 0) AS must_change_password, created_at FROM users ORDER BY username"))
+            if parsed.path == "/api/purchase-orders":
+                if not can_use_field_po(user):
+                    return json_response(self, {"error": "PO access required."}, 403)
+                if is_field_po_only(user):
+                    return json_response(
+                        self,
+                        rows("SELECT * FROM purchase_orders WHERE requested_by_user_id = ? ORDER BY created_at DESC, id DESC", (user["id"],)),
+                    )
+                project_filter = qs.get("project_id", [""])[0]
+                if project_filter:
+                    return json_response(
+                        self,
+                        rows("SELECT * FROM purchase_orders WHERE project_id = ? ORDER BY created_at DESC, id DESC", (project_filter,)),
+                    )
+                return json_response(self, rows("SELECT * FROM purchase_orders ORDER BY created_at DESC, id DESC"))
             if parsed.path == "/api/bid-summary":
                 return json_response(self, bid_summary())
             if parsed.path == "/api/texas-financial-summary":
@@ -6241,8 +7425,121 @@ class Handler(BaseHTTPRequestHandler):
                 with db() as con:
                     con.execute("DELETE FROM user_sessions WHERE user_id = ? AND session_token <> ?", (user["id"], token or ""))
                 return json_response(self, {"ok": True})
+            if parsed.path == "/api/purchase-orders":
+                user = current_user(self)
+                if not can_use_field_po(user):
+                    return json_response(self, {"error": "PO access required."}, 403)
+                form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": self.headers.get("Content-Type")})
+                job_key = form.getvalue("job_key")
+                vendor = str(form.getvalue("vendor") or "").strip()
+                description = str(form.getvalue("description") or "").strip()
+                estimated_amount = money(form.getvalue("estimated_amount"))
+                if not job_key:
+                    return json_response(self, {"error": "Choose a job/order number."}, 400)
+                if not vendor:
+                    return json_response(self, {"error": "Enter the vendor."}, 400)
+                if not description:
+                    return json_response(self, {"error": "Enter what you are buying."}, 400)
+                attachment_file = None
+                file_item = form["attachment"] if "attachment" in form else None
+                if file_item is not None and getattr(file_item, "filename", ""):
+                    safe_name = Path(file_item.filename).name
+                    suffix = Path(safe_name).suffix.lower()
+                    if suffix not in (".pdf", ".png", ".jpg", ".jpeg", ".webp"):
+                        return json_response(self, {"error": "Attachment must be a PDF or image."}, 400)
+                    attachment_file = f"{datetime.now().strftime('%Y%m%d%H%M%S')}-po-{safe_name}"
+                    path = UPLOAD_DIR / attachment_file
+                    with open(path, "wb") as f:
+                        f.write(file_item.file.read())
+                now = datetime.now().isoformat(timespec="seconds")
+                with db() as con:
+                    job_ref = job_reference_for_po(con, job_key)
+                    if not job_ref:
+                        if attachment_file:
+                            try:
+                                (UPLOAD_DIR / attachment_file).unlink()
+                            except Exception:
+                                pass
+                        return json_response(self, {"error": "That job/order is no longer available."}, 400)
+                    po_number = next_po_number(con)
+                    cur = con.execute(
+                        """
+                        INSERT INTO purchase_orders (
+                          po_number, project_id, subproject_id, change_order_id, job_number, job_label,
+                          vendor, description, estimated_amount, attachment_file, status,
+                          requested_by_user_id, requested_by_username, created_at, updated_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending Review', ?, ?, ?, ?)
+                        """,
+                        (
+                            po_number,
+                            job_ref["project_id"],
+                            job_ref["subproject_id"],
+                            job_ref["change_order_id"],
+                            job_ref["job_number"],
+                            job_ref["job_label"],
+                            vendor,
+                            description,
+                            estimated_amount,
+                            attachment_file,
+                            user["id"],
+                            user["username"],
+                            now,
+                            now,
+                        ),
+                    )
+                    return json_response(self, {"id": cur.lastrowid, "po_number": po_number})
+            if parsed.path.startswith("/api/purchase-orders/") and parsed.path.endswith("/pickup"):
+                user = current_user(self)
+                if not can_use_field_po(user):
+                    return json_response(self, {"error": "PO access required."}, 403)
+                po_id = parsed.path.split("/")[-2]
+                with db() as con:
+                    po = con.execute("SELECT * FROM purchase_orders WHERE id = ?", (po_id,)).fetchone()
+                    if not po:
+                        return json_response(self, {"error": "PO not found."}, 404)
+                    if is_field_po_only(user) and po["requested_by_user_id"] != user["id"]:
+                        return json_response(self, {"error": "PO not found."}, 404)
+                    if po["status"] == "Void":
+                        return json_response(self, {"error": "Cannot upload to a void PO."}, 400)
+                    form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": self.headers.get("Content-Type")})
+                    file_item = form["pickup_file"] if "pickup_file" in form else None
+                    if file_item is None or not getattr(file_item, "filename", ""):
+                        return json_response(self, {"error": "Choose a pickup ticket photo or PDF."}, 400)
+                    safe_name = Path(file_item.filename).name
+                    suffix = Path(safe_name).suffix.lower()
+                    if suffix not in (".pdf", ".png", ".jpg", ".jpeg", ".webp"):
+                        return json_response(self, {"error": "Pickup ticket must be a PDF or image."}, 400)
+                    saved_name = f"{datetime.now().strftime('%Y%m%d%H%M%S')}-pickup-{safe_name}"
+                    path = UPLOAD_DIR / saved_name
+                    with open(path, "wb") as f:
+                        f.write(file_item.file.read())
+                    con.execute(
+                        "UPDATE purchase_orders SET pickup_file = ?, updated_at = ? WHERE id = ?",
+                        (saved_name, datetime.now().isoformat(timespec="seconds"), po_id),
+                    )
+                return json_response(self, {"ok": True, "pickup_file": saved_name})
             if not require_editor(self):
                 return json_response(self, {"error": "Read-only users cannot make changes."}, 403)
+            if parsed.path == "/api/fieldwise-audit":
+                form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": self.headers.get("Content-Type")})
+                file_item = form["file"] if "file" in form else None
+                if file_item is None or not getattr(file_item, "filename", ""):
+                    return json_response(self, {"error": "Choose a Field Wise ticket export."}, 400)
+                safe_name = Path(file_item.filename).name
+                if Path(safe_name).suffix.lower() not in (".xlsx", ".xlsm"):
+                    return json_response(self, {"error": "Field Wise audit export must be an Excel file."}, 400)
+                path = UPLOAD_DIR / f"{datetime.now().strftime('%Y%m%d%H%M%S')}-audit-{safe_name}"
+                with open(path, "wb") as f:
+                    f.write(file_item.file.read())
+                try:
+                    result = fieldwise_audit_result(path)
+                finally:
+                    try:
+                        path.unlink()
+                    except Exception:
+                        pass
+                return json_response(self, result)
             if parsed.path == "/api/import-fieldwise":
                 form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": self.headers.get("Content-Type")})
                 project_id = form.getvalue("project_id")
@@ -6512,21 +7809,26 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     return json_response(self, {"id": cur.lastrowid, "code": new_code})
             if parsed.path == "/api/change-orders":
-                new_id = execute(
-                    "INSERT INTO change_orders (project_id, subproject_id, co_number, job_number, order_type, pricing_type, title, status, quoted_value, approved_value) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        data.get("project_id"),
-                        data.get("subproject_id") or None,
-                        data.get("co_number"),
-                        data.get("job_number"),
-                        clean_order_type(data.get("order_type")),
-                        data.get("pricing_type") or "Fixed",
-                        data.get("title"),
-                        data.get("status"),
-                        money(data.get("quoted_value")),
-                        0 if data.get("pricing_type") == "T&M" else money(data.get("approved_value")),
-                    ),
-                )
+                with db() as con:
+                    duplicate_message = duplicate_job_order_message(con, data.get("project_id"), data.get("job_number"))
+                    if duplicate_message:
+                        return json_response(self, {"error": duplicate_message}, 400)
+                    cur = con.execute(
+                        "INSERT INTO change_orders (project_id, subproject_id, co_number, job_number, order_type, pricing_type, title, status, quoted_value, approved_value) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            data.get("project_id"),
+                            data.get("subproject_id") or None,
+                            data.get("co_number"),
+                            data.get("job_number"),
+                            clean_order_type(data.get("order_type")),
+                            data.get("pricing_type") or "Fixed",
+                            data.get("title"),
+                            data.get("status"),
+                            money(data.get("quoted_value")),
+                            0 if data.get("pricing_type") == "T&M" else money(data.get("approved_value")),
+                        ),
+                    )
+                    new_id = cur.lastrowid
                 return json_response(self, {"id": new_id})
             if parsed.path.startswith("/api/change-orders/") and parsed.path.endswith("/copy"):
                 change_order_id = parsed.path.split("/")[-2]
@@ -6551,6 +7853,9 @@ class Handler(BaseHTTPRequestHandler):
                     ).fetchone()
                     if duplicate:
                         return json_response(self, {"error": "A change order with that CO number already exists for the selected subproject."}, 400)
+                    duplicate_job = duplicate_job_order_message(con, original["project_id"], new_job_number)
+                    if duplicate_job:
+                        return json_response(self, {"error": duplicate_job}, 400)
                     pricing_type = data.get("pricing_type") or original["pricing_type"] or "Fixed"
                     cur = con.execute(
                         """
@@ -6824,6 +8129,53 @@ class Handler(BaseHTTPRequestHandler):
                 if "active" in data:
                     execute("UPDATE users SET active = ? WHERE id = ?", (1 if str(data.get("active")) == "1" else 0, user_id))
                 return json_response(self, {"ok": True})
+            if parsed.path.startswith("/api/purchase-orders/"):
+                po_id = parsed.path.rsplit("/", 1)[-1]
+                status = str(data.get("status") or "Pending Review").strip()
+                if status not in ("Pending Review", "Issued", "Received", "Closed", "Void"):
+                    return json_response(self, {"error": "Choose a valid PO status."}, 400)
+                vendor = str(data.get("vendor") or "").strip()
+                description = str(data.get("description") or "").strip()
+                if not vendor:
+                    return json_response(self, {"error": "Vendor is required."}, 400)
+                if not description:
+                    return json_response(self, {"error": "Details are required."}, 400)
+                with db() as con:
+                    job_ref = job_reference_for_po(con, data.get("job_key"))
+                    if not job_ref:
+                        return json_response(self, {"error": "Choose a valid job/order number."}, 400)
+                    updated = con.execute(
+                        """
+                        UPDATE purchase_orders
+                        SET project_id = ?,
+                            subproject_id = ?,
+                            change_order_id = ?,
+                            job_number = ?,
+                            job_label = ?,
+                            vendor = ?,
+                            description = ?,
+                            estimated_amount = ?,
+                            status = ?,
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            job_ref["project_id"],
+                            job_ref["subproject_id"],
+                            job_ref["change_order_id"],
+                            job_ref["job_number"],
+                            job_ref["job_label"],
+                            vendor,
+                            description,
+                            money(data.get("estimated_amount")),
+                            status,
+                            datetime.now().isoformat(timespec="seconds"),
+                            po_id,
+                        ),
+                    ).rowcount
+                    if not updated:
+                        return json_response(self, {"error": "PO not found."}, 404)
+                return json_response(self, {"ok": True})
             if parsed.path.startswith("/api/cost-records/"):
                 record_id = parsed.path.rsplit("/", 1)[-1]
                 cost_type = data.get("cost_type") or None
@@ -6987,45 +8339,52 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path.startswith("/api/change-orders/"):
                 change_order_id = parsed.path.rsplit("/", 1)[-1]
                 pricing_type = data.get("pricing_type") or "Fixed"
-                execute(
-                    """
-                    UPDATE change_orders
-                    SET subproject_id = ?, order_type = ?, co_number = ?, job_number = ?, pricing_type = ?, title = ?, status = ?, quoted_value = ?, approved_value = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        data.get("subproject_id") or None,
-                        clean_order_type(data.get("order_type")),
-                        data.get("co_number"),
-                        data.get("job_number"),
-                        pricing_type,
-                        data.get("title"),
-                        data.get("status") or "Pending",
-                        money(data.get("quoted_value")),
-                        0 if pricing_type == "T&M" else money(data.get("approved_value")),
-                        change_order_id,
-                    ),
-                )
-                execute(
-                    """
-                    UPDATE cost_records
-                    SET subproject_id = ?,
-                        amount = CASE
-                          WHEN cost_type = 'Field Ticket Material' THEN COALESCE(sales_amount, 0) * ?
-                          ELSE amount
-                        END,
-                        raw_rate = CASE
-                          WHEN cost_type = 'Field Ticket Material' THEN COALESCE(sales_rate, rate, 0) * ?
-                          ELSE raw_rate
-                        END,
-                        raw_cost_source = CASE
-                          WHEN cost_type = 'Field Ticket Material' THEN 'CO T&M material estimate at 35% margin'
-                          ELSE raw_cost_source
-                        END
-                    WHERE change_order_id = ?
-                    """,
-                    (data.get("subproject_id") or None, CO_MATERIAL_COST_FACTOR, CO_MATERIAL_COST_FACTOR, change_order_id),
-                )
+                with db() as con:
+                    change_order = con.execute("SELECT project_id FROM change_orders WHERE id = ?", (change_order_id,)).fetchone()
+                    if not change_order:
+                        return json_response(self, {"error": "Change order not found."}, 404)
+                    duplicate_message = duplicate_job_order_message(con, change_order["project_id"], data.get("job_number"), change_order_id)
+                    if duplicate_message:
+                        return json_response(self, {"error": duplicate_message}, 400)
+                    con.execute(
+                        """
+                        UPDATE change_orders
+                        SET subproject_id = ?, order_type = ?, co_number = ?, job_number = ?, pricing_type = ?, title = ?, status = ?, quoted_value = ?, approved_value = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            data.get("subproject_id") or None,
+                            clean_order_type(data.get("order_type")),
+                            data.get("co_number"),
+                            data.get("job_number"),
+                            pricing_type,
+                            data.get("title"),
+                            data.get("status") or "Pending",
+                            money(data.get("quoted_value")),
+                            0 if pricing_type == "T&M" else money(data.get("approved_value")),
+                            change_order_id,
+                        ),
+                    )
+                    con.execute(
+                        """
+                        UPDATE cost_records
+                        SET subproject_id = ?,
+                            amount = CASE
+                              WHEN cost_type = 'Field Ticket Material' THEN COALESCE(sales_amount, 0) * ?
+                              ELSE amount
+                            END,
+                            raw_rate = CASE
+                              WHEN cost_type = 'Field Ticket Material' THEN COALESCE(sales_rate, rate, 0) * ?
+                              ELSE raw_rate
+                            END,
+                            raw_cost_source = CASE
+                              WHEN cost_type = 'Field Ticket Material' THEN 'CO T&M material estimate at 35% margin'
+                              ELSE raw_cost_source
+                            END
+                        WHERE change_order_id = ?
+                        """,
+                        (data.get("subproject_id") or None, CO_MATERIAL_COST_FACTOR, CO_MATERIAL_COST_FACTOR, change_order_id),
+                    )
                 return json_response(self, {"ok": True})
             if parsed.path.startswith("/api/customer-invoices/"):
                 invoice_id = parsed.path.rsplit("/", 1)[-1]
