@@ -632,6 +632,19 @@ def init_db():
               created_at TEXT NOT NULL,
               updated_at TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS fieldwise_audit_omissions (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              ticket_number TEXT NOT NULL,
+              order_number TEXT NOT NULL,
+              customer TEXT,
+              project_name TEXT,
+              reason TEXT,
+              omitted_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+              omitted_by_username TEXT,
+              created_at TEXT NOT NULL,
+              UNIQUE(ticket_number, order_number)
+            );
             """
         )
         existing_cols = [r["name"] for r in con.execute("PRAGMA table_info(subprojects)").fetchall()]
@@ -1007,6 +1020,13 @@ def fieldwise_audit_result(path):
     export = parse_fieldwise_audit_export(path)
     export_tickets = export.get("tickets", {})
     with db() as con:
+        omission_rows = con.execute(
+            """
+            SELECT *
+            FROM fieldwise_audit_omissions
+            ORDER BY created_at DESC, ticket_number
+            """
+        ).fetchall()
         tracked_rows = con.execute(
             """
             SELECT
@@ -1051,6 +1071,7 @@ def fieldwise_audit_result(path):
             """
         ).fetchall()
 
+    omissions_by_key = {f"{str(r['ticket_number'] or '').strip()}|{str(r['order_number'] or '').strip()}": dict(r) for r in omission_rows}
     imported_by_key = {}
     for row in imported_rows:
         ticket_number = str(row["ticket_or_invoice"] or "").strip()
@@ -1064,6 +1085,7 @@ def fieldwise_audit_result(path):
     mismatches = []
     untracked = []
     no_order = []
+    omitted = []
     for key, ticket in export_tickets.items():
         order_number = str(ticket["order_number"] or "").strip()
         if not order_number:
@@ -1076,7 +1098,11 @@ def fieldwise_audit_result(path):
         imported = imported_by_key.get(key)
         row = {**ticket, **job, "imported_total": money(imported["imported_sales_total"]) if imported else 0, "imported_line_count": imported["line_count"] if imported else 0}
         if not imported:
-            missing.append(row)
+            omission = omissions_by_key.get(key)
+            if omission:
+                omitted.append({**row, "omission_id": omission["id"], "omission_reason": omission["reason"] or "", "omitted_by_username": omission["omitted_by_username"] or "", "omitted_at": omission["created_at"] or ""})
+            else:
+                missing.append(row)
         else:
             matched.append(row)
             if abs(money(ticket["export_total"]) - money(imported["imported_sales_total"])) > 0.01:
@@ -1109,6 +1135,7 @@ def fieldwise_audit_result(path):
     matched.sort(key=sort_key)
     mismatches.sort(key=sort_key)
     extra.sort(key=sort_key)
+    omitted.sort(key=sort_key)
     untracked.sort(key=lambda r: (str(r.get("order_number") or ""), str(r.get("ticket_number") or "")))
     no_order.sort(key=lambda r: str(r.get("ticket_number") or ""))
     return {
@@ -1118,12 +1145,14 @@ def fieldwise_audit_result(path):
             "tracked_job_count": len(tracked_jobs),
             "matched_count": len(matched),
             "missing_count": len(missing),
+            "omitted_count": len(omitted),
             "mismatch_count": len(mismatches),
             "extra_imported_count": len(extra),
             "untracked_count": len(untracked),
             "no_order_count": len(no_order),
         },
         "missing": missing,
+        "omitted": omitted,
         "mismatches": mismatches,
         "extra_imported": extra,
         "untracked": untracked,
@@ -2359,7 +2388,8 @@ def extract_financial_pairs_from_pdf(path):
         cleaned = re.sub(r"\s+", " ", line).strip()
         match = re.search(r"(.+?)\s+(\(?\$?\s*-?[0-9][0-9,]*\.?[0-9]*\)?)$", cleaned)
         if match:
-            pairs.append((match.group(1).strip(), financial_amount(match.group(2))))
+            label = re.sub(r"\s+\(?\$?\s*-?[0-9][0-9,]*\.?[0-9]*\)?$", "", match.group(1).strip()).strip()
+            pairs.append((label, financial_amount(match.group(2))))
     return pairs
 
 
@@ -3382,9 +3412,13 @@ HTML = r"""
     .project-switcher { display: flex; align-items: center; gap: 10px; }
     .project-switcher label { color: #d8e6f3; margin: 0; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
     main { padding: 20px 24px 36px; max-width: 1500px; margin: 0 auto; }
-    nav { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+    nav { display: none; }
+    .section-nav { display: flex; align-items: flex-end; justify-content: flex-start; margin-bottom: 16px; }
+    .section-nav label { margin-top: 0; }
+    .section-nav select { width: min(330px, 100%); border: 1px solid var(--line); background: white; color: var(--ink); padding: 9px 10px; border-radius: 6px; cursor: pointer; font-weight: 650; transition: border-color .15s ease, box-shadow .15s ease, background-color .15s ease; }
+    .section-nav select:hover, .section-nav select:focus-visible { border-color: var(--blue); box-shadow: 0 8px 24px rgba(25, 99, 176, .12); outline: none; }
     nav button, .btn { border: 1px solid var(--line); background: white; color: var(--ink); padding: 9px 12px; border-radius: 6px; cursor: pointer; font-weight: 600; transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease, background-color .15s ease; }
-    nav button:hover, nav button:focus-visible, .btn:hover, .btn:focus-visible { border-color: var(--blue); box-shadow: 0 8px 24px rgba(25, 99, 176, .12); outline: none; transform: translateY(-1px); }
+    .btn:hover, .btn:focus-visible { border-color: var(--blue); box-shadow: 0 8px 24px rgba(25, 99, 176, .12); outline: none; transform: translateY(-1px); }
     nav button.active, .btn.primary { background: var(--blue); color: white; border-color: var(--blue); }
     .btn.danger { color: var(--red); border-color: #f0b8b2; }
     .btn.danger:hover, .btn.danger:focus-visible { border-color: var(--red); box-shadow: 0 8px 24px rgba(180, 35, 24, .12); }
@@ -3498,6 +3532,8 @@ HTML = r"""
     body.read-only [data-save-customer-invoice],
     body.read-only [data-allocate-invoice],
     body.read-only [data-delete-financial-report],
+    body.read-only [data-omit-fieldwise],
+    body.read-only [data-delete-audit-omission],
     body.read-only [data-save-office-po],
     body.read-only #addRate,
     body.read-only #importVendorInvoice { display: none !important; }
@@ -3581,6 +3617,7 @@ HTML = r"""
       .brand-lockup { min-width: 0; }
       header select { min-width: 0; width: 100%; }
       .project-switcher { width: 100%; align-items: stretch; flex-direction: column; }
+      .section-nav select { width: 100%; }
       .grid.cols-4, .grid.cols-2 { grid-template-columns: 1fr; }
       .project-banner { grid-template-columns: 1fr; }
       .cost-filter-bar { grid-template-columns: 1fr; }
@@ -3614,6 +3651,12 @@ HTML = r"""
     </div>
   </header>
   <main>
+    <div class="section-nav">
+      <div>
+        <label for="sectionNavSelect">Navigation</label>
+        <select id="sectionNavSelect"></select>
+      </div>
+    </div>
     <nav>
       <button data-tab="home" data-nav-area="home" class="active">Home</button>
       <button data-tab="dashboard" data-nav-area="project" class="hidden">Project Dashboard</button>
@@ -3903,6 +3946,7 @@ HTML = r"""
         <p id="fieldWiseAuditResult" class="muted"></p>
         <div id="fieldWiseAuditSummary" class="grid cols-4" style="margin-top:12px"></div>
         <div id="fieldWiseAuditTables" style="margin-top:12px"></div>
+        <div id="fieldWiseAuditOmissions" style="margin-top:12px"></div>
       </form>
       <div class="panel" style="margin-top:14px">
         <h2>Imported Files</h2>
@@ -4213,6 +4257,7 @@ HTML = r"""
     let officePoRows = [];
     let projectPoRows = [];
     let fieldWiseAuditData = null;
+    let fieldWiseAuditOmissions = [];
     const collapsedHierarchyNodes = new Set();
     const initializedHierarchyNodes = new Set();
     const money = v => Number(v || 0).toLocaleString(undefined, { style: 'currency', currency: 'USD' });
@@ -4259,7 +4304,7 @@ HTML = r"""
     };
     const markUnsaved = event => {
       if (isTemporaryViewControl(event.target)) return;
-      if (event.target.matches('input, textarea, select') && event.target.type !== 'file' && event.target.id !== 'projectSelect') {
+      if (event.target.matches('input, textarea, select') && event.target.type !== 'file' && !['projectSelect', 'sectionNavSelect'].includes(event.target.id)) {
         hasUnsavedChanges = true;
       }
     };
@@ -4359,21 +4404,49 @@ HTML = r"""
       if (event.key === 'Escape') closeCopyChangeOrderModal();
     });
 
-    document.querySelectorAll('nav button').forEach(btn => btn.addEventListener('click', async () => {
-      if (!(await confirmDiscard())) return;
-      openTab(btn.dataset.tab);
-    }));
-
-    function updateNavForTab(tabName) {
+    function navOptionsForTab(tabName) {
       const projectTabs = ['dashboard','setup','import','review','invoices','billing','projectPo'];
       const inProjectArea = projectTabs.includes(tabName);
-      document.querySelectorAll('nav button').forEach(btn => {
-        const area = btn.dataset.navArea || '';
-        let shouldHide = (area === 'project' && !inProjectArea) || (area === 'texas' && tabName !== 'texasOps');
-        if (isTexasReadOnly()) shouldHide = btn.dataset.tab !== 'texasOps';
-        btn.classList.toggle('hidden', shouldHide);
-      });
+      if (isTexasReadOnly()) return [{ tab: 'texasOps', label: 'Texas Ops' }];
+      if (isFieldPoOnly()) return [{ tab: 'fieldPo', label: 'Create PO' }];
+      const homeOptions = [
+        { tab: 'home', label: 'Home' },
+        { tab: 'dashboard', label: 'Project Dashboard' },
+        { tab: 'bids', label: 'Bid Tracking' },
+        { tab: 'texasOps', label: 'Texas Ops' },
+        { tab: 'jobOrderReport', label: 'Job Order Quick Reference' },
+        { tab: 'archivedProjects', label: 'Archived Projects' }
+      ];
+      const projectOptions = [
+        { tab: 'home', label: 'Home' },
+        { tab: 'dashboard', label: 'Project Dashboard' },
+        { tab: 'setup', label: 'Setup' },
+        { tab: 'import', label: 'Field Wise' },
+        { tab: 'review', label: 'Review Exceptions' },
+        { tab: 'invoices', label: 'Vendor Invoices' },
+        { tab: 'billing', label: 'Customer Billing' }
+      ];
+      if (PO_FEATURE_ENABLED) projectOptions.push({ tab: 'projectPo', label: 'POs' });
+      if (tabName === 'admin') return [{ tab: 'home', label: 'Home' }, { tab: 'admin', label: 'Admin' }];
+      const options = inProjectArea ? projectOptions : homeOptions;
+      return options;
     }
+
+    function updateNavForTab(tabName) {
+      document.querySelectorAll('nav button').forEach(btn => btn.classList.toggle('hidden', !navOptionsForTab(tabName).some(option => option.tab === btn.dataset.tab)));
+      const select = document.getElementById('sectionNavSelect');
+      const options = navOptionsForTab(tabName);
+      select.innerHTML = options.map(option => `<option value="${htmlEscape(option.tab)}">${htmlEscape(option.label)}</option>`).join('');
+      select.value = tabName;
+    }
+
+    document.getElementById('sectionNavSelect').onchange = async event => {
+      if (!(await confirmDiscard())) {
+        event.target.value = document.querySelector('.tab:not(.hidden)')?.id || 'home';
+        return;
+      }
+      openTab(event.target.value);
+    };
 
     async function openTab(tabName) {
       if (isTexasReadOnly() && tabName !== 'texasOps') tabName = 'texasOps';
@@ -4388,7 +4461,7 @@ HTML = r"""
       document.getElementById(tabName).classList.remove('hidden');
       if (tabName === 'dashboard') refreshOpenDetails();
       if (tabName === 'review') loadCosts();
-      if (tabName === 'import') { loadImportHistory(); loadFieldTicketLines(); }
+      if (tabName === 'import') { loadImportHistory(); loadFieldTicketLines(); loadFieldWiseAuditOmissions(); }
       if (tabName === 'invoices') { loadVendorInvoiceLines(); loadVendorAllocationHistory(); }
       if (tabName === 'billing') loadCustomerInvoices();
       if (tabName === 'projectPo') loadProjectPos();
@@ -4761,6 +4834,7 @@ HTML = r"""
         refresh();
       };
       await refresh();
+      updateNavForTab(document.querySelector('.tab:not(.hidden)')?.id || 'home');
     }
 
     async function loadArchivedProjects() {
@@ -5370,12 +5444,14 @@ HTML = r"""
       return `<table><thead><tr>${headers.map(h => `<th>${h}</th>`).join('')}</tr></thead><tbody>${data.map(r => `<tr>${r.map(c => `<td>${c}</td>`).join('')}</tr>`).join('')}</tbody></table>`;
     }
 
-    function fieldWiseAuditRowsTable(title, rows, emptyText) {
+    function fieldWiseAuditRowsTable(title, rows, emptyText, options={}) {
       const shown = rows.slice(0, 250);
+      const showOmitAction = Boolean(options.showOmitAction);
+      const actionHeader = showOmitAction ? '<th>Action</th>' : '';
       return `<div class="panel" style="margin-top:14px">
         <h2>${htmlEscape(title)}</h2>
         <div class="muted">${rows.length} item(s)${rows.length > shown.length ? `, showing first ${shown.length}` : ''}</div>
-        <div class="table-wrap" style="margin-top:10px"><table>${shown.length ? `<thead><tr><th>Ticket</th><th>Order #</th><th>Customer</th><th>Project</th><th>Type</th><th>Status</th><th>Date</th><th>Export Total</th><th>Imported Total</th><th>Lines</th></tr></thead><tbody>${shown.map(r => `
+        <div class="table-wrap" style="margin-top:10px"><table>${shown.length ? `<thead><tr><th>Ticket</th><th>Order #</th><th>Customer</th><th>Project</th><th>Type</th><th>Status</th><th>Date</th><th>Export Total</th><th>Imported Total</th><th>Lines</th>${actionHeader}</tr></thead><tbody>${shown.map(r => `
           <tr>
             <td><strong>${htmlEscape(r.ticket_number || '')}</strong></td>
             <td>${htmlEscape(r.order_number || '')}</td>
@@ -5387,8 +5463,64 @@ HTML = r"""
             <td>${money(r.export_total || 0)}</td>
             <td>${money(r.imported_total || 0)}</td>
             <td>${Number(r.line_count || 0)}</td>
+            ${showOmitAction ? `<td><button class="btn" type="button" data-omit-fieldwise="${htmlEscape(r.ticket_number || '')}" data-order-number="${htmlEscape(r.order_number || '')}" data-customer="${htmlEscape(r.customer || '')}" data-project-name="${htmlEscape(r.project_name || '')}">Mark OK</button></td>` : ''}
           </tr>`).join('')}</tbody>` : `<tbody><tr><td>${htmlEscape(emptyText)}</td></tr></tbody>`}</table></div>
       </div>`;
+    }
+
+    function renderFieldWiseAuditOmissions() {
+      const el = document.getElementById('fieldWiseAuditOmissions');
+      if (!el) return;
+      const rows = fieldWiseAuditOmissions || [];
+      el.innerHTML = `<div class="panel">
+        <h2>Tickets Marked OK To Omit</h2>
+        <p class="muted">These ticket/order combinations will not show as missing in future audits.</p>
+        <div class="table-wrap" style="margin-top:10px"><table>${rows.length ? `<thead><tr><th>Ticket</th><th>Order #</th><th>Customer</th><th>Project</th><th>Reason</th><th>Marked By</th><th>Date</th><th></th></tr></thead><tbody>${rows.map(r => `
+          <tr>
+            <td><strong>${htmlEscape(r.ticket_number || '')}</strong></td>
+            <td>${htmlEscape(r.order_number || '')}</td>
+            <td>${htmlEscape(r.customer || '')}</td>
+            <td>${htmlEscape(r.project_name || '')}</td>
+            <td>${htmlEscape(r.reason || '')}</td>
+            <td>${htmlEscape(r.omitted_by_username || '')}</td>
+            <td>${htmlEscape((r.created_at || '').replace('T', ' '))}</td>
+            <td><button class="btn danger" type="button" data-delete-audit-omission="${r.id}">Remove</button></td>
+          </tr>`).join('')}</tbody>` : '<tbody><tr><td>No tickets have been marked OK to omit yet.</td></tr></tbody>'}</table></div>
+      </div>`;
+      document.querySelectorAll('[data-delete-audit-omission]').forEach(btn => btn.onclick = async () => {
+        if (!window.confirm('Remove this OK-to-omit note? The ticket can show as missing again on future audits.')) return;
+        await api(`/api/fieldwise-audit-omissions/${btn.dataset.deleteAuditOmission}`, { method: 'DELETE' });
+        await loadFieldWiseAuditOmissions();
+      });
+    }
+
+    async function loadFieldWiseAuditOmissions() {
+      fieldWiseAuditOmissions = await api('/api/fieldwise-audit-omissions');
+      renderFieldWiseAuditOmissions();
+    }
+
+    async function markFieldWiseTicketOmitted(row) {
+      const reason = window.prompt(`Why is Field Wise ticket ${row.ticket_number} / order ${row.order_number} OK to omit?`, 'Valid Field Wise ticket, not required in this tracker');
+      if (reason === null) return;
+      await api('/api/fieldwise-audit-omissions', {
+        method: 'POST',
+        body: JSON.stringify({
+          ticket_number: row.ticket_number,
+          order_number: row.order_number,
+          customer: row.customer,
+          project_name: row.project_name,
+          reason
+        })
+      });
+      if (fieldWiseAuditData?.missing) {
+        fieldWiseAuditData.missing = fieldWiseAuditData.missing.filter(r => !(String(r.ticket_number || '') === String(row.ticket_number || '') && String(r.order_number || '') === String(row.order_number || '')));
+        if (fieldWiseAuditData.summary) {
+          fieldWiseAuditData.summary.missing_count = Math.max(0, Number(fieldWiseAuditData.summary.missing_count || 0) - 1);
+          fieldWiseAuditData.summary.omitted_count = Number(fieldWiseAuditData.summary.omitted_count || 0) + 1;
+        }
+        renderFieldWiseAudit();
+      }
+      await loadFieldWiseAuditOmissions();
     }
 
     function renderFieldWiseAudit() {
@@ -5406,12 +5538,14 @@ HTML = r"""
       summaryEl.innerHTML = [
         ['Export Tickets', s.export_ticket_count || 0, `${s.export_line_count || 0} line(s)`],
         ['Missing Tracked', s.missing_count || 0, 'Export has it, app does not'],
+        ['Marked OK', s.omitted_count || 0, 'Hidden from missing list'],
         ['Total Mismatches', s.mismatch_count || 0, 'Same ticket/order, different total'],
         ['Untracked / No Order', Number(s.untracked_count || 0) + Number(s.no_order_count || 0), 'Can be omitted']
       ].map(([label, value, hint]) => `<div class="kpi"><div class="label">${htmlEscape(label)}</div><div class="value">${value}</div><div class="hint">${htmlEscape(hint)}</div></div>`).join('');
       const omitUntracked = document.getElementById('omitUntrackedAuditTickets').checked;
       const parts = [
-        fieldWiseAuditRowsTable('Missing Tickets For Tracked Jobs', result.missing || [], 'No missing tracked tickets found.'),
+        fieldWiseAuditRowsTable('Missing Tickets For Tracked Jobs', result.missing || [], 'No missing tracked tickets found.', { showOmitAction: true }),
+        fieldWiseAuditRowsTable('Marked OK To Omit In This Export', result.omitted || [], 'No previously omitted tickets were found in this export.'),
         fieldWiseAuditRowsTable('Imported Here But Not In This Export', result.extra_imported || [], 'No extra imported tickets found.'),
         fieldWiseAuditRowsTable('Total Mismatches', result.mismatches || [], 'No total mismatches found.')
       ];
@@ -5420,6 +5554,11 @@ HTML = r"""
         parts.push(fieldWiseAuditRowsTable('Tickets With Blank Order Number', result.no_order || [], 'No blank order-number tickets found.'));
       }
       tablesEl.innerHTML = parts.join('');
+      document.querySelectorAll('[data-omit-fieldwise]').forEach(btn => btn.onclick = async () => {
+        const row = (fieldWiseAuditData?.missing || []).find(r => String(r.ticket_number || '') === String(btn.dataset.omitFieldwise || '') && String(r.order_number || '') === String(btn.dataset.orderNumber || ''));
+        if (!row) return;
+        await markFieldWiseTicketOmitted(row);
+      });
       exportBtn.disabled = !(result.missing || []).length;
     }
 
@@ -7234,6 +7373,17 @@ class Handler(BaseHTTPRequestHandler):
                         """
                     ),
                 )
+            if parsed.path == "/api/fieldwise-audit-omissions":
+                return json_response(
+                    self,
+                    rows(
+                        """
+                        SELECT *
+                        FROM fieldwise_audit_omissions
+                        ORDER BY created_at DESC, ticket_number, order_number
+                        """
+                    ),
+                )
             if parsed.path == "/api/projects":
                 status_filter = (qs.get("status", ["active"])[0] or "active").lower()
                 if status_filter == "all":
@@ -7521,6 +7671,43 @@ class Handler(BaseHTTPRequestHandler):
                 return json_response(self, {"ok": True, "pickup_file": saved_name})
             if not require_editor(self):
                 return json_response(self, {"error": "Read-only users cannot make changes."}, 403)
+            if parsed.path == "/api/fieldwise-audit-omissions":
+                user = current_user(self)
+                data = parse_json(self)
+                ticket_number = str(data.get("ticket_number") or "").strip()
+                order_number = str(data.get("order_number") or "").strip()
+                if not ticket_number:
+                    return json_response(self, {"error": "Ticket number is required."}, 400)
+                if not order_number:
+                    return json_response(self, {"error": "Order number is required."}, 400)
+                with db() as con:
+                    con.execute(
+                        """
+                        INSERT INTO fieldwise_audit_omissions (
+                          ticket_number, order_number, customer, project_name, reason,
+                          omitted_by_user_id, omitted_by_username, created_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(ticket_number, order_number) DO UPDATE SET
+                          customer = excluded.customer,
+                          project_name = excluded.project_name,
+                          reason = excluded.reason,
+                          omitted_by_user_id = excluded.omitted_by_user_id,
+                          omitted_by_username = excluded.omitted_by_username,
+                          created_at = excluded.created_at
+                        """,
+                        (
+                            ticket_number,
+                            order_number,
+                            str(data.get("customer") or "").strip(),
+                            str(data.get("project_name") or "").strip(),
+                            str(data.get("reason") or "").strip(),
+                            user["id"],
+                            user["username"],
+                            datetime.now().isoformat(timespec="seconds"),
+                        ),
+                    )
+                return json_response(self, {"ok": True})
             if parsed.path == "/api/fieldwise-audit":
                 form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": self.headers.get("Content-Type")})
                 file_item = form["file"] if "file" in form else None
@@ -8431,6 +8618,13 @@ class Handler(BaseHTTPRequestHandler):
                 return json_response(self, {"error": "Login required"}, 401)
             if not require_editor(self):
                 return json_response(self, {"error": "Read-only users cannot make changes."}, 403)
+            if parsed.path.startswith("/api/fieldwise-audit-omissions/"):
+                omission_id = parsed.path.rsplit("/", 1)[-1]
+                with db() as con:
+                    deleted = con.execute("DELETE FROM fieldwise_audit_omissions WHERE id = ?", (omission_id,)).rowcount
+                if not deleted:
+                    return json_response(self, {"error": "Omission note not found."}, 404)
+                return json_response(self, {"ok": True})
             if parsed.path.startswith("/api/subprojects/"):
                 subproject_id = parsed.path.rsplit("/", 1)[-1]
                 with db() as con:
