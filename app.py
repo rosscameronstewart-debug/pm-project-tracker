@@ -1082,7 +1082,6 @@ def fieldwise_audit_result(path):
 
     missing = []
     matched = []
-    mismatches = []
     untracked = []
     no_order = []
     omitted = []
@@ -1105,8 +1104,6 @@ def fieldwise_audit_result(path):
                 missing.append(row)
         else:
             matched.append(row)
-            if abs(money(ticket["export_total"]) - money(imported["imported_sales_total"])) > 0.01:
-                mismatches.append(row)
 
     extra = []
     for key, imported in imported_by_key.items():
@@ -1133,7 +1130,6 @@ def fieldwise_audit_result(path):
     sort_key = lambda r: (str(r.get("project_name") or ""), str(r.get("order_number") or ""), str(r.get("ticket_number") or ""))
     missing.sort(key=sort_key)
     matched.sort(key=sort_key)
-    mismatches.sort(key=sort_key)
     extra.sort(key=sort_key)
     omitted.sort(key=sort_key)
     untracked.sort(key=lambda r: (str(r.get("order_number") or ""), str(r.get("ticket_number") or "")))
@@ -1146,14 +1142,12 @@ def fieldwise_audit_result(path):
             "matched_count": len(matched),
             "missing_count": len(missing),
             "omitted_count": len(omitted),
-            "mismatch_count": len(mismatches),
             "extra_imported_count": len(extra),
             "untracked_count": len(untracked),
             "no_order_count": len(no_order),
         },
         "missing": missing,
         "omitted": omitted,
-        "mismatches": mismatches,
         "extra_imported": extra,
         "untracked": untracked,
         "no_order": no_order,
@@ -2481,6 +2475,23 @@ def texas_financial_summary():
     history = {}
     for metric in metrics:
         history.setdefault(metric["metric_key"], []).append({"report_date": metric["report_date"], "amount": metric["amount"]})
+    by_date = {}
+    for metric in metrics:
+        bucket = by_date.setdefault(metric["report_date"], {})
+        bucket[metric["metric_key"]] = money(metric["amount"])
+    working_capital_history = []
+    current_ratio_history = []
+    for report_date, metric_set in by_date.items():
+        if "current_assets" in metric_set and "current_liabilities" in metric_set:
+            current_assets_for_date = metric_set["current_assets"]
+            current_liabilities_for_date = metric_set["current_liabilities"]
+            working_capital_history.append({"report_date": report_date, "amount": current_assets_for_date - current_liabilities_for_date})
+            if current_liabilities_for_date:
+                current_ratio_history.append({"report_date": report_date, "amount": current_assets_for_date / current_liabilities_for_date})
+    if working_capital_history:
+        history["working_capital"] = sorted(working_capital_history, key=lambda p: p["report_date"])
+    if current_ratio_history:
+        history["current_ratio"] = sorted(current_ratio_history, key=lambda p: p["report_date"])
     reports_by_week = {}
     for report in reports:
         date = report["report_date"] or ""
@@ -3563,6 +3574,10 @@ HTML = r"""
     .selectable-row { cursor: pointer; }
     .selectable-row.selected { background: #eef5ff; }
     .selectable-row.selected td { font-weight: 700; }
+    .trend-metric-row { cursor: pointer; transition: background-color .15s ease, box-shadow .15s ease; }
+    .trend-metric-row:hover,
+    .trend-metric-row:focus-within { background: #eef5ff; box-shadow: inset 4px 0 0 var(--blue); }
+    .trend-metric-row td:first-child::after { content: "View trend"; display: block; margin-top: 2px; color: var(--muted); font-size: 11px; font-weight: 650; }
     .invoice-detail { background: #ffffff; }
     .invoice-detail td:first-child { padding-left: 34px; }
     .invoice-toggle { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; margin-right: 8px; border: 1px solid var(--line); border-radius: 6px; background: white; color: var(--blue); font-weight: 800; }
@@ -3950,6 +3965,8 @@ HTML = r"""
       </form>
       <div class="panel" style="margin-top:14px">
         <h2>Imported Files</h2>
+        <div id="importHistoryFilters" class="cost-filter" style="margin-bottom:10px"></div>
+        <div class="muted" id="importHistoryCount" style="margin-bottom:8px"></div>
         <div class="table-wrap"><table id="importHistoryTable"></table></div>
       </div>
       <div class="panel" style="margin-top:14px">
@@ -4619,6 +4636,44 @@ HTML = r"""
       return points.map((p, i) => `${i ? 'L' : 'M'} ${xFor(p)} ${yFor(p)}`).join(' ');
     }
 
+    function metricTrendValue(metricKey, value) {
+      return metricKey === 'current_ratio' ? Number(value || 0).toFixed(2) : money(value);
+    }
+
+    function singleMetricTrendGraph(points, metricKey, label, range=financialTrendRange(), options={}) {
+      const metricPoints = dateRangePoints(points || [], range);
+      if (!metricPoints.length) return `<div class="muted">No ${htmlEscape(label)} history in ${htmlEscape(rangeLabel(range))}.</div>`;
+      const width = options.width || 1120;
+      const height = options.height || 560;
+      const pad = options.pad || { left: metricKey === 'current_ratio' ? 70 : 92, right: 34, top: 30, bottom: 60 };
+      const dates = [...new Set(metricPoints.map(p => p.report_date))].sort();
+      const values = metricPoints.map(p => Number(p.amount || 0));
+      let min = Math.min(0, ...values);
+      let max = Math.max(0, ...values);
+      if (min === max) { min -= 1; max += 1; }
+      const plotW = width - pad.left - pad.right;
+      const plotH = height - pad.top - pad.bottom;
+      const xDate = d => pad.left + (dates.length === 1 ? plotW / 2 : dates.indexOf(d) / (dates.length - 1) * plotW);
+      const yVal = v => pad.top + (max - Number(v || 0)) / (max - min) * plotH;
+      const xFor = p => xDate(p.report_date);
+      const yFor = p => yVal(p.amount);
+      const zeroY = yVal(0);
+      const yTicks = [max, (max + min) / 2, min];
+      const dateLabels = dates.map(d => {
+        const date = new Date(`${d}T00:00:00`);
+        return Number.isNaN(date.getTime()) ? d : date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+      });
+      const circles = metricPoints.map(p => `<circle class="trend-point" cx="${xFor(p)}" cy="${yFor(p)}" r="5" fill="var(--blue)"><title>${p.report_date}: ${metricTrendValue(metricKey, p.amount)}</title></circle>`).join('');
+      return `<svg class="trend-chart trend-chart-large" viewBox="0 0 ${width} ${height}" role="img" aria-label="${htmlEscape(label)} trend graph">
+        ${yTicks.map(t => `<line class="trend-axis" x1="${pad.left}" x2="${width - pad.right}" y1="${yVal(t)}" y2="${yVal(t)}"></line><text class="trend-label" x="8" y="${yVal(t) + 4}">${htmlEscape(metricTrendValue(metricKey, t))}</text>`).join('')}
+        <line class="trend-axis" x1="${pad.left}" x2="${width - pad.right}" y1="${zeroY}" y2="${zeroY}"></line>
+        ${dates.map((d, i) => `<text class="trend-label" x="${xDate(d)}" y="${height - 18}" text-anchor="middle">${htmlEscape(dateLabels[i])}</text>`).join('')}
+        <path class="trend-line-revenue" d="${linePath(metricPoints, xFor, yFor)}"></path>
+        ${circles}
+      </svg>
+      <div class="trend-legend"><span><span class="trend-swatch" style="background:var(--blue)"></span>${htmlEscape(label)}</span><span>${htmlEscape(rangeLabel(range))}</span></div>`;
+    }
+
     function trendLineGraph(summary, range=financialTrendRange(), options={}) {
       const netPoints = dateRangePoints(summary.history?.net_income || [], range);
       const revenuePoints = dateRangePoints(summary.history?.revenue || [], range);
@@ -4710,6 +4765,14 @@ HTML = r"""
       modal.classList.remove('hidden');
     }
 
+    function openMetricTrendModal(summary, metricKey, label) {
+      const modal = document.getElementById('trendModal');
+      const range = financialTrendRange();
+      document.getElementById('trendModalSubtitle').textContent = `${label} / ${rangeLabel(range)}`;
+      document.getElementById('trendModalBody').innerHTML = singleMetricTrendGraph(summary.history?.[metricKey] || [], metricKey, label, range);
+      modal.classList.remove('hidden');
+    }
+
     function showFinancialDuplicateModal(duplicates) {
       if (!duplicates || !duplicates.length) return;
       document.getElementById('financialDuplicateList').innerHTML = plainTable(
@@ -4754,25 +4817,40 @@ HTML = r"""
       const cash = metricAmount(summary, 'cash');
       const workingCapital = metricAmount(summary, 'working_capital');
       const currentRatio = metricAmount(summary, 'current_ratio');
-      const financialRow = (label, value, helpText) => [label, `<span class="inline-help-cell">${value}${help(helpText)}</span>`];
+      const balanceRows = [
+        { key: 'cash', label: 'Cash', value: money(cash), helpText: 'Cash is pulled from the latest Balance Sheet cash or bank accounts line.' },
+        { key: 'accounts_receivable', label: 'Accounts Receivable', value: money(metricAmount(summary, 'accounts_receivable')), helpText: 'Accounts Receivable comes from the latest Balance Sheet AR line.' },
+        { key: 'accounts_payable', label: 'Accounts Payable', value: money(metricAmount(summary, 'accounts_payable')), helpText: 'Accounts Payable comes from the latest Balance Sheet AP line when present.' },
+        { key: 'current_assets', label: 'Current Assets', value: money(metricAmount(summary, 'current_assets')), helpText: 'Current Assets comes from the latest Balance Sheet total current assets line.' },
+        { key: 'current_liabilities', label: 'Current Liabilities', value: money(metricAmount(summary, 'current_liabilities')), helpText: 'Current Liabilities comes from the latest Balance Sheet total current liabilities line.' },
+        { key: 'working_capital', label: 'Working Capital', value: `<span class="${workingCapital >= 0 ? 'good' : 'bad'}">${money(workingCapital)}</span>`, helpText: 'Working Capital equals Current Assets minus Current Liabilities. It only calculates when both values come from the same report date.' },
+        { key: 'current_ratio', label: 'Current Ratio', value: currentRatio ? currentRatio.toFixed(2) : '', helpText: 'Current Ratio equals Current Assets divided by Current Liabilities. It only calculates when both values come from the same report date.' },
+        { key: 'total_assets', label: 'Total Assets', value: money(metricAmount(summary, 'total_assets')), helpText: 'Total Assets comes from the latest Balance Sheet total assets line.' },
+        { key: 'total_liabilities', label: 'Total Liabilities', value: money(metricAmount(summary, 'total_liabilities')), helpText: 'Total Liabilities comes from the latest Balance Sheet total liabilities line.' },
+        { key: 'equity', label: 'Equity', value: money(metricAmount(summary, 'equity')), helpText: 'Equity comes from the latest Balance Sheet equity or total equity line.' },
+      ];
       document.getElementById('financialKpis').innerHTML = `
         <div class="panel kpi help-card">${help('Revenue comes from the latest uploaded P&L report. The importer looks for Total Income, Total Revenue, Revenue, or Sales.')}<div class="label">Revenue</div><div class="value">${money(revenue)}</div><div class="hint">Latest P&L</div></div>
         <div class="panel kpi help-card">${help('Operating Expenses comes from the latest uploaded P&L report. The importer looks for Total Expenses or Operating Expenses.')}<div class="label">Operating Expenses</div><div class="value">${money(expenses)}</div><div class="hint">Latest P&L</div></div>
         <div class="panel kpi help-card">${help('Net Income comes from the latest uploaded P&L report. It is the report line for Net Income, Net Profit, or Net Earnings.')}<div class="label">Net Income</div><div class="value ${netIncome >= 0 ? 'good' : 'bad'}">${money(netIncome)}</div><div class="hint">Latest P&L</div></div>
         <div class="panel kpi help-card">${help('Cash comes from the latest uploaded Balance Sheet. The importer looks for Bank Accounts, Cash, Cash in Bank, or Cash and Cash Equivalents.')}<div class="label">Cash</div><div class="value">${money(cash)}</div><div class="hint">Latest balance sheet</div></div>`;
       renderProfitabilityTrend(summary, localStorage.getItem('financialTrendMode') || 'graph');
-      document.getElementById('financialBalanceSnapshot').innerHTML = plainTable(['Metric','Value'], [
-        financialRow('Cash', money(cash), 'Cash is pulled from the latest Balance Sheet cash or bank accounts line.'),
-        financialRow('Accounts Receivable', money(metricAmount(summary, 'accounts_receivable')), 'Accounts Receivable comes from the latest Balance Sheet AR line.'),
-        financialRow('Accounts Payable', money(metricAmount(summary, 'accounts_payable')), 'Accounts Payable comes from the latest Balance Sheet AP line when present.'),
-        financialRow('Current Assets', money(metricAmount(summary, 'current_assets')), 'Current Assets comes from the latest Balance Sheet total current assets line.'),
-        financialRow('Current Liabilities', money(metricAmount(summary, 'current_liabilities')), 'Current Liabilities comes from the latest Balance Sheet total current liabilities line.'),
-        financialRow('Working Capital', `<span class="${workingCapital >= 0 ? 'good' : 'bad'}">${money(workingCapital)}</span>`, 'Working Capital equals Current Assets minus Current Liabilities. It only calculates when both values come from the same report date.'),
-        financialRow('Current Ratio', currentRatio ? currentRatio.toFixed(2) : '', 'Current Ratio equals Current Assets divided by Current Liabilities. It only calculates when both values come from the same report date.'),
-        financialRow('Total Assets', money(metricAmount(summary, 'total_assets')), 'Total Assets comes from the latest Balance Sheet total assets line.'),
-        financialRow('Total Liabilities', money(metricAmount(summary, 'total_liabilities')), 'Total Liabilities comes from the latest Balance Sheet total liabilities line.'),
-        financialRow('Equity', money(metricAmount(summary, 'equity')), 'Equity comes from the latest Balance Sheet equity or total equity line.'),
-      ]);
+      document.getElementById('financialBalanceSnapshot').innerHTML = `<table><thead><tr><th>Metric</th><th>Value</th></tr></thead><tbody>${balanceRows.map(row => `
+        <tr class="trend-metric-row" data-financial-metric="${htmlEscape(row.key)}" data-financial-label="${htmlEscape(row.label)}" tabindex="0">
+          <td>${htmlEscape(row.label)}</td>
+          <td><span class="inline-help-cell">${row.value}${help(row.helpText)}</span></td>
+        </tr>`).join('')}</tbody></table>`;
+      document.querySelectorAll('[data-financial-metric]').forEach(row => {
+        row.onclick = event => {
+          if (event.target.closest('.help-marker')) return;
+          openMetricTrendModal(summary, row.dataset.financialMetric, row.dataset.financialLabel);
+        };
+        row.onkeydown = event => {
+          if (!['Enter', ' '].includes(event.key)) return;
+          event.preventDefault();
+          openMetricTrendModal(summary, row.dataset.financialMetric, row.dataset.financialLabel);
+        };
+      });
       document.getElementById('financialReports').innerHTML = renderFinancialReportHistory(summary);
       document.querySelectorAll('[data-delete-financial-report]').forEach(btn => btn.onclick = async () => {
         const report = summary.reports.find(r => String(r.id) === String(btn.dataset.deleteFinancialReport));
@@ -5451,7 +5529,7 @@ HTML = r"""
       return `<div class="panel" style="margin-top:14px">
         <h2>${htmlEscape(title)}</h2>
         <div class="muted">${rows.length} item(s)${rows.length > shown.length ? `, showing first ${shown.length}` : ''}</div>
-        <div class="table-wrap" style="margin-top:10px"><table>${shown.length ? `<thead><tr><th>Ticket</th><th>Order #</th><th>Customer</th><th>Project</th><th>Type</th><th>Status</th><th>Date</th><th>Export Total</th><th>Imported Total</th><th>Lines</th>${actionHeader}</tr></thead><tbody>${shown.map(r => `
+        <div class="table-wrap" style="margin-top:10px"><table>${shown.length ? `<thead><tr><th>Ticket</th><th>Order #</th><th>Customer</th><th>Project</th><th>Type</th><th>Status</th><th>Date</th><th>Lines</th>${actionHeader}</tr></thead><tbody>${shown.map(r => `
           <tr>
             <td><strong>${htmlEscape(r.ticket_number || '')}</strong></td>
             <td>${htmlEscape(r.order_number || '')}</td>
@@ -5460,8 +5538,6 @@ HTML = r"""
             <td>${htmlEscape(r.item_type || '')}</td>
             <td>${htmlEscape(r.status || '')}</td>
             <td>${htmlEscape(r.ticket_date || '')}</td>
-            <td>${money(r.export_total || 0)}</td>
-            <td>${money(r.imported_total || 0)}</td>
             <td>${Number(r.line_count || 0)}</td>
             ${showOmitAction ? `<td><button class="btn" type="button" data-omit-fieldwise="${htmlEscape(r.ticket_number || '')}" data-order-number="${htmlEscape(r.order_number || '')}" data-customer="${htmlEscape(r.customer || '')}" data-project-name="${htmlEscape(r.project_name || '')}">Mark OK</button></td>` : ''}
           </tr>`).join('')}</tbody>` : `<tbody><tr><td>${htmlEscape(emptyText)}</td></tr></tbody>`}</table></div>
@@ -5537,17 +5613,15 @@ HTML = r"""
       const s = result.summary || {};
       summaryEl.innerHTML = [
         ['Export Tickets', s.export_ticket_count || 0, `${s.export_line_count || 0} line(s)`],
-        ['Missing Tracked', s.missing_count || 0, 'Export has it, app does not'],
+        ['Missing Tracked', s.missing_count || 0, 'Ticket/order not found here'],
         ['Marked OK', s.omitted_count || 0, 'Hidden from missing list'],
-        ['Total Mismatches', s.mismatch_count || 0, 'Same ticket/order, different total'],
         ['Untracked / No Order', Number(s.untracked_count || 0) + Number(s.no_order_count || 0), 'Can be omitted']
       ].map(([label, value, hint]) => `<div class="kpi"><div class="label">${htmlEscape(label)}</div><div class="value">${value}</div><div class="hint">${htmlEscape(hint)}</div></div>`).join('');
       const omitUntracked = document.getElementById('omitUntrackedAuditTickets').checked;
       const parts = [
         fieldWiseAuditRowsTable('Missing Tickets For Tracked Jobs', result.missing || [], 'No missing tracked tickets found.', { showOmitAction: true }),
         fieldWiseAuditRowsTable('Marked OK To Omit In This Export', result.omitted || [], 'No previously omitted tickets were found in this export.'),
-        fieldWiseAuditRowsTable('Imported Here But Not In This Export', result.extra_imported || [], 'No extra imported tickets found.'),
-        fieldWiseAuditRowsTable('Total Mismatches', result.mismatches || [], 'No total mismatches found.')
+        fieldWiseAuditRowsTable('Imported Here But Not In This Export', result.extra_imported || [], 'No extra imported tickets found.')
       ];
       if (!omitUntracked) {
         parts.push(fieldWiseAuditRowsTable('Untracked Order Numbers', result.untracked || [], 'No untracked order-number tickets found.'));
@@ -5569,7 +5643,7 @@ HTML = r"""
 
     function downloadMissingTicketCsv() {
       if (!fieldWiseAuditData?.missing?.length) return;
-      const headers = ['Ticket Number','Order Number','Customer','Project','Type','Reference','Status','Ticket Date','Export Total','Imported Total','Line Count'];
+      const headers = ['Ticket Number','Order Number','Customer','Project','Type','Reference','Status','Ticket Date','Line Count'];
       const lines = [headers.map(csvCell).join(',')];
       fieldWiseAuditData.missing.forEach(r => {
         lines.push([
@@ -5581,8 +5655,6 @@ HTML = r"""
           r.reference_code,
           r.status,
           r.ticket_date,
-          Number(r.export_total || 0).toFixed(2),
-          Number(r.imported_total || 0).toFixed(2),
           r.line_count || 0
         ].map(csvCell).join(','));
       });
@@ -6675,29 +6747,66 @@ HTML = r"""
 
     async function loadImportHistory() {
       const tableEl = document.getElementById('importHistoryTable');
+      const filterEl = document.getElementById('importHistoryFilters');
+      const countEl = document.getElementById('importHistoryCount');
       if (!tableEl || !state.projectId) return;
       const imports = await api(`/api/imports?project_id=${state.projectId}`);
-      tableEl.innerHTML = `
-        <thead><tr><th>Source</th><th>File</th><th>Records</th><th>Sales</th><th>Raw Cost</th><th>Last Imported</th><th></th></tr></thead>
-        <tbody>${imports.map(row => `<tr>
-          <td>${row.source || ''}</td>
-          <td>${row.source_file || ''}</td>
-          <td>${row.record_count}</td>
-          <td>${money(row.sales_amount)}</td>
-          <td>${money(row.raw_amount)}</td>
-          <td>${row.last_imported || ''}</td>
-          <td><button class="btn" data-delete-import="${row.source_file}" data-source="${row.source}">Remove Import</button></td>
-        </tr>`).join('')}</tbody>`;
-      document.querySelectorAll('[data-delete-import]').forEach(btn => btn.onclick = async () => {
-        const file = btn.dataset.deleteImport;
-        const source = btn.dataset.source;
-        if (!window.confirm(`Remove imported records from ${file}?`)) return;
-        await api('/api/imports/delete', {
-          method: 'POST',
-          body: JSON.stringify({ project_id: state.projectId, source_file: file, source })
+      const sources = [...new Set(imports.map(row => row.source || '').filter(Boolean))].sort();
+      if (filterEl) {
+        filterEl.innerHTML = `
+          <div><label>Search imports</label><input id="importHistorySearch" placeholder="Search file, source, date, amount, records"></div>
+          <div><label>Source</label><select id="importHistorySource"><option value="">All sources</option>${sources.map(source => `<option>${htmlEscape(source)}</option>`).join('')}</select></div>
+          <div style="align-self:end"><button class="btn" id="clearImportHistoryFilters" type="button">Clear</button></div>`;
+      }
+      const searchEl = document.getElementById('importHistorySearch');
+      const sourceEl = document.getElementById('importHistorySource');
+      const draw = () => {
+        const query = String(searchEl?.value || '').trim().toLowerCase();
+        const sourceFilter = String(sourceEl?.value || '');
+        const filtered = imports.filter(row => {
+          if (sourceFilter && row.source !== sourceFilter) return false;
+          const haystack = [
+            row.source,
+            row.source_file,
+            row.record_count,
+            money(row.sales_amount),
+            money(row.raw_amount),
+            row.last_imported
+          ].join(' ').toLowerCase();
+          return !query || haystack.includes(query);
         });
-        await refresh();
-      });
+        if (countEl) countEl.textContent = `${filtered.length} of ${imports.length} imported file group(s) shown`;
+        tableEl.innerHTML = `
+          <thead><tr><th>Source</th><th>File</th><th>Records</th><th>Sales</th><th>Raw Cost</th><th>Last Imported</th><th></th></tr></thead>
+          <tbody>${filtered.length ? filtered.map(row => `<tr>
+            <td>${htmlEscape(row.source || '')}</td>
+            <td>${htmlEscape(row.source_file || '')}</td>
+            <td>${row.record_count}</td>
+            <td>${money(row.sales_amount)}</td>
+            <td>${money(row.raw_amount)}</td>
+            <td>${htmlEscape(row.last_imported || '')}</td>
+            <td><button class="btn" data-delete-import="${htmlEscape(row.source_file || '')}" data-source="${htmlEscape(row.source || '')}">Remove Import</button></td>
+          </tr>`).join('') : '<tr><td colspan="7">No imported files match the current filters.</td></tr>'}</tbody>`;
+        document.querySelectorAll('[data-delete-import]').forEach(btn => btn.onclick = async () => {
+          const file = btn.dataset.deleteImport;
+          const source = btn.dataset.source;
+          if (!window.confirm(`Remove imported records from ${file}?`)) return;
+          await api('/api/imports/delete', {
+            method: 'POST',
+            body: JSON.stringify({ project_id: state.projectId, source_file: file, source })
+          });
+          await refresh();
+        });
+      };
+      if (searchEl) searchEl.oninput = draw;
+      if (sourceEl) sourceEl.onchange = draw;
+      const clearBtn = document.getElementById('clearImportHistoryFilters');
+      if (clearBtn) clearBtn.onclick = () => {
+        if (searchEl) searchEl.value = '';
+        if (sourceEl) sourceEl.value = '';
+        draw();
+      };
+      draw();
     }
 
     async function loadVendorInvoiceLines() {
