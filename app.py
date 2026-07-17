@@ -6,12 +6,16 @@ import json
 import os
 import re
 import secrets
+import smtplib
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import traceback
 from datetime import datetime, timedelta
+from email.message import EmailMessage
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
@@ -48,10 +52,44 @@ BRAND_DIR = DATA_DIR / "brand"
 DB_PATH = DATA_DIR / "pm_tracker.sqlite3"
 HOST = os.environ.get("PM_TRACKER_HOST", "127.0.0.1")
 PORT = int(os.environ.get("PM_TRACKER_PORT", "8765"))
+SMTP_HOST = os.environ.get("PM_TRACKER_SMTP_HOST", "")
+SMTP_PORT = int(os.environ.get("PM_TRACKER_SMTP_PORT", "587"))
+SMTP_USERNAME = os.environ.get("PM_TRACKER_SMTP_USERNAME", "")
+SMTP_PASSWORD = os.environ.get("PM_TRACKER_SMTP_PASSWORD", "")
+SMTP_FROM = os.environ.get("PM_TRACKER_SMTP_FROM", SMTP_USERNAME)
+SMTP_USE_TLS = os.environ.get("PM_TRACKER_SMTP_TLS", "1").lower() not in ("0", "false", "no")
 SESSION_IDLE_TIMEOUT_MINUTES = 30
 DEFAULT_NEW_USER_PASSWORD = "TPE1776"
 CO_MATERIAL_MARGIN = 0.35
 CO_MATERIAL_COST_FACTOR = 1 - CO_MATERIAL_MARGIN
+COG_CUSTOMER_OPTIONAL_NAMES = {"expenses", "truck & auto expense", "truck and auto expense"}
+ROLE_NAMES = ("Admin", "User", "Read Only", "TX/Read Only", "Field PO")
+PERMISSION_DEFINITIONS = [
+    {"key": "projects", "label": "Project Dashboard", "group": "Projects"},
+    {"key": "project_setup", "label": "Project Setup", "group": "Projects"},
+    {"key": "fieldwise", "label": "Field Wise Import", "group": "Projects"},
+    {"key": "review_exceptions", "label": "Review Exceptions", "group": "Projects"},
+    {"key": "vendor_invoices", "label": "Vendor Invoices", "group": "Projects"},
+    {"key": "customer_billing", "label": "Customer Billing", "group": "Projects"},
+    {"key": "fieldwise_audit", "label": "Field Wise Audit", "group": "Company"},
+    {"key": "bids", "label": "Bid Tracking", "group": "Company"},
+    {"key": "job_order_report", "label": "Job Order Quick Reference", "group": "Company"},
+    {"key": "archived_projects", "label": "Archived Projects", "group": "Projects"},
+    {"key": "texas_ops", "label": "Texas Operations", "group": "Texas"},
+    {"key": "texas_reminders", "label": "Texas Reminders Setup", "group": "Texas"},
+    {"key": "po_requests", "label": "Create / My POs", "group": "Purchase Orders"},
+    {"key": "po_review", "label": "Office PO Review", "group": "Purchase Orders"},
+    {"key": "cog_setup", "label": "COG Setup", "group": "Purchase Orders"},
+    {"key": "activity", "label": "Activity Log", "group": "Admin"},
+    {"key": "admin", "label": "Admin / Users / Backups", "group": "Admin"},
+]
+DEFAULT_ROLE_PERMISSIONS = {
+    "Admin": {p["key"]: (1, 1) for p in PERMISSION_DEFINITIONS},
+    "User": {p["key"]: (1, 1) for p in PERMISSION_DEFINITIONS if p["key"] not in ("admin", "activity")},
+    "Read Only": {p["key"]: (1, 0) for p in PERMISSION_DEFINITIONS if p["key"] not in ("admin", "activity")},
+    "TX/Read Only": {"texas_ops": (1, 0)},
+    "Field PO": {"po_requests": (1, 1), "job_order_report": (1, 0)},
+}
 BID_TRACKER_SOURCE = Path(r"C:\Users\rossc\Twin Peaks Electrical\Project Manager WIP - General\Bid Request Management\_Bid Tracker\Bid Tracker.xlsx")
 SERVER_STARTED_AT = datetime.now().isoformat(timespec="seconds")
 REVISION_LABEL = "server-health-version"
@@ -81,6 +119,16 @@ LOADED_GIT_BRANCH = git_output("branch", "--show-current")
 
 def html_escape(value):
     return str(value or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&#39;")
+
+
+def normalize_cog_name(value):
+    return re.sub(r"\s+", " ", str(value or "").strip().lower())
+
+
+def po_customer_required_for_ref(job_ref):
+    if not job_ref or not job_ref.get("cog_category_id"):
+        return False
+    return normalize_cog_name(job_ref.get("job_number")) not in COG_CUSTOMER_OPTIONAL_NAMES
 
 
 def app_revision_info():
@@ -245,7 +293,7 @@ def developer_revision_html(user):
 def pwa_manifest_json():
     return json.dumps(
         {
-            "name": "Twin Peaks Project Dashboard",
+            "name": "Twin Peaks Company Dashboard",
             "short_name": "TPE Field PO",
             "description": "Twin Peaks Electrical project tracking and field PO requests.",
             "start_url": "/",
@@ -268,7 +316,7 @@ def pwa_manifest_json():
 
 def service_worker_js():
     return """
-const CACHE_NAME = 'tpe-no-po-v2';
+const CACHE_NAME = 'tpe-po-enabled-v3';
 const SHELL_ASSETS = [
   '/offline',
   '/brand/twin-peaks-logo.png'
@@ -371,9 +419,10 @@ def purchase_order_html(po):
         <div class="box"><div class="label">Vendor</div><div class="value">{html_escape(po["vendor"])}</div></div>
         <div class="box"><div class="label">Estimated Amount</div><div class="value">${money(po["estimated_amount"]):,.2f}</div></div>
         <div class="box"><div class="label">Job / Order #</div><div class="value">{html_escape(po["job_number"])}</div><div class="meta">{html_escape(po["job_label"])}</div></div>
-        <div class="box"><div class="label">Requested By</div><div class="value">{html_escape(po["requested_by_username"])}</div></div>
+        <div class="box"><div class="label">Created By</div><div class="value">{html_escape(po["requested_by_username"])}</div></div>
+        <div class="box"><div class="label">Customer</div><div class="value">{html_escape(po["customer_name"] or "")}</div></div>
       </div>
-      <div class="box" style="margin-top:14px"><div class="label">Request Details</div><div class="desc">{html_escape(po["description"])}</div></div>
+      <div class="box" style="margin-top:14px"><div class="label">PO Details</div><div class="desc">{html_escape(po["description"])}</div></div>
       {attachment}
       {pickup}
     </div>
@@ -508,6 +557,24 @@ def init_db():
               created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS project_invoice_alert_acknowledgements (
+              project_id INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+              acknowledged_at TEXT NOT NULL,
+              acknowledged_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+              acknowledged_by_username TEXT,
+              notes TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS job_invoice_alert_acknowledgements (
+              target_type TEXT NOT NULL,
+              target_id INTEGER NOT NULL,
+              acknowledged_at TEXT NOT NULL,
+              acknowledged_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+              acknowledged_by_username TEXT,
+              notes TEXT,
+              PRIMARY KEY (target_type, target_id)
+            );
+
             CREATE TABLE IF NOT EXISTS internal_rates (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               rate_set_id INTEGER,
@@ -583,6 +650,7 @@ def init_db():
               password_hash TEXT NOT NULL,
               role TEXT DEFAULT 'User',
               active INTEGER DEFAULT 1,
+              po_auto_issue INTEGER DEFAULT 0,
               must_change_password INTEGER DEFAULT 0,
               created_at TEXT NOT NULL
             );
@@ -593,6 +661,15 @@ def init_db():
               session_token TEXT NOT NULL UNIQUE,
               created_at TEXT NOT NULL,
               expires_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS role_permissions (
+              role TEXT NOT NULL,
+              permission_key TEXT NOT NULL,
+              can_view INTEGER DEFAULT 0,
+              can_edit INTEGER DEFAULT 0,
+              updated_at TEXT,
+              PRIMARY KEY (role, permission_key)
             );
 
             CREATE TABLE IF NOT EXISTS financial_reports (
@@ -613,24 +690,109 @@ def init_db():
               UNIQUE(report_id, metric_key)
             );
 
+            CREATE TABLE IF NOT EXISTS texas_upload_reminder_recipients (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              user_id INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+              active INTEGER DEFAULT 1,
+              created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS texas_upload_reminder_settings (
+              id INTEGER PRIMARY KEY CHECK (id = 1),
+              enabled INTEGER DEFAULT 1,
+              weekday INTEGER DEFAULT 4,
+              reminder_time TEXT DEFAULT '15:00',
+              updated_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS texas_upload_reminder_log (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              reminder_date TEXT NOT NULL,
+              recipient TEXT NOT NULL,
+              subject TEXT,
+              status TEXT NOT NULL,
+              error TEXT,
+              sent_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS billing_invoice_reminder_recipients (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              user_id INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+              active INTEGER DEFAULT 1,
+              created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS billing_invoice_reminder_settings (
+              id INTEGER PRIMARY KEY CHECK (id = 1),
+              enabled INTEGER DEFAULT 1,
+              weekday INTEGER DEFAULT 4,
+              reminder_time TEXT DEFAULT '15:00',
+              lookback_days INTEGER DEFAULT 7,
+              updated_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS billing_invoice_reminder_log (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              reminder_date TEXT NOT NULL,
+              recipient TEXT NOT NULL,
+              subject TEXT,
+              status TEXT NOT NULL,
+              error TEXT,
+              job_count INTEGER DEFAULT 0,
+              sent_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS activity_log (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              actor_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+              actor_username TEXT,
+              action TEXT NOT NULL,
+              entity_type TEXT,
+              entity_label TEXT,
+              details TEXT,
+              created_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS purchase_orders (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               po_number TEXT NOT NULL UNIQUE,
               project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
               subproject_id INTEGER REFERENCES subprojects(id) ON DELETE SET NULL,
               change_order_id INTEGER REFERENCES change_orders(id) ON DELETE SET NULL,
+              cog_category_id INTEGER REFERENCES cog_categories(id) ON DELETE SET NULL,
               job_number TEXT NOT NULL,
               job_label TEXT,
+              customer_name TEXT,
               vendor TEXT NOT NULL,
               description TEXT NOT NULL,
               estimated_amount REAL DEFAULT 0,
               attachment_file TEXT,
               pickup_file TEXT,
-              status TEXT DEFAULT 'Pending Review',
+              pickup_uploaded_at TEXT,
+              pickup_uploaded_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+              pickup_uploaded_by_username TEXT,
+              status TEXT DEFAULT 'Pending Approval',
+              closed_at TEXT,
+              closed_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+              closed_by_username TEXT,
+              close_reason TEXT,
+              voided_at TEXT,
+              voided_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+              voided_by_username TEXT,
+              void_reason TEXT,
               requested_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
               requested_by_username TEXT,
               created_at TEXT NOT NULL,
               updated_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS cog_categories (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              code TEXT NOT NULL,
+              name TEXT NOT NULL UNIQUE,
+              description TEXT,
+              active INTEGER DEFAULT 1,
+              created_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS fieldwise_audit_omissions (
@@ -752,11 +914,68 @@ def init_db():
         if "rate_set_id" not in rate_cols:
             con.execute("ALTER TABLE internal_rates ADD COLUMN rate_set_id INTEGER")
         user_cols = [r["name"] for r in con.execute("PRAGMA table_info(users)").fetchall()]
+        if "po_auto_issue" not in user_cols:
+            con.execute("ALTER TABLE users ADD COLUMN po_auto_issue INTEGER DEFAULT 0")
+            con.execute("UPDATE users SET po_auto_issue = 1 WHERE role IN ('Admin', 'User')")
         if "must_change_password" not in user_cols:
             con.execute("ALTER TABLE users ADD COLUMN must_change_password INTEGER DEFAULT 0")
         po_cols = [r["name"] for r in con.execute("PRAGMA table_info(purchase_orders)").fetchall()]
         if "pickup_file" not in po_cols:
             con.execute("ALTER TABLE purchase_orders ADD COLUMN pickup_file TEXT")
+        if "cog_category_id" not in po_cols:
+            con.execute("ALTER TABLE purchase_orders ADD COLUMN cog_category_id INTEGER REFERENCES cog_categories(id) ON DELETE SET NULL")
+        if "customer_name" not in po_cols:
+            con.execute("ALTER TABLE purchase_orders ADD COLUMN customer_name TEXT")
+        po_extra_columns = {
+            "pickup_uploaded_at": "TEXT",
+            "pickup_uploaded_by_user_id": "INTEGER",
+            "pickup_uploaded_by_username": "TEXT",
+            "closed_at": "TEXT",
+            "closed_by_user_id": "INTEGER",
+            "closed_by_username": "TEXT",
+            "close_reason": "TEXT",
+            "voided_at": "TEXT",
+            "voided_by_user_id": "INTEGER",
+            "voided_by_username": "TEXT",
+            "void_reason": "TEXT",
+        }
+        for column_name, column_type in po_extra_columns.items():
+            if column_name not in po_cols:
+                con.execute(f"ALTER TABLE purchase_orders ADD COLUMN {column_name} {column_type}")
+        con.execute(
+            """
+            UPDATE purchase_orders
+            SET status = CASE
+              WHEN status IN ('Open', 'Issued') AND COALESCE(pickup_file, '') <> '' THEN 'Picked Up'
+              WHEN status = 'Open' THEN 'Issued'
+              WHEN status = 'Pending Review' THEN 'Pending Approval'
+              WHEN status = 'Received' THEN 'Picked Up'
+              ELSE status
+            END
+            WHERE status IN ('Open', 'Pending Review', 'Received')
+            """
+        )
+        cog_schema = con.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'cog_categories'").fetchone()
+        if cog_schema and "code TEXT NOT NULL UNIQUE" in (cog_schema["sql"] or ""):
+            con.execute("PRAGMA foreign_keys = OFF")
+            con.executescript(
+                """
+                CREATE TABLE cog_categories_new (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  code TEXT NOT NULL,
+                  name TEXT NOT NULL UNIQUE,
+                  description TEXT,
+                  active INTEGER DEFAULT 1,
+                  created_at TEXT NOT NULL
+                );
+                INSERT INTO cog_categories_new (id, code, name, description, active, created_at)
+                SELECT id, code, name, description, COALESCE(active, 1), created_at
+                FROM cog_categories;
+                DROP TABLE cog_categories;
+                ALTER TABLE cog_categories_new RENAME TO cog_categories;
+                """
+            )
+            con.execute("PRAGMA foreign_keys = ON")
         default_rate_set = con.execute("SELECT id FROM rate_sets WHERE name = 'Current'").fetchone()
         if not default_rate_set:
             cur = con.execute("INSERT INTO rate_sets (name, effective_date, active) VALUES ('Current', '', 1)")
@@ -771,6 +990,17 @@ def init_db():
                 "INSERT INTO users (username, display_name, password_hash, role, active, created_at) VALUES (?, ?, ?, 'Admin', 1, ?)",
                 ("admin", "Administrator", hash_password("ChangeMe123!"), datetime.now().isoformat(timespec="seconds")),
             )
+        now = datetime.now().isoformat(timespec="seconds")
+        for role, defaults in DEFAULT_ROLE_PERMISSIONS.items():
+            for permission in PERMISSION_DEFINITIONS:
+                can_view, can_edit = defaults.get(permission["key"], (0, 0))
+                con.execute(
+                    """
+                    INSERT OR IGNORE INTO role_permissions (role, permission_key, can_view, can_edit, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (role, permission["key"], can_view, can_edit, now),
+                )
     seed_bid_tracker_from_workbook()
 
 
@@ -868,7 +1098,9 @@ def current_user(handler):
     now = datetime.now()
     user = one(
         """
-        SELECT users.id, users.username, users.display_name, users.role, users.active, COALESCE(users.must_change_password, 0) AS must_change_password
+        SELECT users.id, users.username, users.display_name, users.role, users.active,
+               COALESCE(users.po_auto_issue, 0) AS po_auto_issue,
+               COALESCE(users.must_change_password, 0) AS must_change_password
         FROM user_sessions
         JOIN users ON users.id = user_sessions.user_id
         WHERE user_sessions.session_token = ?
@@ -886,6 +1118,43 @@ def current_user(handler):
     return user
 
 
+def role_permissions(role):
+    role = clean_role(role)
+    if role == "Admin":
+        return {p["key"]: {"can_view": 1, "can_edit": 1} for p in PERMISSION_DEFINITIONS}
+    records = rows("SELECT permission_key, can_view, can_edit FROM role_permissions WHERE role = ?", (role,))
+    permissions = {r["permission_key"]: {"can_view": int(r["can_view"] or 0), "can_edit": int(r["can_edit"] or 0)} for r in records}
+    defaults = DEFAULT_ROLE_PERMISSIONS.get(role, {})
+    for permission in PERMISSION_DEFINITIONS:
+        if permission["key"] not in permissions:
+            can_view, can_edit = defaults.get(permission["key"], (0, 0))
+            permissions[permission["key"]] = {"can_view": can_view, "can_edit": can_edit}
+    return permissions
+
+
+def current_user_with_permissions(handler):
+    user = current_user(handler)
+    if user:
+        user["permissions"] = role_permissions(user.get("role"))
+    return user
+
+
+def can_view_permission(user, permission_key):
+    if not user:
+        return False
+    if user.get("role") == "Admin":
+        return True
+    return bool(role_permissions(user.get("role")).get(permission_key, {}).get("can_view"))
+
+
+def can_edit_permission(user, permission_key):
+    if not user:
+        return False
+    if user.get("role") == "Admin":
+        return True
+    return bool(role_permissions(user.get("role")).get(permission_key, {}).get("can_edit"))
+
+
 def require_admin(handler):
     user = current_user(handler)
     return user if user and user.get("role") == "Admin" else None
@@ -900,6 +1169,10 @@ def can_use_field_po(user):
     return bool(user and user.get("role") in ("Admin", "User", "Field PO"))
 
 
+def can_auto_issue_po(user):
+    return bool(user and (user.get("role") == "Admin" or int(user.get("po_auto_issue") or 0) == 1))
+
+
 def is_texas_read_only(user):
     return bool(user and user.get("role") == "TX/Read Only")
 
@@ -910,7 +1183,7 @@ def is_field_po_only(user):
 
 def clean_role(role):
     role = str(role or "User").strip()
-    return role if role in ("Admin", "User", "Read Only", "TX/Read Only", "Field PO") else "User"
+    return role if role in ROLE_NAMES else "User"
 
 
 def clean_order_type(order_type):
@@ -1057,7 +1330,7 @@ def fieldwise_audit_result(path):
             """
             SELECT
               cr.ticket_or_invoice,
-              COALESCE(sp.job_number, co.job_number) AS job_number,
+              COALESCE(NULLIF(TRIM(co.job_number), ''), NULLIF(TRIM(sp.job_number), '')) AS job_number,
               COUNT(*) AS line_count,
               COALESCE(SUM(cr.sales_amount), 0) AS imported_sales_total,
               COALESCE(SUM(cr.amount), 0) AS imported_raw_total,
@@ -1067,7 +1340,7 @@ def fieldwise_audit_result(path):
             LEFT JOIN change_orders co ON co.id = cr.change_order_id
             WHERE cr.source IN ('Field Wise', 'Field Wise PDF')
               AND TRIM(COALESCE(cr.ticket_or_invoice, '')) <> ''
-            GROUP BY cr.ticket_or_invoice, COALESCE(sp.job_number, co.job_number)
+            GROUP BY cr.ticket_or_invoice, COALESCE(NULLIF(TRIM(co.job_number), ''), NULLIF(TRIM(sp.job_number), ''))
             """
         ).fetchall()
 
@@ -1225,6 +1498,27 @@ def job_reference_for_po(con, job_key):
             """,
             (item_id,),
         ).fetchone()
+    elif kind == "cog":
+        row = con.execute(
+            """
+            SELECT
+              NULL AS subproject_id,
+              NULL AS change_order_id,
+              id AS cog_category_id,
+              NULL AS project_id,
+              name AS job_number,
+              'COG' AS item_type,
+              '' AS customer,
+              'COG Category' AS project_name,
+              code AS project_code,
+              code AS reference_code,
+              description
+            FROM cog_categories
+            WHERE id = ?
+              AND COALESCE(active, 1) = 1
+            """,
+            (item_id,),
+        ).fetchone()
     else:
         return None
     if not row or not str(row["job_number"] or "").strip():
@@ -1237,6 +1531,7 @@ def job_reference_for_po(con, job_key):
         row["reference_code"],
     ]
     result = dict(row)
+    result.setdefault("cog_category_id", None)
     result["job_label"] = " - ".join(str(part or "").strip() for part in label_parts if str(part or "").strip())
     return result
 
@@ -1364,16 +1659,29 @@ def first_regex(patterns, text, flags=re.IGNORECASE):
     return ""
 
 
+def pdf_text_is_garbled(text):
+    if not text:
+        return False
+    cid_count = text.count("(cid:")
+    if cid_count >= 10:
+        return True
+    compact = re.sub(r"\s+", "", text)
+    if not compact:
+        return False
+    printable_letters = sum(1 for ch in compact if ch.isalpha())
+    return cid_count >= 3 and printable_letters / max(len(compact), 1) < 0.15
+
+
 def extract_pdf_text(path):
     pages = []
     with pdfplumber.open(path) as pdf:
         for page in pdf.pages:
             pages.append(page.extract_text() or "")
     text = "\n".join(pages).strip()
-    if text:
+    if text and not pdf_text_is_garbled(text):
         return text
     if pdfium is None or RapidOCR is None:
-        return ""
+        return "" if pdf_text_is_garbled(text) else text
 
     global OCR_ENGINE
     if OCR_ENGINE is None:
@@ -1722,6 +2030,52 @@ def bytes_response(handler, data, content_type="application/octet-stream", statu
     handler.send_header("Content-Length", str(len(data)))
     handler.end_headers()
     handler.wfile.write(data)
+
+
+def download_response(handler, data, filename, content_type="application/octet-stream", status=200):
+    handler.send_response(status)
+    handler.send_header("Content-Type", content_type)
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+    handler.send_header("Content-Length", str(len(data)))
+    handler.end_headers()
+    handler.wfile.write(data)
+
+
+def sqlite_backup_bytes():
+    backup_path = Path(tempfile.gettempdir()) / f"pm-tracker-backup-{secrets.token_hex(8)}.sqlite3"
+    try:
+        with sqlite3.connect(DB_PATH) as source, sqlite3.connect(backup_path) as target:
+            source.backup(target)
+        return backup_path.read_bytes()
+    finally:
+        try:
+            backup_path.unlink()
+        except Exception:
+            pass
+
+
+def log_activity(actor=None, action="", entity_type="", entity_label="", details=None):
+    try:
+        actor = actor or {}
+        detail_text = details if isinstance(details, str) else json.dumps(details or {}, default=str)
+        execute(
+            """
+            INSERT INTO activity_log (actor_user_id, actor_username, action, entity_type, entity_label, details, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                actor.get("id"),
+                actor.get("username") or actor.get("display_name") or "",
+                str(action or "").strip(),
+                str(entity_type or "").strip(),
+                str(entity_label or "").strip(),
+                detail_text,
+                datetime.now().isoformat(timespec="seconds"),
+            ),
+        )
+    except Exception:
+        traceback.print_exc()
 
 
 def upload_pdf_path(file_name):
@@ -2243,6 +2597,258 @@ def bid_summary():
     }
 
 
+def jobs_missing_recent_customer_invoice_attention(days=5):
+    cutoff = (datetime.now() - timedelta(days=int(days or 5))).isoformat(timespec="seconds")
+    subprojects = rows(
+        """
+        SELECT *
+        FROM (
+          SELECT
+            'subproject' AS target_type,
+            sp.id AS target_id,
+            p.id AS project_id,
+            p.project_code,
+            p.name AS project_name,
+            p.customer,
+            sp.job_number,
+            sp.code AS reference_code,
+            sp.name AS job_name,
+            'Subproject' AS job_type,
+            ci.last_invoice_added_at,
+            ci.last_invoice_date,
+            ack.acknowledged_at,
+            ack.acknowledged_by_username,
+            MAX(
+              COALESCE(ci.last_invoice_added_at, ''),
+              COALESCE(ack.acknowledged_at, ''),
+              COALESCE(p.created_at, '')
+            ) AS last_activity_at
+          FROM subprojects sp
+          JOIN projects p ON p.id = sp.project_id
+          LEFT JOIN (
+            SELECT subproject_id, MAX(created_at) AS last_invoice_added_at, MAX(invoice_date) AS last_invoice_date
+            FROM customer_invoices
+            WHERE COALESCE(status, '') <> 'Void'
+              AND change_order_id IS NULL
+            GROUP BY subproject_id
+          ) ci ON ci.subproject_id = sp.id
+          LEFT JOIN job_invoice_alert_acknowledgements ack ON ack.target_type = 'subproject' AND ack.target_id = sp.id
+          WHERE COALESCE(p.status, 'Active') <> 'Archived'
+            AND TRIM(COALESCE(sp.job_number, '')) <> ''
+        )
+        WHERE COALESCE(last_activity_at, '') <> ''
+          AND last_activity_at <= ?
+        ORDER BY last_activity_at ASC, customer, project_name, job_number
+        """,
+        (cutoff,),
+    )
+    change_orders = rows(
+        """
+        SELECT *
+        FROM (
+          SELECT
+            'change_order' AS target_type,
+            co.id AS target_id,
+            p.id AS project_id,
+            p.project_code,
+            p.name AS project_name,
+            p.customer,
+            co.job_number,
+            co.co_number AS reference_code,
+            co.title AS job_name,
+            COALESCE(co.order_type, 'Change Order') AS job_type,
+            ci.last_invoice_added_at,
+            ci.last_invoice_date,
+            ack.acknowledged_at,
+            ack.acknowledged_by_username,
+            MAX(
+              COALESCE(ci.last_invoice_added_at, ''),
+              COALESCE(ack.acknowledged_at, ''),
+              COALESCE(p.created_at, '')
+            ) AS last_activity_at
+          FROM change_orders co
+          JOIN projects p ON p.id = co.project_id
+          LEFT JOIN (
+            SELECT change_order_id, MAX(created_at) AS last_invoice_added_at, MAX(invoice_date) AS last_invoice_date
+            FROM customer_invoices
+            WHERE COALESCE(status, '') <> 'Void'
+            GROUP BY change_order_id
+          ) ci ON ci.change_order_id = co.id
+          LEFT JOIN job_invoice_alert_acknowledgements ack ON ack.target_type = 'change_order' AND ack.target_id = co.id
+          WHERE COALESCE(p.status, 'Active') <> 'Archived'
+            AND TRIM(COALESCE(co.job_number, '')) <> ''
+            AND COALESCE(co.status, '') NOT IN ('Rejected', 'Void')
+        )
+        WHERE COALESCE(last_activity_at, '') <> ''
+          AND last_activity_at <= ?
+        ORDER BY last_activity_at ASC, customer, project_name, job_number
+        """,
+        (cutoff,),
+    )
+    return sorted(subprojects + change_orders, key=lambda item: (item.get("last_activity_at") or "", item.get("customer") or "", item.get("project_name") or "", item.get("job_number") or ""))
+
+
+def home_alerts():
+    today = datetime.now().date()
+    week_start = today - timedelta(days=today.weekday())
+    week_end = week_start + timedelta(days=6)
+    stale_cutoff = (datetime.now() - timedelta(days=5)).isoformat(timespec="seconds")
+    today_text = today.isoformat()
+    uncoded = one(
+        """
+        SELECT
+          COUNT(*) AS line_count,
+          COUNT(DISTINCT COALESCE(NULLIF(TRIM(ticket_or_invoice), ''), source_file, id)) AS ticket_count,
+          COALESCE(SUM(COALESCE(sales_amount, amount, 0)), 0) AS total_amount
+        FROM cost_records
+        WHERE source IN ('Field Wise', 'Field Wise PDF')
+          AND (
+            subproject_id IS NULL
+            OR cost_type IS NULL
+            OR cost_type = 'Uncoded'
+            OR raw_cost_source IN ('Missing project rate', 'Missing internal rate')
+          )
+        """
+    )
+    pnl = one(
+        """
+        SELECT COUNT(*) AS count
+        FROM financial_reports
+        WHERE report_date BETWEEN ? AND ?
+          AND report_type IN ('pnl', 'combined')
+        """,
+        (week_start.isoformat(), week_end.isoformat()),
+    )
+    balance_sheet = one(
+        """
+        SELECT COUNT(*) AS count
+        FROM financial_reports
+        WHERE report_date BETWEEN ? AND ?
+          AND report_type IN ('balance_sheet', 'combined')
+        """,
+        (week_start.isoformat(), week_end.isoformat()),
+    )
+    overdue_bids = one(
+        """
+        SELECT COUNT(*) AS count, COALESCE(SUM(COALESCE(bid_price, 0)), 0) AS value
+        FROM bid_requests
+        WHERE COALESCE(outcome, 'Pending') NOT IN ('Won', 'Lost')
+          AND COALESCE(go_no_go, '') <> 'No Go'
+          AND TRIM(COALESCE(bid_due_date, '')) <> ''
+          AND bid_due_date < ?
+        """,
+        (today_text,),
+    )
+    stale_bids = one(
+        """
+        SELECT COUNT(*) AS count, COALESCE(SUM(COALESCE(bid_price, 0)), 0) AS value
+        FROM bid_requests
+        WHERE COALESCE(outcome, 'Pending') NOT IN ('Won', 'Lost')
+          AND COALESCE(go_no_go, '') <> 'No Go'
+          AND COALESCE(updated_at, created_at, '') <> ''
+          AND COALESCE(updated_at, created_at) <= ?
+        """,
+        (stale_cutoff,),
+    )
+    open_pos = one(
+        """
+        SELECT COUNT(*) AS count, COALESCE(SUM(COALESCE(estimated_amount, 0)), 0) AS value
+        FROM purchase_orders
+        WHERE COALESCE(status, 'Pending Approval') NOT IN ('Closed', 'Void')
+        """
+    )
+    stale_invoice_jobs = jobs_missing_recent_customer_invoice_attention(5)
+    missing_pnl = not bool(pnl and pnl["count"])
+    missing_balance_sheet = not bool(balance_sheet and balance_sheet["count"])
+    alerts = [
+        {
+            "key": "uncoded_fieldwise",
+            "label": "Uncoded Field Wise Tickets",
+            "count": int(uncoded["ticket_count"] or 0),
+            "detail": f"{int(uncoded['line_count'] or 0)} line(s) need coding",
+            "amount": money(uncoded["total_amount"] if uncoded else 0),
+            "severity": "warn" if uncoded and uncoded["ticket_count"] else "ok",
+            "tab": "review",
+        },
+        {
+            "key": "missing_texas_pnl",
+            "label": "Missing Texas P&L",
+            "count": 1 if missing_pnl else 0,
+            "detail": f"Current week {week_start.isoformat()} to {week_end.isoformat()}",
+            "severity": "bad" if missing_pnl else "ok",
+            "tab": "texasOps",
+        },
+        {
+            "key": "missing_balance_sheet",
+            "label": "Missing Balance Sheet",
+            "count": 1 if missing_balance_sheet else 0,
+            "detail": f"Current week {week_start.isoformat()} to {week_end.isoformat()}",
+            "severity": "bad" if missing_balance_sheet else "ok",
+            "tab": "texasOps",
+        },
+        {
+            "key": "overdue_bids",
+            "label": "Overdue Bids",
+            "count": int(overdue_bids["count"] or 0),
+            "detail": "Open bids past due date",
+            "amount": money(overdue_bids["value"] if overdue_bids else 0),
+            "severity": "bad" if overdue_bids and overdue_bids["count"] else "ok",
+            "tab": "bids",
+        },
+        {
+            "key": "open_pos",
+            "label": "Open POs",
+            "count": int(open_pos["count"] or 0),
+            "detail": "Not closed or void",
+            "amount": money(open_pos["value"] if open_pos else 0),
+            "severity": "warn" if open_pos and open_pos["count"] else "ok",
+            "tab": "officePo",
+        },
+        {
+            "key": "stale_job_invoices",
+            "label": "Jobs / Subprojects Not Invoiced",
+            "count": len(stale_invoice_jobs),
+            "detail": "No customer invoice added or acknowledgement in 5+ days",
+            "severity": "warn" if stale_invoice_jobs else "ok",
+            "tab": "billing",
+            "items": [
+                {
+                    "target_type": item["target_type"],
+                    "target_id": item["target_id"],
+                    "project_id": item["project_id"],
+                    "label": " / ".join(str(x or "").strip() for x in (item["job_number"], item["reference_code"]) if str(x or "").strip()) or str(item["job_name"] or "Job"),
+                    "customer": item["customer"] or "",
+                    "project_name": item["project_name"] or "",
+                    "job_name": item["job_name"] or "",
+                    "job_type": item["job_type"] or "",
+                    "last_invoice_added_at": item["last_invoice_added_at"] or "",
+                    "last_invoice_date": item["last_invoice_date"] or "",
+                    "acknowledged_at": item["acknowledged_at"] or "",
+                    "acknowledged_by_username": item["acknowledged_by_username"] or "",
+                    "last_activity_at": item["last_activity_at"] or "",
+                }
+                for item in stale_invoice_jobs[:10]
+            ],
+        },
+        {
+            "key": "stale_pending_bids",
+            "label": "Stale Pending Bid Rows",
+            "count": int(stale_bids["count"] or 0),
+            "detail": "No update in 5+ days",
+            "amount": money(stale_bids["value"] if stale_bids else 0),
+            "severity": "warn" if stale_bids and stale_bids["count"] else "ok",
+            "tab": "bids",
+        },
+    ]
+    return {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "week_start": week_start.isoformat(),
+        "week_end": week_end.isoformat(),
+        "attention_count": sum(1 for alert in alerts if alert["severity"] != "ok" and alert["count"]),
+        "alerts": alerts,
+    }
+
+
 FINANCIAL_METRICS = {
     "revenue": ("Revenue", ["total for income", "total income", "total revenue", "revenue", "sales"], "pnl"),
     "gross_profit": ("Gross Profit", ["gross profit", "gross margin"], "pnl"),
@@ -2519,6 +3125,387 @@ def texas_financial_summary():
         week_status.append(bucket)
     week_status.sort(key=lambda x: x["report_date"], reverse=True)
     return {"reports": reports[:24], "report_weeks": week_status[:24], "latest_metrics": latest, "history": history}
+
+
+def texas_pnl_uploaded_for_date(report_date):
+    report_date = str(report_date or "").strip()
+    if not report_date:
+        return False
+    found = one(
+        """
+        SELECT fr.id
+        FROM financial_reports fr
+        LEFT JOIN financial_metrics fm ON fm.report_id = fr.id
+        WHERE fr.report_date = ?
+          AND (
+            fr.report_type IN ('pnl', 'combined')
+            OR fm.metric_key IN ('revenue', 'gross_profit', 'operating_expenses', 'net_income')
+          )
+        LIMIT 1
+        """,
+        (report_date,),
+    )
+    return bool(found)
+
+
+REMINDER_WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+
+def texas_upload_reminder_settings():
+    setting = one("SELECT * FROM texas_upload_reminder_settings WHERE id = 1")
+    if not setting:
+        execute(
+            "INSERT INTO texas_upload_reminder_settings (id, enabled, weekday, reminder_time, updated_at) VALUES (1, 1, 4, '15:00', ?)",
+            (datetime.now().isoformat(timespec="seconds"),),
+        )
+        setting = one("SELECT * FROM texas_upload_reminder_settings WHERE id = 1")
+    result = dict(setting)
+    try:
+        result["weekday"] = max(0, min(6, int(result.get("weekday", 4))))
+    except Exception:
+        result["weekday"] = 4
+    reminder_time = str(result.get("reminder_time") or "15:00").strip()
+    if not re.match(r"^\d{2}:\d{2}$", reminder_time):
+        reminder_time = "15:00"
+    result["reminder_time"] = reminder_time
+    result["weekday_label"] = REMINDER_WEEKDAYS[result["weekday"]]
+    result["schedule_label"] = f"Every {result['weekday_label']} at {reminder_time} server time"
+    return result
+
+
+def texas_upload_reminder_status(reminder_date=None):
+    reminder_date = reminder_date or datetime.now().date().isoformat()
+    settings = texas_upload_reminder_settings()
+    recipients = rows(
+        """
+        SELECT u.id, u.username, u.display_name, u.role, COALESCE(r.active, 0) AS selected
+        FROM users u
+        LEFT JOIN texas_upload_reminder_recipients r ON r.user_id = u.id AND COALESCE(r.active, 1) = 1
+        WHERE u.active = 1
+        ORDER BY u.display_name, u.username
+        """
+    )
+    logs = rows(
+        """
+        SELECT *
+        FROM texas_upload_reminder_log
+        ORDER BY sent_at DESC, id DESC
+        LIMIT 20
+        """
+    )
+    return {
+        "smtp_configured": bool(SMTP_HOST and SMTP_FROM),
+        "reminder_date": reminder_date,
+        "pnl_uploaded": texas_pnl_uploaded_for_date(reminder_date),
+        "settings": settings,
+        "schedule": settings["schedule_label"],
+        "recipients": recipients,
+        "logs": logs,
+    }
+
+
+def active_texas_upload_reminder_recipients():
+    return rows(
+        """
+        SELECT u.id, u.username, u.display_name
+        FROM texas_upload_reminder_recipients r
+        JOIN users u ON u.id = r.user_id
+        WHERE COALESCE(r.active, 1) = 1
+          AND u.active = 1
+        ORDER BY u.display_name, u.username
+        """
+    )
+
+
+def billing_invoice_reminder_settings():
+    setting = one("SELECT * FROM billing_invoice_reminder_settings WHERE id = 1")
+    if not setting:
+        execute(
+            "INSERT INTO billing_invoice_reminder_settings (id, enabled, weekday, reminder_time, lookback_days, updated_at) VALUES (1, 1, 4, '15:00', 7, ?)",
+            (datetime.now().isoformat(timespec="seconds"),),
+        )
+        setting = one("SELECT * FROM billing_invoice_reminder_settings WHERE id = 1")
+    result = dict(setting)
+    try:
+        result["weekday"] = max(0, min(6, int(result.get("weekday", 4))))
+    except Exception:
+        result["weekday"] = 4
+    reminder_time = str(result.get("reminder_time") or "15:00").strip()
+    if not re.match(r"^\d{2}:\d{2}$", reminder_time):
+        reminder_time = "15:00"
+    result["reminder_time"] = reminder_time
+    try:
+        result["lookback_days"] = max(1, min(60, int(result.get("lookback_days", 7))))
+    except Exception:
+        result["lookback_days"] = 7
+    result["weekday_label"] = REMINDER_WEEKDAYS[result["weekday"]]
+    result["schedule_label"] = f"Every {result['weekday_label']} at {reminder_time} server time"
+    return result
+
+
+def jobs_missing_recent_customer_invoice(lookback_days=7):
+    cutoff = (datetime.now() - timedelta(days=int(lookback_days or 7))).isoformat(timespec="seconds")
+    subproject_jobs = rows(
+        """
+        SELECT
+          'Subproject' AS job_type,
+          p.customer,
+          p.project_code,
+          p.name AS project_name,
+          sp.job_number,
+          sp.code AS reference_code,
+          sp.name AS description,
+          MAX(ci.created_at) AS last_invoice_added_at,
+          MAX(ci.invoice_date) AS last_invoice_date,
+          SUM(CASE WHEN ci.created_at >= ? THEN 1 ELSE 0 END) AS recent_invoice_count
+        FROM subprojects sp
+        JOIN projects p ON p.id = sp.project_id
+        LEFT JOIN customer_invoices ci ON ci.subproject_id = sp.id AND ci.change_order_id IS NULL AND COALESCE(ci.status, '') <> 'Void'
+        WHERE COALESCE(p.status, 'Active') <> 'Archived'
+          AND TRIM(COALESCE(sp.job_number, '')) <> ''
+        GROUP BY sp.id
+        HAVING COALESCE(recent_invoice_count, 0) = 0
+        ORDER BY p.customer, p.name, sp.job_number
+        """,
+        (cutoff,),
+    )
+    change_order_jobs = rows(
+        """
+        SELECT
+          COALESCE(co.order_type, 'Change Order') AS job_type,
+          p.customer,
+          p.project_code,
+          p.name AS project_name,
+          co.job_number,
+          co.co_number AS reference_code,
+          co.title AS description,
+          MAX(ci.created_at) AS last_invoice_added_at,
+          MAX(ci.invoice_date) AS last_invoice_date,
+          SUM(CASE WHEN ci.created_at >= ? THEN 1 ELSE 0 END) AS recent_invoice_count
+        FROM change_orders co
+        JOIN projects p ON p.id = co.project_id
+        LEFT JOIN customer_invoices ci ON ci.change_order_id = co.id AND COALESCE(ci.status, '') <> 'Void'
+        WHERE COALESCE(p.status, 'Active') <> 'Archived'
+          AND TRIM(COALESCE(co.job_number, '')) <> ''
+          AND COALESCE(co.status, '') NOT IN ('Rejected', 'Void')
+        GROUP BY co.id
+        HAVING COALESCE(recent_invoice_count, 0) = 0
+        ORDER BY p.customer, p.name, co.job_number
+        """,
+        (cutoff,),
+    )
+    return subproject_jobs + change_order_jobs
+
+
+def active_billing_invoice_reminder_recipients():
+    return rows(
+        """
+        SELECT u.id, u.username, u.display_name
+        FROM billing_invoice_reminder_recipients r
+        JOIN users u ON u.id = r.user_id
+        WHERE COALESCE(r.active, 1) = 1
+          AND u.active = 1
+        ORDER BY u.display_name, u.username
+        """
+    )
+
+
+def billing_invoice_reminder_status():
+    settings = billing_invoice_reminder_settings()
+    recipients = rows(
+        """
+        SELECT u.id, u.username, u.display_name, u.role, COALESCE(r.active, 0) AS selected
+        FROM users u
+        LEFT JOIN billing_invoice_reminder_recipients r ON r.user_id = u.id AND COALESCE(r.active, 1) = 1
+        WHERE u.active = 1
+        ORDER BY u.display_name, u.username
+        """
+    )
+    logs = rows(
+        """
+        SELECT *
+        FROM billing_invoice_reminder_log
+        ORDER BY sent_at DESC, id DESC
+        LIMIT 20
+        """
+    )
+    missing_jobs = jobs_missing_recent_customer_invoice(settings["lookback_days"])
+    return {
+        "smtp_configured": bool(SMTP_HOST and SMTP_FROM),
+        "settings": settings,
+        "schedule": settings["schedule_label"],
+        "recipients": recipients,
+        "logs": logs,
+        "missing_jobs": missing_jobs[:100],
+        "missing_job_count": len(missing_jobs),
+    }
+
+
+def send_email(to_address, subject, body):
+    if not SMTP_HOST or not SMTP_FROM:
+        raise RuntimeError("Email is not configured. Set PM_TRACKER_SMTP_HOST and PM_TRACKER_SMTP_FROM on the server.")
+    message = EmailMessage()
+    message["From"] = SMTP_FROM
+    message["To"] = to_address
+    message["Subject"] = subject
+    message.set_content(body)
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as smtp:
+        if SMTP_USE_TLS:
+            smtp.starttls()
+        if SMTP_USERNAME:
+            smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
+        smtp.send_message(message)
+
+
+def log_texas_upload_reminder(reminder_date, recipient, subject, status, error=""):
+    execute(
+        """
+        INSERT INTO texas_upload_reminder_log (reminder_date, recipient, subject, status, error, sent_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (reminder_date, recipient, subject, status, str(error or ""), datetime.now().isoformat(timespec="seconds")),
+    )
+
+
+def texas_upload_reminder_already_attempted(reminder_date, recipient):
+    return bool(
+        one(
+            """
+            SELECT id
+            FROM texas_upload_reminder_log
+            WHERE reminder_date = ?
+              AND recipient = ?
+              AND status IN ('sent', 'failed')
+            LIMIT 1
+            """,
+            (reminder_date, recipient),
+        )
+    )
+
+
+def billing_invoice_reminder_already_attempted(reminder_date, recipient):
+    return bool(
+        one(
+            """
+            SELECT id
+            FROM billing_invoice_reminder_log
+            WHERE reminder_date = ?
+              AND recipient = ?
+              AND status IN ('sent', 'failed')
+            LIMIT 1
+            """,
+            (reminder_date, recipient),
+        )
+    )
+
+
+def log_billing_invoice_reminder(reminder_date, recipient, subject, status, error="", job_count=0):
+    execute(
+        """
+        INSERT INTO billing_invoice_reminder_log (reminder_date, recipient, subject, status, error, job_count, sent_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (reminder_date, recipient, subject, status, str(error or ""), int(job_count or 0), datetime.now().isoformat(timespec="seconds")),
+    )
+
+
+def run_texas_upload_reminder(force=False):
+    reminder_date = datetime.now().date().isoformat()
+    if texas_pnl_uploaded_for_date(reminder_date):
+        return {"sent": 0, "failed": 0, "skipped": 0, "pnl_uploaded": True, "message": "P&L is already uploaded for today."}
+    recipients = active_texas_upload_reminder_recipients()
+    subject = f"Texas Ops P&L upload needed for {reminder_date}"
+    body = (
+        f"Reminder: the Texas Operations weekly P&L has not been uploaded for {reminder_date}.\n\n"
+        "Please upload the P&L report in the Company Dashboard under Texas Ops before end of day.\n"
+    )
+    result = {"sent": 0, "failed": 0, "skipped": 0, "pnl_uploaded": False, "message": ""}
+    for recipient in recipients:
+        email = str(recipient["username"] or "").strip()
+        if "@" not in email:
+            result["skipped"] += 1
+            if force:
+                log_texas_upload_reminder(reminder_date, email or f"user:{recipient['id']}", subject, "skipped", "Username is not an email address.")
+            continue
+        if not force and texas_upload_reminder_already_attempted(reminder_date, email):
+            result["skipped"] += 1
+            continue
+        try:
+            send_email(email, subject, body)
+            log_texas_upload_reminder(reminder_date, email, subject, "sent")
+            result["sent"] += 1
+        except Exception as exc:
+            log_texas_upload_reminder(reminder_date, email, subject, "failed", exc)
+            result["failed"] += 1
+    result["message"] = f"Sent {result['sent']}, failed {result['failed']}, skipped {result['skipped']}."
+    return result
+
+
+def run_billing_invoice_reminder(force=False):
+    settings = billing_invoice_reminder_settings()
+    reminder_date = datetime.now().date().isoformat()
+    jobs = jobs_missing_recent_customer_invoice(settings["lookback_days"])
+    if not jobs:
+        return {"sent": 0, "failed": 0, "skipped": 0, "job_count": 0, "message": "All active jobs have a customer invoice added inside the lookback window."}
+    recipients = active_billing_invoice_reminder_recipients()
+    subject = f"Jobs missing recent customer invoices: {len(jobs)}"
+    job_lines = []
+    for job in jobs[:200]:
+        label = " / ".join(str(x or "").strip() for x in [job.get("job_number"), job.get("reference_code")] if str(x or "").strip())
+        last_added = job.get("last_invoice_added_at") or "Never"
+        job_lines.append(f"- {label} | {job.get('customer') or ''} | {job.get('project_name') or ''} | {job.get('job_type') or ''} | last added: {last_added}")
+    body = (
+        f"Customer invoice reminder for {reminder_date}\n\n"
+        f"The following active jobs have not had a customer invoice added in the last {settings['lookback_days']} day(s):\n\n"
+        + "\n".join(job_lines)
+        + "\n\nPlease review Customer Billing in the Company Dashboard."
+    )
+    result = {"sent": 0, "failed": 0, "skipped": 0, "job_count": len(jobs), "message": ""}
+    for recipient in recipients:
+        email = str(recipient["username"] or "").strip()
+        if "@" not in email:
+            result["skipped"] += 1
+            if force:
+                log_billing_invoice_reminder(reminder_date, email or f"user:{recipient['id']}", subject, "skipped", "Username is not an email address.", len(jobs))
+            continue
+        if not force and billing_invoice_reminder_already_attempted(reminder_date, email):
+            result["skipped"] += 1
+            continue
+        try:
+            send_email(email, subject, body)
+            log_billing_invoice_reminder(reminder_date, email, subject, "sent", "", len(jobs))
+            result["sent"] += 1
+        except Exception as exc:
+            log_billing_invoice_reminder(reminder_date, email, subject, "failed", exc, len(jobs))
+            result["failed"] += 1
+    result["message"] = f"Found {len(jobs)} job(s). Sent {result['sent']}, failed {result['failed']}, skipped {result['skipped']}."
+    return result
+
+
+def texas_upload_reminder_scheduler():
+    while True:
+        try:
+            now = datetime.now()
+            settings = texas_upload_reminder_settings()
+            reminder_hour, reminder_minute = [int(x) for x in settings["reminder_time"].split(":", 1)]
+            is_due_day = now.weekday() == int(settings["weekday"])
+            is_due_time = now.hour > reminder_hour or (now.hour == reminder_hour and now.minute >= reminder_minute)
+            if int(settings.get("enabled") or 0) and is_due_day and is_due_time:
+                run_texas_upload_reminder(force=False)
+            billing_settings = billing_invoice_reminder_settings()
+            billing_hour, billing_minute = [int(x) for x in billing_settings["reminder_time"].split(":", 1)]
+            billing_due_day = now.weekday() == int(billing_settings["weekday"])
+            billing_due_time = now.hour > billing_hour or (now.hour == billing_hour and now.minute >= billing_minute)
+            if int(billing_settings.get("enabled") or 0) and billing_due_day and billing_due_time:
+                run_billing_invoice_reminder(force=False)
+        except Exception:
+            traceback.print_exc()
+        time.sleep(60)
+
+
+def start_background_jobs():
+    thread = threading.Thread(target=texas_upload_reminder_scheduler, daemon=True)
+    thread.start()
 
 
 def import_fieldwise_xlsx(path, project_id):
@@ -3058,12 +4045,35 @@ def import_vendor_invoice_pdf(path, project_id):
         vendor = "CED Williston"
         invoice_header = re.search(r"([0-9]{3,}\s*-\s*[0-9]{3,})\s+([0-9]{2}/[0-9]{2}/[0-9]{2,4})", text)
         invoice_number = invoice_header.group(1).strip() if invoice_header else first_regex([r"\b([0-9]{3,}\s*-\s*[0-9]{3,})\b"], text)
-        invoice_date = invoice_header.group(2).strip() if invoice_header else ""
+        invoice_date = invoice_header.group(2).strip() if invoice_header else first_regex(
+            [
+                r"INVOICE\s+DATE\s*\n\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4})",
+                r"INVOICE\s+NO\.\s*\n\s*[0-9]{3,}\s*-\s*[0-9]{3,}\s*\n\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4})",
+                r"SHIP\s+DATE\s*\n\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4})",
+            ],
+            text,
+            flags=re.IGNORECASE,
+        )
         if not invoice_date and invoice_number:
             invoice_date = first_regex([re.escape(invoice_number) + r".*?([0-9]{2}/[0-9]{2}/[0-9]{4})", re.escape(invoice_number) + r".*?([0-9]{2}/[0-9]{2}/[0-9]{2})"], text, flags=re.IGNORECASE | re.DOTALL)
         invoice_date = date_text(invoice_date)
-        order_number = first_regex([r"\b(HUNT-[0-9]+)\b", r"CUSTOMERORDERNO\.\s*\n([A-Za-z0-9\-]+)", r"CUSTOMER\s*\nORDER\s*\n.*?([A-Za-z0-9\-]+)\s*\nSALES PERSON", r"\bORDER\s*\n.*?([0-9]{3,})"], text, flags=re.IGNORECASE | re.DOTALL)
-        total_due = parse_money_text(first_regex([r"TOTAL\s*DUE\s+([0-9,]+\.[0-9]{2})", r"TOTALDUE\s*\n?\s*([0-9,]+\.[0-9]{2})"], text, flags=re.IGNORECASE))
+        order_number = first_regex(
+            [
+                r"\b(HUNT-[0-9]+)\b",
+                r"CUSTOMER\s+ORDER\s+NO\.\s*\n\s*([A-Za-z0-9\-]+)",
+                r"CUSTOMERORDERNO\.\s*\n\s*([A-Za-z0-9\-]+)",
+                r"JOB\s+NAME\s+CUSTOMER\s+ORDER\s+NO\.\s*\n.*?\b([A-Za-z0-9]+-[A-Za-z0-9]+)\b",
+                r"CUSTOMER\s*\nORDER\s*\n.*?([A-Za-z0-9\-]+)\s*\nSALES PERSON",
+                r"\bORDER\s*\n.*?([0-9]{3,})",
+            ],
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        total_due = parse_money_text(first_regex([r"TOTAL\s*DUE\s*[-=]*>?\s*([0-9,]+\.[0-9]{2})", r"TOTALDUE\s*\n?\s*([0-9,]+\.[0-9]{2})"], text, flags=re.IGNORECASE))
+        if not total_due:
+            money_values = [parse_money_text(value) for value in re.findall(r"\b[0-9,]+\.[0-9]{2}\b", text)]
+            if money_values:
+                total_due = money_values[-1]
         item_lines = []
         current = None
         stop_re = re.compile(r"^(TITLE TO|AT POINT|MERCHANDISE|A SERVICE|THIS SALE|CODE:|B -|C -|SALES TAX|SHIPPING CHARGE|TOTAL DUE)\b", re.IGNORECASE)
@@ -3089,6 +4099,28 @@ def import_vendor_invoice_pdf(path, project_id):
                     "unit_price": (parse_money_text(extension) / money(shipped_qty or ordered_qty)) if money(shipped_qty or ordered_qty) else 0,
                     "amount": extension,
                     "ced_price_code": price_code,
+                    "ced_quoted_price": quoted_price,
+                }
+                continue
+            match = re.match(
+                r"^T?\s*([0-9.]+)\s+(.+?)\s+([0-9.]+)\s+([0-9,]+\.[0-9]{2})\s+([A-Za-z])\s+([0-9,]+\.[0-9]{2})$",
+                line,
+            )
+            if match:
+                if current:
+                    item_lines.append(current)
+                ordered_qty, product_description, shipped_qty, quoted_price, price_code, extension = match.groups()
+                parts = product_description.split()
+                product_code = " ".join(parts[:2]) if len(parts) > 1 else product_description
+                qty = money(shipped_qty or ordered_qty)
+                amount = parse_money_text(extension)
+                current = {
+                    "product_code": product_code,
+                    "description": product_description,
+                    "qty": qty,
+                    "unit_price": amount / qty if qty else parse_money_text(quoted_price),
+                    "amount": amount,
+                    "ced_price_code": price_code.upper(),
                     "ced_quoted_price": quoted_price,
                 }
                 continue
@@ -3355,7 +4387,7 @@ LOGIN_HTML = r"""
   <form class="login" id="loginForm">
     <div class="brand">
       <img src="/brand/twin-peaks-logo.png" alt="Twin Peaks Electrical">
-      <div><h1>Project Dashboard</h1><div class="subtitle">Twin Peaks Electrical</div></div>
+      <div><h1>Company Dashboard</h1><div class="subtitle">Twin Peaks Electrical</div></div>
     </div>
     <label>Username</label><input name="username" autocomplete="username" required autofocus>
     <label>Password</label><input name="password" type="password" autocomplete="current-password" required>
@@ -3393,7 +4425,7 @@ HTML = r"""
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <link rel="manifest" href="/manifest.json">
   <link rel="apple-touch-icon" href="/brand/twin-peaks-logo.png">
-  <title>Twin Peaks Project Dashboard</title>
+  <title>Twin Peaks Company Dashboard</title>
   <style>
     :root {
       --ink: #17202a;
@@ -3423,12 +4455,15 @@ HTML = r"""
     .project-switcher { display: flex; align-items: center; gap: 10px; }
     .project-switcher label { color: #d8e6f3; margin: 0; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
     main { padding: 20px 24px 36px; max-width: 1500px; margin: 0 auto; }
-    nav { display: none; }
-    .section-nav { display: flex; align-items: flex-end; justify-content: flex-start; margin-bottom: 16px; }
-    .section-nav label { margin-top: 0; }
-    .section-nav select { width: min(330px, 100%); border: 1px solid var(--line); background: white; color: var(--ink); padding: 9px 10px; border-radius: 6px; cursor: pointer; font-weight: 650; transition: border-color .15s ease, box-shadow .15s ease, background-color .15s ease; }
-    .section-nav select:hover, .section-nav select:focus-visible { border-color: var(--blue); box-shadow: 0 8px 24px rgba(25, 99, 176, .12); outline: none; }
+    .app-shell { display: grid; grid-template-columns: 230px minmax(0, 1fr); gap: 18px; align-items: start; }
+    nav { position: sticky; top: 16px; display: flex; flex-direction: column; gap: 8px; background: white; border: 1px solid var(--line); border-radius: 8px; padding: 12px; }
+    nav::before { content: "Navigation"; color: var(--muted); font-size: 12px; font-weight: 750; text-transform: uppercase; letter-spacing: .04em; margin: 2px 2px 4px; }
+    nav button { width: 100%; text-align: left; }
+    .nav-subgroup { display: flex; flex-direction: column; gap: 6px; margin: -3px 0 6px 12px; padding: 0 0 0 10px; border-left: 2px solid #e6edf4; }
+    .nav-subgroup.hidden { display: none; }
+    .nav-subgroup button { font-size: 13px; padding: 8px 10px; }
     nav button, .btn { border: 1px solid var(--line); background: white; color: var(--ink); padding: 9px 12px; border-radius: 6px; cursor: pointer; font-weight: 600; transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease, background-color .15s ease; }
+    nav button:hover, nav button:focus-visible { border-color: var(--blue); box-shadow: 0 8px 24px rgba(25, 99, 176, .12); outline: none; transform: translateY(-1px); }
     .btn:hover, .btn:focus-visible { border-color: var(--blue); box-shadow: 0 8px 24px rgba(25, 99, 176, .12); outline: none; transform: translateY(-1px); }
     nav button.active, .btn.primary { background: var(--blue); color: white; border-color: var(--blue); }
     .btn.danger { color: var(--red); border-color: #f0b8b2; }
@@ -3439,6 +4474,34 @@ HTML = r"""
     .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px; min-width: 0; }
     .home-card { cursor: pointer; transition: border-color .15s ease, box-shadow .15s ease; }
     .home-card:hover { border-color: var(--blue); box-shadow: 0 8px 24px rgba(25, 99, 176, .12); }
+    .attention-panel { margin-bottom: 14px; }
+    .section-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+    .section-head h2 { margin: 0 0 4px; }
+    .attention-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+    .attention-card { display: grid; grid-template-columns: 1fr auto; gap: 8px 12px; align-items: center; border: 1px solid var(--line); border-radius: 8px; padding: 12px; background: #fbfcfd; cursor: pointer; transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease; }
+    .attention-card:hover { border-color: var(--blue); box-shadow: 0 8px 22px rgba(25, 99, 176, .11); transform: translateY(-1px); }
+    .attention-card.ok { border-color: #cfe3d7; background: #f7fbf8; }
+    .attention-card.warn { border-color: #f0d08b; background: #fffbef; }
+    .attention-card.bad { border-color: #e5aaa5; background: #fff6f5; }
+    .attention-card .label { color: #34495e; font-size: 12px; font-weight: 800; text-transform: uppercase; }
+    .attention-card .count { font-size: 28px; font-weight: 800; line-height: 1; }
+    .attention-card.ok .count { color: var(--green); }
+    .attention-card.warn .count { color: var(--amber); }
+    .attention-card.bad .count { color: var(--red); }
+    .attention-card .detail { color: var(--muted); font-size: 13px; }
+    .attention-card .amount { color: #34495e; font-weight: 700; text-align: right; }
+    .attention-card .open-link { grid-column: 2; color: var(--blue); font-weight: 800; font-size: 13px; text-align: right; }
+    .attention-list { grid-column: 1 / -1; display: grid; gap: 6px; margin-top: 4px; }
+    .attention-item { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 8px; padding: 8px; border: 1px solid rgba(0,0,0,.08); border-radius: 8px; background: rgba(255,255,255,.65); }
+    .attention-item strong { display: block; font-size: 13px; }
+    .attention-item span { color: var(--muted); font-size: 12px; }
+    .attention-item .btn { padding: 6px 8px; font-size: 12px; }
+    .permission-role { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; margin-top: 12px; }
+    .permission-role-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 12px 14px; background: #eef2f6; font-weight: 800; }
+    .permission-role table { margin: 0; }
+    .permission-role td:last-child, .permission-role th:last-child,
+    .permission-role td:nth-last-child(2), .permission-role th:nth-last-child(2) { text-align: center; width: 90px; }
+    .permission-role input[type="checkbox"] { width: auto; }
     .kpi { min-height: 98px; }
     .help-card { position: relative; overflow: visible; }
     .help-marker { position: absolute; top: 10px; right: 10px; z-index: 4; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border: 1px solid var(--line); border-radius: 50%; background: #fbfcfd; color: var(--blue); font-size: 13px; font-weight: 800; cursor: help; }
@@ -3522,10 +4585,6 @@ HTML = r"""
     .bad { color: var(--red); }
     .warn { color: var(--gold); }
     .hidden { display: none; }
-    .po-feature-disabled,
-    .home-card[data-open-tab="fieldPo"],
-    .home-card[data-open-tab="officePo"],
-    nav [data-tab="projectPo"] { display: none !important; }
     body.read-only form input, body.read-only form select, body.read-only form textarea { pointer-events: none; background: #f6f8fa; color: #607080; }
     body.read-only #changePasswordForm input { pointer-events: auto; background: white; color: var(--ink); }
     body.read-only form .actions,
@@ -3546,20 +4605,32 @@ HTML = r"""
     body.read-only [data-omit-fieldwise],
     body.read-only [data-delete-audit-omission],
     body.read-only [data-save-office-po],
+    body.read-only [data-save-cog],
+    body.read-only [data-delete-cog],
     body.read-only #addRate,
+    body.read-only #addCogCategory,
+    body.read-only #saveTexasReminderRecipients,
+    body.read-only #sendTexasReminderNow,
+    body.read-only #saveBillingReminder,
+    body.read-only #sendBillingReminderNow,
     body.read-only #importVendorInvoice { display: none !important; }
     body.read-only .home-card[data-open-tab="officePo"] { display: none !important; }
     body.read-only #vendorAllocationForm .actions { display: none !important; }
     body.read-only #changePasswordForm .actions { display: flex !important; }
     body.tx-read-only .project-switcher,
-    body.tx-read-only nav [data-tab="home"],
-    body.tx-read-only nav [data-nav-area="project"],
+    body.tx-read-only nav button:not([data-tab="texasOps"]),
+    body.tx-read-only nav .nav-subgroup,
     body.tx-read-only .home-card:not([data-open-tab="texasOps"]),
     body.tx-read-only #financialUploadForm,
     body.tx-read-only [data-delete-financial-report] { display: none !important; }
     body.field-po-only .project-switcher,
     body.field-po-only nav,
     body.field-po-only .home-card:not([data-open-tab="fieldPo"]) { display: none !important; }
+    .field-po-hero { max-width: 760px; margin: 0 auto 14px; }
+    .field-po-hero h2 { font-size: 28px; margin-bottom: 4px; }
+    .field-po-steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 12px; }
+    .field-po-step { border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: #fbfcfd; font-weight: 750; }
+    .field-po-step span { display: block; color: var(--muted); font-size: 12px; margin-top: 3px; font-weight: 650; }
     .field-po-panel { max-width: 760px; margin: 0 auto; }
     .field-po-panel label { font-size: 15px; color: var(--ink); margin-top: 16px; }
     .field-po-panel input,
@@ -3567,6 +4638,47 @@ HTML = r"""
     .field-po-panel textarea { font-size: 18px; padding: 14px 13px; min-height: 52px; }
     .field-po-panel textarea { min-height: 132px; }
     .field-po-submit { width: 100%; min-height: 58px; font-size: 18px; }
+    .field-po-list { display: grid; gap: 12px; }
+    .field-po-card { border: 1px solid var(--line); border-radius: 8px; background: white; padding: 14px; display: grid; gap: 10px; }
+    .field-po-card-header { display: flex; justify-content: space-between; gap: 10px; align-items: flex-start; }
+    .field-po-card-title { font-size: 18px; font-weight: 800; }
+    .field-po-card-meta { color: var(--muted); font-size: 13px; margin-top: 3px; }
+    .field-po-status { border-radius: 999px; padding: 5px 9px; font-size: 12px; font-weight: 800; background: #eef2f6; white-space: nowrap; }
+    .field-po-status-pending-approval { background: #fff7e6; color: #8a5a00; }
+    .field-po-status-open, .field-po-status-issued { background: #eef5ff; color: var(--blue); }
+    .field-po-status-picked-up { background: #e8f7ef; color: var(--green); }
+    .field-po-status-closed { background: #e9eef5; color: var(--muted); }
+    .field-po-status-void { background: #fdecea; color: var(--red); }
+    .pickup-upload { border: 1px dashed #9eb4cb; background: #f8fbff; border-radius: 8px; padding: 12px; }
+    .pickup-upload input { width: 100%; min-height: 48px; }
+    .pickup-upload .btn { width: 100%; min-height: 48px; justify-content: center; margin-top: 8px; }
+    .combo-wrap { position: relative; }
+    .combo-list {
+      position: absolute;
+      z-index: 20;
+      top: calc(100% + 4px);
+      left: 0;
+      right: 0;
+      max-height: 260px;
+      overflow: auto;
+      background: white;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: 0 14px 30px rgba(15, 23, 42, 0.16);
+    }
+    .combo-option {
+      width: 100%;
+      border: 0;
+      background: white;
+      text-align: left;
+      padding: 10px 12px;
+      border-bottom: 1px solid #eef2f6;
+      cursor: pointer;
+    }
+    .combo-option:hover,
+    .combo-option:focus { background: #eef5ff; outline: none; }
+    .combo-option strong { display: block; color: var(--ink); }
+    .combo-option span { display: block; color: var(--muted); font-size: 12px; margin-top: 2px; }
     .bar { height: 12px; background: #e8edf2; border-radius: 999px; overflow: hidden; }
     .bar span { display: block; height: 100%; background: var(--blue); }
     .invoice-summary { background: #fbfcfd; cursor: pointer; }
@@ -3625,6 +4737,7 @@ HTML = r"""
     details .detail-body { padding: 12px; }
     @media (max-width: 1250px) {
       .dashboard-split { grid-template-columns: 1fr; }
+      .attention-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
     @media (max-width: 900px) {
       header { align-items: flex-start; flex-direction: column; }
@@ -3632,8 +4745,18 @@ HTML = r"""
       .brand-lockup { min-width: 0; }
       header select { min-width: 0; width: 100%; }
       .project-switcher { width: 100%; align-items: stretch; flex-direction: column; }
-      .section-nav select { width: 100%; }
+      .app-shell { grid-template-columns: 1fr; }
+      nav { position: static; flex-direction: row; overflow-x: auto; }
+      nav::before { display: none; }
+      .nav-subgroup { flex-direction: row; margin: 0; padding: 0; border-left: 0; }
+      nav button { width: auto; white-space: nowrap; }
+      .field-po-steps { grid-template-columns: 1fr; }
+      .field-po-hero h2 { font-size: 24px; }
+      .field-po-card-header { flex-direction: column; }
+      .field-po-status { align-self: flex-start; }
       .grid.cols-4, .grid.cols-2 { grid-template-columns: 1fr; }
+      .attention-grid { grid-template-columns: 1fr; }
+      .section-head { flex-direction: column; align-items: stretch; }
       .project-banner { grid-template-columns: 1fr; }
       .cost-filter-bar { grid-template-columns: 1fr; }
     }
@@ -3653,11 +4776,11 @@ HTML = r"""
         </div>
       </div>
       <div class="brand-title">
-        <h1>Project Dashboard</h1>
+        <h1>Company Dashboard</h1>
         <div class="subtitle">Twin Peaks Electrical</div>
       </div>
     </div>
-    <div class="project-switcher">
+    <div class="project-switcher hidden">
       <label for="projectSelect">Master Project</label>
       <select id="projectSelect"></select>
       <div style="margin-top:8px;display:flex;gap:8px;align-items:center;justify-content:flex-end">
@@ -3666,71 +4789,75 @@ HTML = r"""
     </div>
   </header>
   <main>
-    <div class="section-nav">
-      <div>
-        <label for="sectionNavSelect">Navigation</label>
-        <select id="sectionNavSelect"></select>
-      </div>
-    </div>
-    <nav>
-      <button data-tab="home" data-nav-area="home" class="active">Home</button>
-      <button data-tab="dashboard" data-nav-area="project" class="hidden">Project Dashboard</button>
-      <button data-tab="setup" data-nav-area="project" class="hidden">Setup</button>
-      <button data-tab="import" data-nav-area="project" class="hidden">Field Wise</button>
-      <button data-tab="review" data-nav-area="project" class="hidden">Review Exceptions</button>
-      <button data-tab="invoices" data-nav-area="project" class="hidden">Vendor Invoices</button>
-      <button data-tab="billing" data-nav-area="project" class="hidden">Customer Billing</button>
-      <button data-tab="projectPo" data-nav-area="project" class="hidden po-feature-disabled">POs</button>
-      <button data-tab="texasOps" data-nav-area="texas" class="hidden">Texas Ops</button>
-    </nav>
+    <div class="app-shell">
+      <nav>
+        <button data-tab="home" data-nav-area="main" data-nav-level="main" class="active">Home</button>
+        <div class="nav-subgroup hidden" data-nav-group="home">
+          <button data-tab="bids" data-nav-area="home" data-nav-level="sub">Bid Tracking</button>
+          <button data-tab="jobOrderReport" data-nav-area="home" data-nav-level="sub">Job Order Quick Reference</button>
+        </div>
+        <button data-tab="dashboard" data-nav-area="main" data-nav-level="main">Project Dashboard</button>
+        <div class="nav-subgroup hidden" data-nav-group="project">
+          <button data-tab="newMasterProject" data-nav-area="project" data-nav-level="sub">New Master Project</button>
+          <button data-tab="setup" data-nav-area="project" data-nav-level="sub">Setup</button>
+          <button data-tab="import" data-nav-area="project" data-nav-level="sub">Field Wise</button>
+          <button data-tab="review" data-nav-area="project" data-nav-level="sub">Review Exceptions</button>
+          <button data-tab="invoices" data-nav-area="project" data-nav-level="sub">Vendor Invoices</button>
+          <button data-tab="billing" data-nav-area="project" data-nav-level="sub">Customer Billing</button>
+          <button data-tab="projectPo" data-nav-area="project" data-nav-level="sub" class="po-feature-disabled">POs</button>
+          <button data-tab="archivedProjects" data-nav-area="project" data-nav-level="sub">Archived Projects</button>
+        </div>
+        <button data-tab="fieldwiseAudit" data-nav-area="main" data-nav-level="main">Field Wise Audit</button>
+        <button data-tab="fieldPo" data-nav-area="main" data-nav-level="main">Purchase Orders</button>
+        <div class="nav-subgroup hidden" data-nav-group="po">
+          <button data-tab="fieldPo" data-nav-area="po" data-nav-level="sub">Create PO</button>
+          <button data-tab="officePo" data-nav-area="po" data-nav-level="sub">Office PO Review</button>
+          <button data-tab="cogSetup" data-nav-area="po" data-nav-level="sub">COG's Setup</button>
+        </div>
+        <button data-tab="texasOps" data-nav-area="main" data-nav-level="main">Texas Ops</button>
+        <div class="nav-subgroup hidden" data-nav-group="texas">
+          <button data-tab="texasReminders" data-nav-area="texas" data-nav-level="sub">Reminders Setup</button>
+        </div>
+      </nav>
+      <div class="app-content">
 
     <section id="home" class="tab">
-      <div class="grid cols-2">
-        <div class="panel home-card" data-open-tab="dashboard" role="button" tabindex="0">
-          <h2>Project Dashboard</h2>
-          <p class="muted">Track master projects, subprojects, change orders, Field Wise tickets, vendor invoices, and profitability.</p>
-          <div class="actions"><button class="btn primary" data-open-tab="dashboard" type="button">Open Project Dashboard</button></div>
+      <div class="panel attention-panel">
+        <div class="section-head">
+          <div>
+            <h2>Needs Attention</h2>
+            <p class="muted">Quick checks for items that may need action today.</p>
+          </div>
+          <button class="btn" id="refreshHomeAlerts" type="button">Refresh</button>
         </div>
-        <div class="panel home-card" data-open-tab="bids" role="button" tabindex="0">
-          <h2>Bid Tracking</h2>
-          <p class="muted">Track RFQs, due dates, estimators, bid stages, weighted forecast, win/loss, and risk notes.</p>
-          <div class="actions"><button class="btn primary" data-open-tab="bids" type="button">Open Bid Tracking</button></div>
-        </div>
-        <div class="panel home-card" data-open-tab="texasOps" role="button" tabindex="0">
-          <h2>Texas Operations</h2>
-          <p class="muted">Upload weekly Balance Sheet and P&L reports and review a financial overview with trends.</p>
-          <div class="actions"><button class="btn primary" data-open-tab="texasOps" type="button">Open Texas Ops</button></div>
-        </div>
-        <div class="panel home-card" data-open-tab="jobOrderReport" role="button" tabindex="0">
-          <h2>Job Order Quick Reference</h2>
-          <p class="muted">Look up active job/order numbers with their customer, master project, and description.</p>
-          <div class="actions"><button class="btn primary" data-open-tab="jobOrderReport" type="button">Open Job Orders</button></div>
-        </div>
-        <div class="panel home-card po-feature-disabled" data-open-tab="fieldPo" role="button" tabindex="0">
-          <h2>Create PO</h2>
-          <p class="muted">Fast field purchase order requests tied to active job/order numbers.</p>
-          <div class="actions"><button class="btn primary" data-open-tab="fieldPo" type="button">Create PO</button></div>
-        </div>
-        <div class="panel home-card po-feature-disabled" data-open-tab="officePo" role="button" tabindex="0">
-          <h2>Office PO Review</h2>
-          <p class="muted">Review, issue, receive, close, or void purchase order requests from the field.</p>
-          <div class="actions"><button class="btn primary" data-open-tab="officePo" type="button">Open PO Review</button></div>
-        </div>
-        <div class="panel home-card" data-open-tab="archivedProjects" role="button" tabindex="0">
-          <h2>Archived Projects</h2>
-          <p class="muted">Open closed projects for reference or restore them back to the active project list.</p>
-          <div class="actions"><button class="btn primary" data-open-tab="archivedProjects" type="button">Open Archive</button></div>
-        </div>
+        <div id="homeAlerts" class="attention-grid"></div>
       </div>
     </section>
 
     <section id="fieldPo" class="tab hidden">
+      <div class="panel field-po-hero">
+        <h2>Field Purchase Orders</h2>
+        <p class="muted">Create the PO, then come back here to upload the pickup ticket after the vendor gives it to you.</p>
+        <div class="field-po-steps">
+          <div class="field-po-step">1. Pick job<span>Search job/order or COG</span></div>
+          <div class="field-po-step">2. Create PO<span>Vendor and materials</span></div>
+          <div class="field-po-step">3. Add ticket<span>Photo after pickup</span></div>
+        </div>
+      </div>
       <div class="panel field-po-panel">
         <h2>Create PO</h2>
         <form id="fieldPoForm" enctype="multipart/form-data">
-          <label>Job / Order #</label>
-          <select name="job_key" id="fieldPoJobSelect" required></select>
-          <label>Vendor</label>
+          <label>Job / Order # / COG</label>
+          <div class="combo-wrap">
+            <input id="fieldPoJobSearch" placeholder="Type job, order, COG, customer, or project..." autocomplete="off" required>
+            <input type="hidden" name="job_key" id="fieldPoJobKey" required>
+            <div id="fieldPoJobList" class="combo-list hidden"></div>
+          </div>
+          <div id="fieldPoCustomerWrap" class="hidden">
+            <label>Customer <span class="bad">*</span></label>
+            <input name="customer_name" id="fieldPoCustomer" placeholder="Customer name" autocomplete="organization" disabled>
+          </div>
+          <label>Vendor <span class="bad">*</span></label>
           <input name="vendor" id="fieldPoVendor" placeholder="Vendor name" autocomplete="organization" required>
           <label>What are you buying?</label>
           <textarea name="description" id="fieldPoDescription" placeholder="Example: 2 boxes 3/4 EMT, 20 couplings, lift rental" required></textarea>
@@ -3739,7 +4866,7 @@ HTML = r"""
           <label>Photo / Quote</label>
           <input name="attachment" id="fieldPoAttachment" type="file" accept=".pdf,.png,.jpg,.jpeg,.webp">
           <div class="actions field-po-actions">
-            <button class="btn primary field-po-submit" type="submit">Submit PO Request</button>
+            <button class="btn primary field-po-submit" type="submit">Create PO</button>
           </div>
           <div id="fieldPoResult" class="muted"></div>
         </form>
@@ -3749,7 +4876,7 @@ HTML = r"""
           <h2>My POs</h2>
           <button class="btn" id="refreshFieldPos" type="button">Refresh</button>
         </div>
-        <div class="table-wrap"><table id="fieldPoTable"></table></div>
+        <div id="fieldPoList" class="field-po-list"></div>
       </div>
     </section>
 
@@ -3758,16 +4885,30 @@ HTML = r"""
         <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
           <div>
             <h2>Office PO Review</h2>
-            <p class="muted">Use status to close the loop after the PO is issued, received, closed, or voided.</p>
+            <p class="muted">Use status to track pickup tickets and close or void completed POs with a reason.</p>
           </div>
           <button class="btn" id="refreshOfficePos" type="button">Refresh</button>
         </div>
         <div class="grid cols-4">
-          <div><label>Status</label><select id="officePoStatusFilter"><option value="">All statuses</option><option>Pending Review</option><option>Issued</option><option>Received</option><option>Closed</option><option>Void</option></select></div>
+          <div><label>Status</label><select id="officePoStatusFilter"><option value="">All statuses</option><option>Pending Approval</option><option>Issued</option><option>Picked Up</option><option>Closed</option><option>Void</option></select></div>
           <div style="grid-column:span 3"><label>Search</label><input id="officePoSearch" placeholder="Search PO, job/order, vendor, requester, or description"></div>
         </div>
         <div class="muted" id="officePoCount" style="margin-top:8px"></div>
         <div class="table-wrap" style="margin-top:10px"><table id="officePoTable"></table></div>
+      </div>
+    </section>
+
+    <section id="cogSetup" class="tab hidden">
+      <div class="panel">
+        <h2>COG Categories</h2>
+        <p class="muted">Company-wide COG choices for POs that do not belong to a tracked job/order number.</p>
+        <div class="grid cols-4">
+          <div><label>Name</label><input id="cogName" placeholder="Truck 12"></div>
+          <div><label>Internal COG Code</label><input id="cogCode" placeholder="TRUCK"></div>
+          <div style="grid-column:span 2"><label>Description</label><input id="cogDescription" placeholder="Optional notes for office review"></div>
+        </div>
+        <div class="actions"><button class="btn primary" id="addCogCategory" type="button">Add COG Category</button></div>
+        <div class="table-wrap" style="margin-top:12px"><table id="cogCategoryTable"></table></div>
       </div>
     </section>
 
@@ -3827,6 +4968,63 @@ HTML = r"""
       <div class="panel" style="margin-top:14px"><h2>Uploaded Reports</h2><div id="financialReports"></div></div>
     </section>
 
+    <section id="texasReminders" class="tab hidden">
+      <div class="panel">
+        <h2>Reminders Setup</h2>
+        <p class="muted">Set a recurring reminder for the Texas Ops P&amp;L upload. When the selected day and time arrives, the server checks whether that day&apos;s P&amp;L has been uploaded. If it is missing, selected users receive an email reminder.</p>
+        <div class="grid cols-4">
+          <label style="display:flex;align-items:center;gap:8px;margin-top:28px"><input id="texasReminderEnabled" type="checkbox" style="width:auto"> Enabled</label>
+          <div><label>Day</label><select id="texasReminderWeekday">
+            <option value="0">Monday</option>
+            <option value="1">Tuesday</option>
+            <option value="2">Wednesday</option>
+            <option value="3">Thursday</option>
+            <option value="4">Friday</option>
+            <option value="5">Saturday</option>
+            <option value="6">Sunday</option>
+          </select></div>
+          <div><label>Time</label><input id="texasReminderTime" type="time" value="15:00"></div>
+        </div>
+        <div id="texasReminderStatus" class="muted" style="margin-top:10px"></div>
+        <h3>Recipients</h3>
+        <div id="texasReminderRecipients" style="margin-top:10px"></div>
+        <div class="actions">
+          <button class="btn primary" id="saveTexasReminderRecipients" type="button">Save Reminder Setup</button>
+          <button class="btn" id="sendTexasReminderNow" type="button">Check / Send Reminder Now</button>
+        </div>
+        <div id="texasReminderResult" class="muted"></div>
+        <div id="texasReminderLog" style="margin-top:10px"></div>
+      </div>
+      <div class="panel" style="margin-top:14px">
+        <h2>Customer Invoice Reminder</h2>
+        <p class="muted">Send a weekly list of active jobs that have not had a customer invoice added within the selected lookback window.</p>
+        <div class="grid cols-4">
+          <label style="display:flex;align-items:center;gap:8px;margin-top:28px"><input id="billingReminderEnabled" type="checkbox" style="width:auto"> Enabled</label>
+          <div><label>Day</label><select id="billingReminderWeekday">
+            <option value="0">Monday</option>
+            <option value="1">Tuesday</option>
+            <option value="2">Wednesday</option>
+            <option value="3">Thursday</option>
+            <option value="4">Friday</option>
+            <option value="5">Saturday</option>
+            <option value="6">Sunday</option>
+          </select></div>
+          <div><label>Time</label><input id="billingReminderTime" type="time" value="15:00"></div>
+          <div><label>Lookback Days</label><input id="billingReminderLookback" type="number" min="1" max="60" value="7"></div>
+        </div>
+        <div id="billingReminderStatus" class="muted" style="margin-top:10px"></div>
+        <h3>Recipients</h3>
+        <div id="billingReminderRecipients" style="margin-top:10px"></div>
+        <div class="actions">
+          <button class="btn primary" id="saveBillingReminder" type="button">Save Billing Reminder</button>
+          <button class="btn" id="sendBillingReminderNow" type="button">Check / Send Billing Reminder Now</button>
+        </div>
+        <div id="billingReminderResult" class="muted"></div>
+        <div id="billingReminderJobs" style="margin-top:10px"></div>
+        <div id="billingReminderLog" style="margin-top:10px"></div>
+      </div>
+    </section>
+
     <section id="dashboard" class="tab hidden">
       <div id="projectBanner"></div>
       <div class="actions" style="margin-bottom:14px"><button class="btn primary" id="openMasterDetail" type="button">Open Master Project Detail</button></div>
@@ -3870,6 +5068,24 @@ HTML = r"""
       <div class="panel" style="margin-top:14px"><h2>Cost By Type</h2><div id="typeSummary"></div></div>
     </section>
 
+    <section id="newMasterProject" class="tab hidden">
+      <form class="panel" id="newProjectForm">
+        <h2>New Master Project</h2>
+        <p class="muted">Create a company-level master project. Subprojects and change orders are added afterward in Setup.</p>
+        <div class="grid cols-2">
+          <div><label>Project Code</label><input name="project_code" placeholder="Alexandria 33-6" required></div>
+          <div><label>Project Name</label><input name="name" placeholder="Alexandria 33-6" required></div>
+          <div><label>Customer</label><input name="customer" placeholder="Hunt Oil"></div>
+          <div><label>Location</label><input name="location" placeholder="Alexandria 33-6"></div>
+          <div><label>Customer Provided PO #</label><input name="customer_po" placeholder="PO number"></div>
+          <div><label>Project Rate Set</label><select name="rate_set_id" id="newProjectRateSet"></select></div>
+        </div>
+        <label>Description</label><textarea name="description" placeholder="Scope notes, project summary, or contract description"></textarea>
+        <input type="hidden" name="contract_value" value="0">
+        <div class="actions"><button class="btn primary" type="submit">Create Master Project</button></div>
+      </form>
+    </section>
+
     <section id="setup" class="tab hidden">
       <div class="grid cols-2">
         <form class="panel" id="projectForm">
@@ -3884,8 +5100,6 @@ HTML = r"""
           <label>Project Rate Set</label><select name="rate_set_id" id="projectRateSet"></select>
           <div class="actions">
             <button class="btn primary" id="saveProjectBtn" type="submit">Save Project</button>
-            <button class="btn" id="newProjectBtn" type="button">New Master Project</button>
-            <button class="btn hidden" id="cancelNewProjectBtn" type="button">Cancel New</button>
             <button class="btn danger" id="archiveProjectBtn" type="button">Close & Archive Project</button>
           </div>
         </form>
@@ -3949,7 +5163,22 @@ HTML = r"""
         <div class="actions"><button class="btn primary" type="submit">Import</button></div>
         <p id="importResult" class="muted"></p>
       </form>
-      <form class="panel" id="fieldWiseAuditForm" style="margin-top:14px">
+      <div class="panel" style="margin-top:14px">
+        <h2>Imported Files</h2>
+        <div id="importHistoryFilters" class="cost-filter" style="margin-bottom:10px"></div>
+        <div class="muted" id="importHistoryCount" style="margin-bottom:8px"></div>
+        <div class="table-wrap"><table id="importHistoryTable"></table></div>
+      </div>
+      <div class="panel" style="margin-top:14px">
+        <h2>Field Ticket Lines</h2>
+        <p class="muted">Expand a ticket to correct individual labor, equipment, or material lines when the ticket was written against the wrong job.</p>
+        <div id="fieldTicketLineFilters"></div>
+        <div class="table-wrap"><table id="fieldTicketLinesTable"></table></div>
+      </div>
+    </section>
+
+    <section id="fieldwiseAudit" class="tab hidden">
+      <form class="panel" id="fieldWiseAuditForm">
         <h2>Field Wise Ticket Audit</h2>
         <p class="muted">Upload the all-customer Field Wise line-item export to check tracked job/order numbers against tickets already imported here.</p>
         <label>Field Wise Ticket Export</label><input type="file" name="file" accept=".xlsx,.xlsm" required>
@@ -3963,18 +5192,6 @@ HTML = r"""
         <div id="fieldWiseAuditTables" style="margin-top:12px"></div>
         <div id="fieldWiseAuditOmissions" style="margin-top:12px"></div>
       </form>
-      <div class="panel" style="margin-top:14px">
-        <h2>Imported Files</h2>
-        <div id="importHistoryFilters" class="cost-filter" style="margin-bottom:10px"></div>
-        <div class="muted" id="importHistoryCount" style="margin-bottom:8px"></div>
-        <div class="table-wrap"><table id="importHistoryTable"></table></div>
-      </div>
-      <div class="panel" style="margin-top:14px">
-        <h2>Field Ticket Lines</h2>
-        <p class="muted">Expand a ticket to correct individual labor, equipment, or material lines when the ticket was written against the wrong job.</p>
-        <div id="fieldTicketLineFilters"></div>
-        <div class="table-wrap"><table id="fieldTicketLinesTable"></table></div>
-      </div>
     </section>
 
     <section id="review" class="tab hidden">
@@ -4058,7 +5275,7 @@ HTML = r"""
           <button class="btn" id="refreshProjectPos" type="button">Refresh</button>
         </div>
         <div class="grid cols-4">
-          <div><label>Status</label><select id="projectPoStatusFilter"><option value="">All statuses</option><option>Pending Review</option><option>Issued</option><option>Received</option><option>Closed</option><option>Void</option></select></div>
+          <div><label>Status</label><select id="projectPoStatusFilter"><option value="">All statuses</option><option>Pending Approval</option><option>Issued</option><option>Picked Up</option><option>Closed</option><option>Void</option></select></div>
           <div style="grid-column:span 3"><label>Search</label><input id="projectPoSearch" placeholder="Search PO, job/order, vendor, requester, or description"></div>
         </div>
         <div class="muted" id="projectPoCount" style="margin-top:8px"></div>
@@ -4112,6 +5329,7 @@ HTML = r"""
           <label>Username</label><input name="username" required>
           <label>Display Name</label><input name="display_name">
           <label>Role</label><select name="role"><option>User</option><option>Read Only</option><option>TX/Read Only</option><option>Field PO</option><option>Admin</option></select>
+          <label><input name="po_auto_issue" type="checkbox" value="1"> Auto-issue this user's POs</label>
           <p class="muted">New users start with temporary password TPE1776 and must change it at first login.</p>
           <div class="actions"><button class="btn primary" type="submit">Add User</button></div>
         </form>
@@ -4119,8 +5337,39 @@ HTML = r"""
           <h2>Users</h2>
           <div class="table-wrap"><table id="usersTable"></table></div>
         </div>
+        <div class="panel" style="grid-column:1 / -1">
+          <h2>Role Permissions</h2>
+          <p class="muted">Control what each role can see or change. Admin is always full access so you cannot lock yourself out.</p>
+          <div id="rolePermissions"></div>
+        </div>
+        <div class="panel">
+          <h2>Manual Backup</h2>
+          <p class="muted">Download a snapshot of the SQLite database before major imports, server updates, or cleanup work.</p>
+          <div class="actions"><a class="btn primary" href="/api/admin/database-backup">Download Database Backup</a></div>
+        </div>
+        <div class="panel">
+          <h2>Activity Log</h2>
+          <p class="muted">Review sensitive changes such as deletes, user updates, reminder changes, and audit exceptions.</p>
+          <div class="actions"><button class="btn primary" data-open-tab="activity" type="button">Open Activity Log</button></div>
+        </div>
       </div>
     </section>
+
+    <section id="activity" class="tab hidden">
+      <div class="panel">
+        <h2>Activity Log</h2>
+        <div class="grid cols-4">
+          <div><label>Search</label><input id="activitySearch" placeholder="User, action, target, details"></div>
+          <div><label>Action</label><select id="activityAction"><option value="">All actions</option></select></div>
+          <div><label>Limit</label><select id="activityLimit"><option>50</option><option selected>100</option><option>250</option><option>500</option></select></div>
+        </div>
+        <div class="actions"><button class="btn" id="refreshActivity" type="button">Refresh</button></div>
+        <div class="muted" id="activityCount" style="margin-top:10px"></div>
+        <div class="table-wrap" style="margin-top:10px"><table id="activityTable"></table></div>
+      </div>
+    </section>
+      </div>
+    </div>
   </main>
   <div class="modal-backdrop hidden" id="unsavedModal">
     <div class="modal">
@@ -4258,12 +5507,12 @@ HTML = r"""
   </div>
 
   <script>
-    const PO_FEATURE_ENABLED = false;
-    let state = { projects: [], projectId: null, subprojects: [], changeOrders: [], internalRates: [], rateSets: [], currentUser: null };
+    const PO_FEATURE_ENABLED = true;
+    const COG_CUSTOMER_OPTIONAL_NAMES = new Set(['expenses', 'truck & auto expense', 'truck and auto expense']);
+    let state = { projects: [], projectId: null, subprojects: [], changeOrders: [], cogCategories: [], internalRates: [], rateSets: [], currentUser: null };
     let openSubprojectDetailId = null;
     let masterDetailIsOpen = false;
     let hasUnsavedChanges = false;
-    let projectCreateMode = false;
     let selectedDashboardSubprojectId = null;
     let selectedDashboardChangeOrderId = null;
     let invoiceGroupSeq = 0;
@@ -4271,8 +5520,10 @@ HTML = r"""
     let vendorAllocationGroups = {};
     let jobOrderReportRows = [];
     let jobOrderSort = { field: 'job_number', direction: 'asc' };
+    let fieldPoJobChoices = [];
     let officePoRows = [];
     let projectPoRows = [];
+    let rolePermissionsData = null;
     let fieldWiseAuditData = null;
     let fieldWiseAuditOmissions = [];
     const collapsedHierarchyNodes = new Set();
@@ -4281,6 +5532,27 @@ HTML = r"""
     const pct = v => `${(Number(v || 0) * 100).toFixed(1)}%`;
     const htmlEscape = v => String(v ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
     const help = text => `<span class="help-marker" tabindex="0" aria-label="${htmlEscape(text)}">?<span class="help-popover">${htmlEscape(text)}</span></span>`;
+    const TAB_PERMISSIONS = {
+      dashboard: 'projects',
+      newMasterProject: 'project_setup',
+      setup: 'project_setup',
+      import: 'fieldwise',
+      review: 'review_exceptions',
+      invoices: 'vendor_invoices',
+      billing: 'customer_billing',
+      projectPo: 'po_review',
+      fieldwiseAudit: 'fieldwise_audit',
+      bids: 'bids',
+      jobOrderReport: 'job_order_report',
+      archivedProjects: 'archived_projects',
+      texasOps: 'texas_ops',
+      texasReminders: 'texas_reminders',
+      fieldPo: 'po_requests',
+      officePo: 'po_review',
+      cogSetup: 'cog_setup',
+      activity: 'activity',
+      admin: 'admin'
+    };
     const plainTable = (headers, rows) => `<table><thead><tr>${headers.map(h => `<th>${h}</th>`).join('')}</tr></thead><tbody>${rows.map(r => `<tr>${r.map(c => `<td>${c}</td>`).join('')}</tr>`).join('')}</tbody></table>`;
     const api = async (url, opts={}) => {
       const res = await fetch(url, opts);
@@ -4296,32 +5568,21 @@ HTML = r"""
     const markSaved = () => { hasUnsavedChanges = false; };
     const isTexasReadOnly = () => state.currentUser?.role === 'TX/Read Only';
     const isFieldPoOnly = () => state.currentUser?.role === 'Field PO';
-    const setProjectCreateMode = enabled => {
-      projectCreateMode = enabled;
-      const form = document.getElementById('projectForm');
-      const saveBtn = document.getElementById('saveProjectBtn');
-      const cancelBtn = document.getElementById('cancelNewProjectBtn');
-      if (saveBtn) saveBtn.textContent = enabled ? 'Create Project' : 'Save Project';
-      if (cancelBtn) cancelBtn.classList.toggle('hidden', !enabled);
-      const archiveBtn = document.getElementById('archiveProjectBtn');
-      if (archiveBtn) archiveBtn.classList.toggle('hidden', enabled);
-      if (form && enabled) {
-        form.reset();
-        const rateSelect = document.getElementById('projectRateSet');
-        if (rateSelect && state.projects.length) {
-          const current = state.projects.find(p => p.id === state.projectId);
-          if (current?.rate_set_id) rateSelect.value = current.rate_set_id;
-        }
-        const contract = form.querySelector('[name="contract_value"]');
-        if (contract) contract.value = '0';
-      }
+    const canViewPermission = key => {
+      if (!key || state.currentUser?.role === 'Admin') return true;
+      return !!Number(state.currentUser?.permissions?.[key]?.can_view || 0);
     };
+    const canEditPermission = key => {
+      if (!key || state.currentUser?.role === 'Admin') return true;
+      return !!Number(state.currentUser?.permissions?.[key]?.can_edit || 0);
+    };
+    const canViewTab = tabName => canViewPermission(TAB_PERMISSIONS[tabName]);
     const isTemporaryViewControl = target => {
       return target.closest('.cost-filter') || target.closest('#financialProfitTrend') || target.id === 'showAllCosts';
     };
     const markUnsaved = event => {
       if (isTemporaryViewControl(event.target)) return;
-      if (event.target.matches('input, textarea, select') && event.target.type !== 'file' && !['projectSelect', 'sectionNavSelect'].includes(event.target.id)) {
+      if (event.target.matches('input, textarea, select') && event.target.type !== 'file' && event.target.id !== 'projectSelect') {
         hasUnsavedChanges = true;
       }
     };
@@ -4422,78 +5683,163 @@ HTML = r"""
     });
 
     function navOptionsForTab(tabName) {
-      const projectTabs = ['dashboard','setup','import','review','invoices','billing','projectPo'];
-      const inProjectArea = projectTabs.includes(tabName);
-      if (isTexasReadOnly()) return [{ tab: 'texasOps', label: 'Texas Ops' }];
-      if (isFieldPoOnly()) return [{ tab: 'fieldPo', label: 'Create PO' }];
-      const homeOptions = [
-        { tab: 'home', label: 'Home' },
-        { tab: 'dashboard', label: 'Project Dashboard' },
-        { tab: 'bids', label: 'Bid Tracking' },
-        { tab: 'texasOps', label: 'Texas Ops' },
-        { tab: 'jobOrderReport', label: 'Job Order Quick Reference' },
-        { tab: 'archivedProjects', label: 'Archived Projects' }
-      ];
-      const projectOptions = [
-        { tab: 'home', label: 'Home' },
-        { tab: 'dashboard', label: 'Project Dashboard' },
-        { tab: 'setup', label: 'Setup' },
-        { tab: 'import', label: 'Field Wise' },
-        { tab: 'review', label: 'Review Exceptions' },
-        { tab: 'invoices', label: 'Vendor Invoices' },
-        { tab: 'billing', label: 'Customer Billing' }
-      ];
-      if (PO_FEATURE_ENABLED) projectOptions.push({ tab: 'projectPo', label: 'POs' });
-      if (tabName === 'admin') return [{ tab: 'home', label: 'Home' }, { tab: 'admin', label: 'Admin' }];
-      const options = inProjectArea ? projectOptions : homeOptions;
-      return options;
+      const projectTabs = ['dashboard','newMasterProject','setup','import','review','invoices','billing','projectPo','archivedProjects'];
+      const poTabs = ['fieldPo','officePo','cogSetup'];
+      const homeTabs = ['home','bids','jobOrderReport','admin','activity'];
+      if (projectTabs.includes(tabName)) return 'project';
+      if (poTabs.includes(tabName)) return 'po';
+      if (tabName === 'fieldwiseAudit') return 'audit';
+      if (['texasOps','texasReminders'].includes(tabName)) return 'texas';
+      if (homeTabs.includes(tabName)) return 'home';
+      return 'home';
+    }
+
+    function attentionCountText(alert) {
+      if (alert.key === 'missing_texas_pnl' || alert.key === 'missing_balance_sheet') {
+        return Number(alert.count || 0) ? 'Missing' : 'OK';
+      }
+      return Number(alert.count || 0).toLocaleString();
+    }
+
+    function attentionItemsHtml(alert) {
+      if (alert.key !== 'stale_job_invoices' || !Array.isArray(alert.items) || !alert.items.length) return '';
+      return `<div class="attention-list">${alert.items.map(item => `
+        <div class="attention-item">
+          <div>
+            <strong>${htmlEscape(item.label || 'Job')}</strong>
+            <span>${htmlEscape([item.customer, item.project_name, item.job_type].filter(Boolean).join(' / '))}${item.last_invoice_added_at ? ` / last invoice added ${htmlEscape(item.last_invoice_added_at.replace('T', ' '))}` : ''}${item.acknowledged_at ? ` / acknowledged ${htmlEscape(item.acknowledged_at.replace('T', ' '))}` : ''}</span>
+          </div>
+          <button class="btn" data-ack-job-invoice="${htmlEscape(item.target_id)}" data-ack-job-type="${htmlEscape(item.target_type)}" type="button">Acknowledge</button>
+        </div>
+      `).join('')}</div>`;
+    }
+
+    async function openAttentionTab(tabName) {
+      if (!(await confirmDiscard())) return;
+      openTab(tabName);
+    }
+
+    async function loadHomeAlerts() {
+      const target = document.getElementById('homeAlerts');
+      if (!target) return;
+      target.innerHTML = '<div class="muted">Checking alerts...</div>';
+      try {
+        const summary = await api('/api/home-alerts');
+        const alerts = (summary.alerts || []).filter(alert => canViewTab(alert.tab || 'home'));
+        target.innerHTML = alerts.length
+          ? alerts.map(alert => `
+              <div class="attention-card ${alert.severity || 'ok'}" data-alert-tab="${htmlEscape(alert.tab || 'home')}" role="button" tabindex="0">
+                <div>
+                  <div class="label">${htmlEscape(alert.label)}</div>
+                  <div class="count">${htmlEscape(attentionCountText(alert))}</div>
+                  <div class="detail">${htmlEscape(alert.detail || '')}</div>
+                </div>
+                <div>
+                  ${alert.amount ? `<div class="amount">${money(alert.amount)}</div>` : ''}
+                  <div class="open-link">Open</div>
+                </div>
+                ${attentionItemsHtml(alert)}
+              </div>
+            `).join('')
+          : '<div class="muted">No dashboard alerts right now.</div>';
+        target.querySelectorAll('[data-alert-tab]').forEach(card => {
+          card.onclick = () => openAttentionTab(card.dataset.alertTab);
+          card.onkeydown = event => {
+            if (event.key === 'Enter' || event.key === ' ') {
+              event.preventDefault();
+              card.click();
+            }
+          };
+        });
+        target.querySelectorAll('[data-ack-job-invoice]').forEach(btn => {
+          btn.onclick = async event => {
+            event.stopPropagation();
+            btn.disabled = true;
+            btn.textContent = 'Saving...';
+            try {
+              await api('/api/home-alerts/job-invoice-ack', { method:'POST', body: JSON.stringify({ target_type: btn.dataset.ackJobType, target_id: btn.dataset.ackJobInvoice }) });
+              await loadHomeAlerts();
+            } catch (err) {
+              btn.disabled = false;
+              btn.textContent = 'Acknowledge';
+              window.alert(err.message || 'Could not acknowledge this job.');
+            }
+          };
+        });
+      } catch (err) {
+        target.innerHTML = `<div class="bad">Could not load dashboard alerts: ${htmlEscape(err.message)}</div>`;
+      }
+    }
+
+    function applyPermissionVisibility() {
+      document.querySelectorAll('[data-open-tab]').forEach(el => {
+        const tab = el.dataset.openTab;
+        el.classList.toggle('hidden', tab !== 'home' && !canViewTab(tab));
+      });
+      document.querySelectorAll('nav button[data-tab]').forEach(btn => {
+        btn.classList.toggle('hidden', btn.dataset.tab !== 'home' && !canViewTab(btn.dataset.tab));
+      });
+      document.getElementById('systemAdminBtn')?.classList.toggle('hidden', !canViewTab('admin'));
+      document.getElementById('systemRevisionBtn')?.classList.toggle('hidden', state.currentUser?.role !== 'Admin');
     }
 
     function updateNavForTab(tabName) {
-      document.querySelectorAll('nav button').forEach(btn => btn.classList.toggle('hidden', !navOptionsForTab(tabName).some(option => option.tab === btn.dataset.tab)));
-      const select = document.getElementById('sectionNavSelect');
-      const options = navOptionsForTab(tabName);
-      select.innerHTML = options.map(option => `<option value="${htmlEscape(option.tab)}">${htmlEscape(option.label)}</option>`).join('');
-      select.value = tabName;
+      const activeGroup = navOptionsForTab(tabName);
+      document.querySelector('.project-switcher')?.classList.toggle('hidden', activeGroup !== 'project');
+      document.querySelectorAll('nav button').forEach(btn => {
+        const tab = btn.dataset.tab;
+        const isDisabledPo = !PO_FEATURE_ENABLED && ['fieldPo', 'officePo', 'projectPo'].includes(tab);
+        btn.classList.toggle('hidden', !!isDisabledPo || !canViewTab(tab));
+      });
+      document.querySelectorAll('.nav-subgroup').forEach(group => {
+        group.classList.toggle('hidden', group.dataset.navGroup !== activeGroup);
+      });
+      document.querySelector('nav button[data-tab="home"]')?.classList.toggle('active', activeGroup === 'home');
+      document.querySelector('nav button[data-tab="dashboard"]')?.classList.toggle('active', activeGroup === 'project');
+      document.querySelector('nav button[data-tab="fieldwiseAudit"]')?.classList.toggle('active', activeGroup === 'audit');
+      document.querySelector('nav button[data-tab="fieldPo"][data-nav-level="main"]')?.classList.toggle('active', activeGroup === 'po');
+      document.querySelector('nav button[data-tab="texasOps"]')?.classList.toggle('active', activeGroup === 'texas');
     }
 
-    document.getElementById('sectionNavSelect').onchange = async event => {
-      if (!(await confirmDiscard())) {
-        event.target.value = document.querySelector('.tab:not(.hidden)')?.id || 'home';
-        return;
-      }
-      openTab(event.target.value);
-    };
-
     async function openTab(tabName) {
+      if (tabName !== 'home' && !canViewTab(tabName)) tabName = 'home';
       if (isTexasReadOnly() && tabName !== 'texasOps') tabName = 'texasOps';
       if (isFieldPoOnly() && tabName !== 'fieldPo') tabName = 'fieldPo';
       if (!PO_FEATURE_ENABLED && ['fieldPo', 'officePo', 'projectPo'].includes(tabName)) tabName = 'home';
       markSaved();
-      updateNavForTab(tabName);
       document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
+      updateNavForTab(tabName);
       document.querySelectorAll('.tab').forEach(t => t.classList.add('hidden'));
-      const navButton = document.querySelector(`nav button[data-tab="${tabName}"]`);
-      if (navButton) navButton.classList.add('active');
+      document.querySelectorAll(`nav button[data-tab="${tabName}"]`).forEach(navButton => navButton.classList.add('active'));
       document.getElementById(tabName).classList.remove('hidden');
+      if (tabName === 'home') loadHomeAlerts();
       if (tabName === 'dashboard') refreshOpenDetails();
       if (tabName === 'review') loadCosts();
-      if (tabName === 'import') { loadImportHistory(); loadFieldTicketLines(); loadFieldWiseAuditOmissions(); }
+      if (tabName === 'import') { loadImportHistory(); loadFieldTicketLines(); }
+      if (tabName === 'fieldwiseAudit') loadFieldWiseAuditOmissions();
       if (tabName === 'invoices') { loadVendorInvoiceLines(); loadVendorAllocationHistory(); }
       if (tabName === 'billing') loadCustomerInvoices();
       if (tabName === 'projectPo') loadProjectPos();
+      if (tabName === 'newMasterProject') loadNewMasterProjectForm();
       if (tabName === 'bids') loadBidDashboard();
       if (tabName === 'admin') loadUsers();
+      if (tabName === 'activity') loadActivityLog();
       if (tabName === 'texasOps') loadTexasOpsDashboard();
+      if (tabName === 'texasReminders') loadTexasReminderSetup();
       if (tabName === 'archivedProjects') loadArchivedProjects();
       if (tabName === 'jobOrderReport') loadJobOrderReport();
       if (tabName === 'fieldPo') loadFieldPo();
       if (tabName === 'officePo') loadOfficePos();
+      if (tabName === 'cogSetup') loadCogSetup();
     }
 
     document.querySelectorAll('[data-open-tab]').forEach(btn => btn.onclick = async () => {
       if (!(await confirmDiscard())) return;
       openTab(btn.dataset.openTab);
+    });
+    document.querySelectorAll('nav button[data-tab]').forEach(btn => btn.onclick = async () => {
+      if (!(await confirmDiscard())) return;
+      openTab(btn.dataset.tab);
     });
     document.querySelectorAll('.home-card[data-open-tab]').forEach(card => card.onkeydown = async event => {
       if (!['Enter', ' '].includes(event.key)) return;
@@ -4501,6 +5847,7 @@ HTML = r"""
       if (!(await confirmDiscard())) return;
       openTab(card.dataset.openTab);
     });
+    document.getElementById('refreshHomeAlerts').onclick = loadHomeAlerts;
     document.getElementById('homeLogo').onclick = async () => {
       if (!(await confirmDiscard())) return;
       openTab('home');
@@ -4809,6 +6156,90 @@ HTML = r"""
       }).join('')}</tbody></table>`;
     }
 
+    function renderTexasReminderSetup(data) {
+      const statusEl = document.getElementById('texasReminderStatus');
+      const recipientsEl = document.getElementById('texasReminderRecipients');
+      const logEl = document.getElementById('texasReminderLog');
+      if (!statusEl || !recipientsEl || !logEl) return;
+      const smtpText = data.smtp_configured
+        ? '<span class="good">Email sending is configured.</span>'
+        : '<span class="warn">Email sending is not configured on this server yet. Recipient selection can still be saved.</span>';
+      const pnlText = data.pnl_uploaded
+        ? '<span class="good">P&amp;L is uploaded for today.</span>'
+        : '<span class="warn">No P&amp;L found for today.</span>';
+      const settings = data.settings || {};
+      document.getElementById('texasReminderEnabled').checked = Number(settings.enabled || 0) === 1;
+      document.getElementById('texasReminderWeekday').value = String(settings.weekday ?? 4);
+      document.getElementById('texasReminderTime').value = settings.reminder_time || '15:00';
+      statusEl.innerHTML = `${smtpText}<br>${Number(settings.enabled || 0) === 1 ? htmlEscape(data.schedule || 'Weekly reminder') : '<span class="warn">Reminder is disabled.</span>'} / ${pnlText}`;
+      const recipients = data.recipients || [];
+      recipientsEl.innerHTML = recipients.length ? `<div class="grid cols-2">${recipients.map(user => {
+        const isEmail = String(user.username || '').includes('@');
+        const label = `${user.display_name || user.username}${user.display_name ? ' / ' + user.username : ''}`;
+        return `<label style="display:flex;align-items:flex-start;gap:8px;border:1px solid var(--line);border-radius:6px;padding:9px;background:white">
+          <input type="checkbox" style="width:auto;margin-top:3px" data-texas-reminder-user="${user.id}" ${Number(user.selected || 0) ? 'checked' : ''}>
+          <span><strong>${htmlEscape(label)}</strong>${isEmail ? '' : '<div class="muted">Username is not an email address, so email cannot be sent to this user.</div>'}</span>
+        </label>`;
+      }).join('')}</div>` : '<div class="muted">No active users found.</div>';
+      const logs = data.logs || [];
+      logEl.innerHTML = logs.length
+        ? `<h3>Recent Reminder Activity</h3><table><thead><tr><th>Date</th><th>Recipient</th><th>Status</th><th>Time</th><th>Note</th></tr></thead><tbody>${logs.map(log => `<tr>
+          <td>${htmlEscape(log.reminder_date || '')}</td>
+          <td>${htmlEscape(log.recipient || '')}</td>
+          <td class="${log.status === 'sent' ? 'good' : log.status === 'failed' ? 'bad' : 'warn'}">${htmlEscape(log.status || '')}</td>
+          <td>${htmlEscape(log.sent_at || '')}</td>
+          <td>${htmlEscape(log.error || '')}</td>
+        </tr>`).join('')}</tbody></table>`
+        : '<div class="muted">No reminder activity yet.</div>';
+    }
+
+    async function loadTexasReminderSetup() {
+      const data = await api('/api/texas-upload-reminders');
+      renderTexasReminderSetup(data);
+      await loadBillingReminderSetup();
+    }
+
+    function renderBillingReminderSetup(data) {
+      document.getElementById('billingReminderEnabled').checked = Number(data.settings?.enabled || 0) === 1;
+      document.getElementById('billingReminderWeekday').value = String(data.settings?.weekday ?? 4);
+      document.getElementById('billingReminderTime').value = data.settings?.reminder_time || '15:00';
+      document.getElementById('billingReminderLookback').value = data.settings?.lookback_days || 7;
+      const smtpText = data.smtp_configured ? '<span class="good">Email sending is configured.</span>' : '<span class="warn">Email sending is not configured on this server yet. Recipient selection can still be saved.</span>';
+      const enabledText = Number(data.settings?.enabled || 0) === 1 ? htmlEscape(data.schedule || 'Weekly reminder') : '<span class="warn">Reminder is disabled.</span>';
+      document.getElementById('billingReminderStatus').innerHTML = `${smtpText}<br>${enabledText}<br><strong>${Number(data.missing_job_count || 0)}</strong> active job(s) currently have no customer invoice added in the last ${Number(data.settings?.lookback_days || 7)} day(s).`;
+      const recipients = data.recipients || [];
+      document.getElementById('billingReminderRecipients').innerHTML = recipients.length ? `<div class="grid cols-2">${recipients.map(user => {
+        const isEmail = String(user.username || '').includes('@');
+        const label = `${user.display_name || user.username}${user.display_name ? ' / ' + user.username : ''}`;
+        return `<label style="display:flex;align-items:flex-start;gap:8px;border:1px solid var(--line);border-radius:6px;padding:9px;background:white">
+          <input type="checkbox" style="width:auto;margin-top:3px" data-billing-reminder-user="${user.id}" ${Number(user.selected || 0) ? 'checked' : ''}>
+          <span><strong>${htmlEscape(label)}</strong>${isEmail ? '' : '<div class="muted">Username is not an email address, so email cannot be sent to this user.</div>'}</span>
+        </label>`;
+      }).join('')}</div>` : '<div class="muted">No active users found.</div>';
+      const jobs = data.missing_jobs || [];
+      document.getElementById('billingReminderJobs').innerHTML = jobs.length ? `<h3>Current Jobs Missing Recent Customer Invoice</h3><table><thead><tr><th>Job</th><th>Customer</th><th>Project</th><th>Type</th><th>Last Added</th></tr></thead><tbody>${jobs.slice(0, 25).map(job => `<tr>
+        <td><strong>${htmlEscape(job.job_number || '')}</strong><div class="muted">${htmlEscape(job.reference_code || '')}</div></td>
+        <td>${htmlEscape(job.customer || '')}</td>
+        <td>${htmlEscape(job.project_name || '')}</td>
+        <td>${htmlEscape(job.job_type || '')}</td>
+        <td>${htmlEscape(job.last_invoice_added_at || 'Never')}</td>
+      </tr>`).join('')}</tbody></table>${jobs.length > 25 ? `<div class="muted">Showing 25 of ${jobs.length} jobs.</div>` : ''}` : '<div class="good">All active jobs have recent customer invoice activity.</div>';
+      const logs = data.logs || [];
+      document.getElementById('billingReminderLog').innerHTML = logs.length ? `<h3>Recent Billing Reminder Activity</h3><table><thead><tr><th>Date</th><th>Recipient</th><th>Status</th><th>Jobs</th><th>Time</th><th>Note</th></tr></thead><tbody>${logs.map(log => `<tr>
+        <td>${htmlEscape(log.reminder_date || '')}</td>
+        <td>${htmlEscape(log.recipient || '')}</td>
+        <td class="${log.status === 'sent' ? 'good' : log.status === 'failed' ? 'bad' : 'warn'}">${htmlEscape(log.status || '')}</td>
+        <td>${Number(log.job_count || 0)}</td>
+        <td>${htmlEscape(log.sent_at || '')}</td>
+        <td>${htmlEscape(log.error || '')}</td>
+      </tr>`).join('')}</tbody></table>` : '<div class="muted">No billing reminder activity yet.</div>';
+    }
+
+    async function loadBillingReminderSetup() {
+      const data = await api('/api/billing-invoice-reminders');
+      renderBillingReminderSetup(data);
+    }
+
     async function loadTexasOpsDashboard() {
       const summary = await api('/api/texas-financial-summary');
       const revenue = metricAmount(summary, 'revenue');
@@ -4884,6 +6315,51 @@ HTML = r"""
         resultEl.textContent = `Import failed: ${err.message}`;
       }
     };
+    document.getElementById('saveTexasReminderRecipients').onclick = async () => {
+      const userIds = [...document.querySelectorAll('[data-texas-reminder-user]:checked')].map(el => Number(el.dataset.texasReminderUser));
+      await api('/api/texas-upload-reminders', {
+        method:'POST',
+        body: JSON.stringify({
+          user_ids: userIds,
+          enabled: document.getElementById('texasReminderEnabled').checked ? 1 : 0,
+          weekday: document.getElementById('texasReminderWeekday').value,
+          reminder_time: document.getElementById('texasReminderTime').value
+        })
+      });
+      document.getElementById('texasReminderResult').textContent = 'Reminder setup saved.';
+      markSaved();
+      await loadTexasReminderSetup();
+    };
+    document.getElementById('sendTexasReminderNow').onclick = async () => {
+      const resultEl = document.getElementById('texasReminderResult');
+      resultEl.textContent = 'Checking P&L status...';
+      const result = await api('/api/texas-upload-reminders/send-now', { method:'POST', body: JSON.stringify({}) });
+      resultEl.textContent = result.message || `Sent ${result.sent || 0}, failed ${result.failed || 0}, skipped ${result.skipped || 0}.`;
+      await loadTexasReminderSetup();
+    };
+    document.getElementById('saveBillingReminder').onclick = async () => {
+      const userIds = [...document.querySelectorAll('[data-billing-reminder-user]:checked')].map(el => Number(el.dataset.billingReminderUser));
+      await api('/api/billing-invoice-reminders', {
+        method:'POST',
+        body: JSON.stringify({
+          user_ids: userIds,
+          enabled: document.getElementById('billingReminderEnabled').checked ? 1 : 0,
+          weekday: document.getElementById('billingReminderWeekday').value,
+          reminder_time: document.getElementById('billingReminderTime').value,
+          lookback_days: document.getElementById('billingReminderLookback').value
+        })
+      });
+      document.getElementById('billingReminderResult').textContent = 'Billing reminder saved.';
+      markSaved();
+      await loadBillingReminderSetup();
+    };
+    document.getElementById('sendBillingReminderNow').onclick = async () => {
+      const resultEl = document.getElementById('billingReminderResult');
+      resultEl.textContent = 'Checking customer invoice activity...';
+      const result = await api('/api/billing-invoice-reminders/send-now', { method:'POST', body: JSON.stringify({}) });
+      resultEl.textContent = result.message || `Found ${result.job_count || 0} job(s). Sent ${result.sent || 0}, failed ${result.failed || 0}, skipped ${result.skipped || 0}.`;
+      await loadBillingReminderSetup();
+    };
 
     async function loadProjects() {
       state.projects = await api('/api/projects?status=all');
@@ -4905,7 +6381,6 @@ HTML = r"""
           return;
         }
         markSaved();
-        setProjectCreateMode(false);
         selectedDashboardSubprojectId = null;
         state.projectId = Number(sel.value);
         localStorage.setItem('selectedProjectId', state.projectId);
@@ -4913,6 +6388,7 @@ HTML = r"""
       };
       await refresh();
       updateNavForTab(document.querySelector('.tab:not(.hidden)')?.id || 'home');
+      if (!document.getElementById('home')?.classList.contains('hidden')) loadHomeAlerts();
     }
 
     async function loadArchivedProjects() {
@@ -5058,16 +6534,71 @@ HTML = r"""
 
     async function loadFieldPoJobs() {
       if (!jobOrderReportRows.length) jobOrderReportRows = await api('/api/job-order-report');
-      const select = document.getElementById('fieldPoJobSelect');
       const rowsWithKeys = jobOrderReportRows.filter(row => row.job_key);
-      select.innerHTML = '<option value="">Choose job/order...</option>' + rowsWithKeys.map(row => {
-        const label = [row.job_number, row.customer, row.project_name, row.reference_code].filter(Boolean).join(' - ');
-        return `<option value="${htmlEscape(row.job_key)}">${htmlEscape(label)}</option>`;
-      }).join('');
+      fieldPoJobChoices = rowsWithKeys.map(row => {
+        const isCog = row.item_type === 'COG';
+        const primary = isCog ? row.job_number : [row.job_number, row.reference_code].filter(Boolean).join(' / ');
+        const secondary = isCog
+          ? ['COG', row.reference_code ? `Internal COG ${row.reference_code}` : '', row.description].filter(Boolean).join(' - ')
+          : [row.customer, row.project_name, row.item_type, row.description].filter(Boolean).join(' - ');
+        return {
+          key: row.job_key,
+          primary,
+          secondary,
+          label: [primary, secondary].filter(Boolean).join(' - '),
+          search: (isCog
+            ? [row.job_number, row.description]
+            : [row.job_number, row.reference_code, row.customer, row.project_name, row.item_type, row.description, row.project_description]
+          ).filter(Boolean).join(' ').toLowerCase()
+        };
+      });
+      renderFieldPoJobChoices('');
+    }
+
+    function selectFieldPoJob(choice) {
+      document.getElementById('fieldPoJobSearch').value = choice.label;
+      document.getElementById('fieldPoJobKey').value = choice.key;
+      document.getElementById('fieldPoJobList').classList.add('hidden');
+      updateFieldPoCustomerRequirement();
+    }
+
+    function updateFieldPoCustomerRequirement() {
+      const jobKey = document.getElementById('fieldPoJobKey')?.value || '';
+      const customerWrap = document.getElementById('fieldPoCustomerWrap');
+      const customerInput = document.getElementById('fieldPoCustomer');
+      const choice = fieldPoJobChoices.find(item => item.key === jobKey);
+      const selectedCogName = String(choice?.primary || '').trim().toLowerCase().replace(/\s+/g, ' ');
+      const requiresCustomer = jobKey.startsWith('cog:') && !COG_CUSTOMER_OPTIONAL_NAMES.has(selectedCogName);
+      if (customerWrap) customerWrap.classList.toggle('hidden', !requiresCustomer);
+      if (customerInput) {
+        customerInput.required = requiresCustomer;
+        customerInput.disabled = !requiresCustomer;
+        customerInput.setAttribute('aria-required', requiresCustomer ? 'true' : 'false');
+        if (!requiresCustomer) customerInput.value = '';
+      }
+    }
+
+    function renderFieldPoJobChoices(query) {
+      const list = document.getElementById('fieldPoJobList');
+      if (!list) return;
+      const needle = String(query || '').trim().toLowerCase();
+      const matches = fieldPoJobChoices
+        .filter(choice => !needle || choice.search.includes(needle) || choice.label.toLowerCase().includes(needle))
+        .slice(0, 30);
+      list.innerHTML = matches.length
+        ? matches.map(choice => `<button class="combo-option" type="button" data-field-po-job="${htmlEscape(choice.key)}"><strong>${htmlEscape(choice.primary || choice.label)}</strong><span>${htmlEscape(choice.secondary || '')}</span></button>`).join('')
+        : '<div class="combo-option"><strong>No matching job/order found</strong><span>Try another job number, COG, customer, or project.</span></div>';
+      list.classList.toggle('hidden', !needle && !document.activeElement?.matches('#fieldPoJobSearch'));
+      list.querySelectorAll('[data-field-po-job]').forEach(btn => {
+        btn.onclick = () => {
+          const choice = fieldPoJobChoices.find(item => item.key === btn.dataset.fieldPoJob);
+          if (choice) selectFieldPoJob(choice);
+        };
+      });
     }
 
     function officePoJobOptions(po) {
-      const currentValue = po.change_order_id ? `change_order:${po.change_order_id}` : (po.subproject_id ? `subproject:${po.subproject_id}` : '');
+      const currentValue = po.cog_category_id ? `cog:${po.cog_category_id}` : (po.change_order_id ? `change_order:${po.change_order_id}` : (po.subproject_id ? `subproject:${po.subproject_id}` : ''));
       return '<option value="">Choose job/order...</option>' + jobOrderReportRows.filter(row => row.job_key).map(row => {
         const label = [row.job_number, row.customer, row.project_name, row.reference_code].filter(Boolean).join(' - ');
         return `<option value="${htmlEscape(row.job_key)}" ${row.job_key === currentValue ? 'selected' : ''}>${htmlEscape(label)}</option>`;
@@ -5076,30 +6607,47 @@ HTML = r"""
 
     async function loadFieldPos() {
       const poRows = await api('/api/purchase-orders');
-      document.getElementById('fieldPoTable').innerHTML = poRows.length
-        ? `<thead><tr><th>PO</th><th>Job / Order</th><th>Vendor</th><th>Amount</th><th>Status</th><th>Pickup Ticket</th><th>Requested</th><th></th></tr></thead><tbody>${poRows.map(po => `
-          <tr>
-            <td><strong>${htmlEscape(po.po_number || '')}</strong></td>
-            <td>${htmlEscape(po.job_number || '')}<div class="muted">${htmlEscape(po.job_label || '')}</div></td>
-            <td>${htmlEscape(po.vendor || '')}</td>
-            <td>${money(po.estimated_amount || 0)}</td>
-            <td>${htmlEscape(po.status || '')}</td>
-            <td>
-              ${po.pickup_file ? `<a class="pdf-link" href="/uploads/${encodeURIComponent(po.pickup_file)}" target="_blank" rel="noopener">Open pickup ticket</a>` : '<span class="muted">Not uploaded</span>'}
-              <form data-pickup-form="${po.id}" style="margin-top:8px">
-                <input name="pickup_file" type="file" accept=".pdf,.png,.jpg,.jpeg,.webp" required>
-                <button class="btn" type="submit" style="margin-top:6px">Upload</button>
-              </form>
-            </td>
-            <td>${htmlEscape((po.created_at || '').slice(0, 16).replace('T', ' '))}</td>
-            <td><a class="btn" href="/po/${po.id}" target="_blank" rel="noopener">Open</a></td>
-          </tr>`).join('')}</tbody>`
-        : '<tbody><tr><td>No PO requests yet.</td></tr></tbody>';
+      const target = document.getElementById('fieldPoList');
+      target.innerHTML = poRows.length
+        ? poRows.map(po => {
+          const statusClass = String(po.status || '').toLowerCase().replace(/\s+/g, '-');
+          const pendingApproval = po.status === 'Pending Approval';
+          const pickup = po.pickup_file
+            ? `<a class="btn" href="/uploads/${encodeURIComponent(po.pickup_file)}" target="_blank" rel="noopener">Open Pickup Ticket</a>`
+            : pendingApproval
+            ? `<div class="pickup-upload"><strong>Pending PO admin approval.</strong><div class="field-po-card-meta">Wait for office to issue this PO before buying or uploading a pickup ticket.</div></div>`
+            : `<form class="pickup-upload" data-pickup-form="${po.id}">
+                <label style="margin-top:0">Upload pickup ticket photo</label>
+                <input name="pickup_file" type="file" accept=".pdf,.png,.jpg,.jpeg,.webp" capture="environment" required>
+                <button class="btn primary" type="submit">Upload Pickup Ticket</button>
+              </form>`;
+          return `<div class="field-po-card">
+            <div class="field-po-card-header">
+              <div>
+                <div class="field-po-card-title">${htmlEscape(po.po_number || '')}</div>
+                <div class="field-po-card-meta">${htmlEscape((po.created_at || '').slice(0, 16).replace('T', ' '))}</div>
+              </div>
+              <span class="field-po-status field-po-status-${htmlEscape(statusClass)}">${htmlEscape(po.status || '')}</span>
+            </div>
+            <div><strong>${htmlEscape(po.job_number || '')}</strong><div class="field-po-card-meta">${htmlEscape(po.job_label || '')}</div></div>
+            ${po.customer_name ? `<div><strong>Customer:</strong> ${htmlEscape(po.customer_name || '')}</div>` : ''}
+            <div><strong>Vendor:</strong> ${htmlEscape(po.vendor || '')}</div>
+            <div><strong>Amount:</strong> ${money(po.estimated_amount || 0)}</div>
+            <div class="field-po-card-meta">${htmlEscape(po.description || '')}</div>
+            <div class="actions" style="margin-top:0">
+              <a class="btn" href="/po/${po.id}" target="_blank" rel="noopener">Open PO</a>
+            </div>
+            ${pickup}
+          </div>`;
+        }).join('')
+        : '<div class="field-po-card"><strong>No POs yet.</strong><div class="field-po-card-meta">Your created POs will show here.</div></div>';
       document.querySelectorAll('[data-pickup-form]').forEach(form => form.onsubmit = async event => {
         event.preventDefault();
         const poId = form.dataset.pickupForm;
         const data = new FormData(form);
         try {
+          const button = form.querySelector('button');
+          if (button) button.textContent = 'Uploading...';
           await api(`/api/purchase-orders/${poId}/pickup`, { method: 'POST', body: data });
           await loadFieldPos();
         } catch (err) {
@@ -5123,26 +6671,37 @@ HTML = r"""
           po.po_number,
           po.job_number,
           po.job_label,
+          po.customer_name,
           po.vendor,
           po.description,
           po.requested_by_username,
           po.status
         ].some(value => String(value || '').toLowerCase().includes(search));
       });
-      document.getElementById(config.countId).textContent = `${filtered.length} of ${rows.length} PO request(s) shown`;
+      document.getElementById(config.countId).textContent = `${filtered.length} of ${rows.length} PO(s) shown`;
       document.getElementById(config.tableId).innerHTML = filtered.length
-        ? `<thead><tr><th>PO</th><th>Job / Order</th><th>Vendor</th><th>Amount</th><th>Requested By</th><th>Status</th><th>Details</th><th></th></tr></thead><tbody>${filtered.map(po => `
+        ? `<thead><tr><th>PO</th><th>Job / Order / COG</th><th>Customer</th><th>Vendor</th><th>Amount</th><th>Created By</th><th>Status</th><th>Close / Void Reason</th><th>Details</th><th></th></tr></thead><tbody>${filtered.map(po => {
+          const statusOptions = ['Pending Approval','Issued','Picked Up','Closed','Void'].map(statusOption => `<option ${po.status === statusOption ? 'selected' : ''}>${statusOption}</option>`).join('');
+          const eventLines = [
+            po.pickup_uploaded_at ? `Pickup uploaded ${String(po.pickup_uploaded_at).slice(0, 16).replace('T', ' ')}${po.pickup_uploaded_by_username ? ' by ' + po.pickup_uploaded_by_username : ''}` : '',
+            po.closed_at ? `Closed ${String(po.closed_at).slice(0, 16).replace('T', ' ')}${po.closed_by_username ? ' by ' + po.closed_by_username : ''}` : '',
+            po.voided_at ? `Voided ${String(po.voided_at).slice(0, 16).replace('T', ' ')}${po.voided_by_username ? ' by ' + po.voided_by_username : ''}` : ''
+          ].filter(Boolean).map(line => `<div class="muted">${htmlEscape(line)}</div>`).join('');
+          return `
           <tr>
             <td><strong>${htmlEscape(po.po_number || '')}</strong><div class="muted">${htmlEscape((po.created_at || '').slice(0, 16).replace('T', ' '))}</div></td>
             <td><select data-office-po-field="${po.id}" data-field="job_key">${officePoJobOptions(po)}</select></td>
+            <td><input data-office-po-field="${po.id}" data-field="customer_name" value="${htmlEscape(po.customer_name || '')}" placeholder="${po.cog_category_id ? 'Required' : 'Optional'}"></td>
             <td><input data-office-po-field="${po.id}" data-field="vendor" value="${htmlEscape(po.vendor || '')}"></td>
             <td><input data-office-po-field="${po.id}" data-field="estimated_amount" type="number" min="0" step="0.01" value="${Number(po.estimated_amount || 0)}"></td>
             <td>${htmlEscape(po.requested_by_username || '')}</td>
-            <td><select data-office-po-field="${po.id}" data-field="status">${['Pending Review','Issued','Received','Closed','Void'].map(statusOption => `<option ${po.status === statusOption ? 'selected' : ''}>${statusOption}</option>`).join('')}</select></td>
+            <td><select data-office-po-field="${po.id}" data-field="status">${statusOptions}</select>${eventLines}</td>
+            <td><textarea data-office-po-field="${po.id}" data-field="close_reason" placeholder="Required when closing">${htmlEscape(po.close_reason || '')}</textarea><textarea data-office-po-field="${po.id}" data-field="void_reason" placeholder="Required when voiding" style="margin-top:6px">${htmlEscape(po.void_reason || '')}</textarea></td>
             <td><textarea data-office-po-field="${po.id}" data-field="description">${htmlEscape(po.description || '')}</textarea>${po.attachment_file ? `<div><a class="pdf-link" href="/uploads/${encodeURIComponent(po.attachment_file)}" target="_blank" rel="noopener">Attachment</a></div>` : ''}${po.pickup_file ? `<div><a class="pdf-link" href="/uploads/${encodeURIComponent(po.pickup_file)}" target="_blank" rel="noopener">Pickup ticket</a></div>` : '<div class="muted">No pickup ticket</div>'}</td>
-            <td class="actions-cell"><a class="btn" href="/po/${po.id}" target="_blank" rel="noopener">Open</a><button class="btn" data-save-office-po="${po.id}" type="button">Save</button></td>
-          </tr>`).join('')}</tbody>`
-        : '<tbody><tr><td>No PO requests match those filters.</td></tr></tbody>';
+            <td class="actions-cell"><a class="btn" href="/po/${po.id}" target="_blank" rel="noopener">Open</a><button class="btn" data-save-office-po="${po.id}" type="button">Save</button>${state.currentUser?.role === 'Admin' ? `<button class="btn danger" data-delete-office-po="${po.id}" type="button">Delete</button>` : ''}</td>
+          </tr>`;
+        }).join('')}</tbody>`
+        : '<tbody><tr><td>No POs match those filters.</td></tr></tbody>';
       document.querySelectorAll(`#${config.tableId} [data-save-office-po]`).forEach(btn => btn.onclick = async () => {
         const id = btn.dataset.saveOfficePo;
         const fields = {};
@@ -5151,6 +6710,14 @@ HTML = r"""
           method: 'PUT',
           body: JSON.stringify(fields)
         });
+        await config.reload();
+      });
+      document.querySelectorAll(`#${config.tableId} [data-delete-office-po]`).forEach(btn => btn.onclick = async () => {
+        const id = btn.dataset.deleteOfficePo;
+        const po = rows.find(item => String(item.id) === String(id));
+        const label = po ? `${po.po_number || 'this PO'}${po.vendor ? ' / ' + po.vendor : ''}` : 'this PO';
+        if (!window.confirm(`Delete ${label}?\n\nThis removes the PO from the tracker.`)) return;
+        await api(`/api/purchase-orders/${id}`, { method: 'DELETE' });
         await config.reload();
       });
     }
@@ -5169,6 +6736,11 @@ HTML = r"""
       if (!jobOrderReportRows.length) jobOrderReportRows = await api('/api/job-order-report');
       officePoRows = await api('/api/purchase-orders');
       renderOfficePos();
+    }
+
+    async function loadCogSetup() {
+      state.cogCategories = await api('/api/cog-categories');
+      loadCogCategoryEditor();
     }
 
     async function loadProjectPos() {
@@ -5194,12 +6766,14 @@ HTML = r"""
       }
       state.subprojects = await api(`/api/subprojects?project_id=${state.projectId}`);
       state.changeOrders = await api(`/api/change-orders?project_id=${state.projectId}`);
+      state.cogCategories = await api('/api/cog-categories');
       state.rateSets = await api('/api/rate-sets');
       state.internalRates = await api('/api/internal-rates');
       fillSelects();
       await loadDashboard();
       loadSubprojectEditor();
       loadChangeOrderEditor();
+      loadCogCategoryEditor();
       loadInternalRateEditor();
       loadImportHistory();
       loadFieldTicketLines();
@@ -5222,13 +6796,13 @@ HTML = r"""
       });
       const project = state.projects.find(p => p.id === state.projectId);
       const rateSetOptions = state.rateSets.map(r => `<option value="${r.id}">${r.name}${r.effective_date ? ' - ' + r.effective_date : ''}</option>`).join('');
-      ['projectRateSet','rateSetSelect'].forEach(id => {
+      ['projectRateSet','newProjectRateSet','rateSetSelect'].forEach(id => {
         const el = document.getElementById(id);
         if (el) el.innerHTML = rateSetOptions;
       });
       if (project && document.getElementById('projectRateSet')) document.getElementById('projectRateSet').value = project.rate_set_id || '';
       if (project && document.getElementById('rateSetSelect')) document.getElementById('rateSetSelect').value = project.rate_set_id || '';
-      if (project && !projectCreateMode) {
+      if (project) {
         const projectForm = document.getElementById('projectForm');
         if (projectForm) {
           ['project_code','name','customer','location','customer_po','description'].forEach(field => {
@@ -5241,6 +6815,18 @@ HTML = r"""
           const isArchived = (project.status || 'Active') === 'Archived';
           archiveBtn.classList.toggle('hidden', isArchived);
         }
+      }
+    }
+
+    function loadNewMasterProjectForm() {
+      const form = document.getElementById('newProjectForm');
+      if (!form) return;
+      const rateSelect = document.getElementById('newProjectRateSet');
+      const rateSetOptions = state.rateSets.map(r => `<option value="${r.id}">${r.name}${r.effective_date ? ' - ' + r.effective_date : ''}</option>`).join('');
+      if (rateSelect) {
+        rateSelect.innerHTML = rateSetOptions;
+        const current = state.projects.find(p => p.id === state.projectId);
+        if (current?.rate_set_id) rateSelect.value = current.rate_set_id;
       }
     }
 
@@ -6611,6 +8197,48 @@ HTML = r"""
       if (rateSetSelect) rateSetSelect.onchange = loadInternalRateEditor;
     }
 
+    function loadCogCategoryEditor() {
+      const tableEl = document.getElementById('cogCategoryTable');
+      if (!tableEl) return;
+      tableEl.innerHTML = state.cogCategories.length
+        ? `<thead><tr><th>Name</th><th>Internal COG Code</th><th>Description</th><th></th></tr></thead><tbody>${state.cogCategories.map(c => `<tr>
+            <td><input data-cog="${c.id}" data-field="name" value="${htmlEscape(c.name || '')}"></td>
+            <td><input data-cog="${c.id}" data-field="code" value="${htmlEscape(c.code || '')}"></td>
+            <td><input data-cog="${c.id}" data-field="description" value="${htmlEscape(c.description || '')}"></td>
+            <td class="actions-cell"><button class="btn" data-save-cog="${c.id}" type="button">Save</button><button class="btn danger" data-delete-cog="${c.id}" type="button">Delete</button></td>
+          </tr>`).join('')}</tbody>`
+        : '<tbody><tr><td>No COG categories yet.</td></tr></tbody>';
+      tableEl.querySelectorAll('[data-cog]').forEach(el => {
+        const markRowDirty = () => el.closest('tr')?.classList.add('setup-dirty');
+        el.oninput = markRowDirty;
+        el.onchange = markRowDirty;
+      });
+      tableEl.querySelectorAll('[data-save-cog]').forEach(btn => btn.onclick = async () => {
+        const id = btn.dataset.saveCog;
+        const fields = {};
+        tableEl.querySelectorAll(`[data-cog="${id}"]`).forEach(el => fields[el.dataset.field] = el.value);
+        await api(`/api/cog-categories/${id}`, { method:'PUT', body: JSON.stringify(fields) });
+        btn.closest('tr')?.classList.remove('setup-dirty');
+        markSaved();
+        state.cogCategories = await api('/api/cog-categories');
+        jobOrderReportRows = await api('/api/job-order-report');
+        loadCogCategoryEditor();
+        renderFieldPoJobChoices(document.getElementById('fieldPoJobSearch')?.value || '');
+      });
+      tableEl.querySelectorAll('[data-delete-cog]').forEach(btn => btn.onclick = async () => {
+        const id = btn.dataset.deleteCog;
+        const category = state.cogCategories.find(c => String(c.id) === String(id));
+        const label = category ? [category.code, category.name].filter(Boolean).join(' - ') : 'this COG category';
+        if (!window.confirm(`Delete COG category ${label}? Existing POs will keep their current label.`)) return;
+        await api(`/api/cog-categories/${id}`, { method:'DELETE' });
+        markSaved();
+        state.cogCategories = await api('/api/cog-categories');
+        jobOrderReportRows = await api('/api/job-order-report');
+        loadCogCategoryEditor();
+        renderFieldPoJobChoices(document.getElementById('fieldPoJobSearch')?.value || '');
+      });
+    }
+
     async function loadCosts() {
       if (!state.projectId) return;
       const costs = await api(`/api/cost-records?project_id=${state.projectId}`);
@@ -7017,25 +8645,28 @@ HTML = r"""
     async function loadCurrentUser() {
       const me = await api('/api/me');
       state.currentUser = me;
-      const readOnly = me.role === 'Read Only' || me.role === 'TX/Read Only';
+      const hasAnyEdit = Object.values(me.permissions || {}).some(permission => Number(permission.can_edit || 0));
+      const readOnly = !hasAnyEdit;
       document.body.classList.toggle('read-only', readOnly);
       document.body.classList.toggle('tx-read-only', me.role === 'TX/Read Only');
       document.body.classList.toggle('field-po-only', me.role === 'Field PO');
       document.getElementById('currentUser').textContent = `${me.display_name || me.username}${readOnly || me.role === 'Field PO' ? ' / ' + me.role : ''}`;
-      document.getElementById('systemAdminBtn').classList.toggle('hidden', me.role !== 'Admin');
-      document.getElementById('systemRevisionBtn').classList.toggle('hidden', me.role !== 'Admin');
+      applyPermissionVisibility();
       if (Number(me.must_change_password || 0)) openAccountModal(true);
     }
 
     async function loadUsers() {
       if (state.currentUser?.role !== 'Admin') return;
+      if (!rolePermissionsData) rolePermissionsData = await api('/api/role-permissions');
       const users = await api('/api/users');
+      const roleOptions = (rolePermissionsData?.roles || ['User','Read Only','TX/Read Only','Field PO','Admin']);
       document.getElementById('usersTable').innerHTML = `
-        <thead><tr><th>Username</th><th>Name</th><th>Role</th><th>Status</th><th>Password</th><th></th></tr></thead>
+        <thead><tr><th>Username</th><th>Name</th><th>Role</th><th>PO Trust</th><th>Status</th><th>Password</th><th></th></tr></thead>
         <tbody>${users.map(u => `<tr>
           <td>${u.username}</td>
           <td>${u.display_name || ''}</td>
-          <td><select data-user-role="${u.id}"><option ${u.role === 'User' ? 'selected' : ''}>User</option><option ${u.role === 'Read Only' ? 'selected' : ''}>Read Only</option><option ${u.role === 'TX/Read Only' ? 'selected' : ''}>TX/Read Only</option><option ${u.role === 'Field PO' ? 'selected' : ''}>Field PO</option><option ${u.role === 'Admin' ? 'selected' : ''}>Admin</option></select></td>
+          <td><select data-user-role="${u.id}">${roleOptions.map(role => `<option ${u.role === role ? 'selected' : ''}>${htmlEscape(role)}</option>`).join('')}</select></td>
+          <td><label><input data-user-po-auto-issue="${u.id}" type="checkbox" ${Number(u.po_auto_issue || 0) ? 'checked' : ''}> Auto-issue</label></td>
           <td>${u.active ? 'Active' : 'Inactive'}${Number(u.must_change_password || 0) ? '<div class="muted">Must change password</div>' : ''}</td>
           <td><input data-user-password="${u.id}" type="password" placeholder="TPE1776"></td>
           <td>
@@ -7058,35 +8689,130 @@ HTML = r"""
         await api(`/api/users/${sel.dataset.userRole}`, { method:'PUT', body: JSON.stringify({ role: sel.value }) });
         await loadUsers();
       });
+      document.querySelectorAll('[data-user-po-auto-issue]').forEach(box => box.onchange = async () => {
+        await api(`/api/users/${box.dataset.userPoAutoIssue}`, { method:'PUT', body: JSON.stringify({ po_auto_issue: box.checked ? 1 : 0 }) });
+        await loadUsers();
+      });
+      renderRolePermissions();
+    }
+
+    function renderRolePermissions() {
+      const wrap = document.getElementById('rolePermissions');
+      if (!wrap || !rolePermissionsData) return;
+      const permissions = rolePermissionsData.permissions || [];
+      const matrix = rolePermissionsData.matrix || {};
+      wrap.innerHTML = (rolePermissionsData.roles || []).map(role => {
+        const locked = role === 'Admin';
+        const rows = permissions.map(permission => {
+          const value = matrix?.[role]?.[permission.key] || {};
+          return `<tr>
+            <td><strong>${htmlEscape(permission.label)}</strong><div class="muted">${htmlEscape(permission.group)}</div></td>
+            <td><input type="checkbox" data-role-permission="${htmlEscape(role)}" data-permission-key="${htmlEscape(permission.key)}" data-permission-field="can_view" ${Number(value.can_view || 0) ? 'checked' : ''} ${locked ? 'disabled' : ''}></td>
+            <td><input type="checkbox" data-role-permission="${htmlEscape(role)}" data-permission-key="${htmlEscape(permission.key)}" data-permission-field="can_edit" ${Number(value.can_edit || 0) ? 'checked' : ''} ${locked ? 'disabled' : ''}></td>
+          </tr>`;
+        }).join('');
+        return `<div class="permission-role">
+          <div class="permission-role-header">
+            <span>${htmlEscape(role)}</span>
+            ${locked ? '<span class="muted">Locked full access</span>' : `<button class="btn primary" data-save-role-permissions="${htmlEscape(role)}" type="button">Save Role</button>`}
+          </div>
+          <div class="table-wrap"><table><thead><tr><th>Area</th><th>View</th><th>Edit</th></tr></thead><tbody>${rows}</tbody></table></div>
+        </div>`;
+      }).join('');
+      wrap.querySelectorAll('[data-permission-field="can_view"]').forEach(box => {
+        box.onchange = () => {
+          const editBox = wrap.querySelector(`[data-role-permission="${CSS.escape(box.dataset.rolePermission)}"][data-permission-key="${CSS.escape(box.dataset.permissionKey)}"][data-permission-field="can_edit"]`);
+          if (!box.checked && editBox) editBox.checked = false;
+        };
+      });
+      wrap.querySelectorAll('[data-permission-field="can_edit"]').forEach(box => {
+        box.onchange = () => {
+          const viewBox = wrap.querySelector(`[data-role-permission="${CSS.escape(box.dataset.rolePermission)}"][data-permission-key="${CSS.escape(box.dataset.permissionKey)}"][data-permission-field="can_view"]`);
+          if (box.checked && viewBox) viewBox.checked = true;
+        };
+      });
+      wrap.querySelectorAll('[data-save-role-permissions]').forEach(btn => {
+        btn.onclick = async () => {
+          const role = btn.dataset.saveRolePermissions;
+          const payload = {};
+          permissions.forEach(permission => {
+            const viewBox = wrap.querySelector(`[data-role-permission="${CSS.escape(role)}"][data-permission-key="${CSS.escape(permission.key)}"][data-permission-field="can_view"]`);
+            const editBox = wrap.querySelector(`[data-role-permission="${CSS.escape(role)}"][data-permission-key="${CSS.escape(permission.key)}"][data-permission-field="can_edit"]`);
+            payload[permission.key] = { can_view: !!viewBox?.checked, can_edit: !!editBox?.checked };
+          });
+          await api('/api/role-permissions', { method:'POST', body: JSON.stringify({ role, permissions: payload }) });
+          rolePermissionsData = await api('/api/role-permissions');
+          renderRolePermissions();
+        };
+      });
+    }
+
+    async function loadRolePermissions() {
+      if (state.currentUser?.role !== 'Admin') return;
+      rolePermissionsData = await api('/api/role-permissions');
+      renderRolePermissions();
+    }
+
+    let activityRows = [];
+    function renderActivityLog() {
+      const search = String(document.getElementById('activitySearch')?.value || '').trim().toLowerCase();
+      const action = document.getElementById('activityAction')?.value || '';
+      const filtered = activityRows.filter(row => {
+        if (action && row.action !== action) return false;
+        if (!search) return true;
+        return [
+          row.actor_username,
+          row.action,
+          row.entity_type,
+          row.entity_label,
+          row.details,
+          row.created_at
+        ].some(value => String(value || '').toLowerCase().includes(search));
+      });
+      document.getElementById('activityCount').textContent = `${filtered.length} of ${activityRows.length} activity record(s) shown`;
+      document.getElementById('activityTable').innerHTML = filtered.length ? `
+        <thead><tr><th>When</th><th>User</th><th>Action</th><th>Target</th><th>Details</th></tr></thead>
+        <tbody>${filtered.map(row => `<tr>
+          <td>${htmlEscape(row.created_at || '')}</td>
+          <td>${htmlEscape(row.actor_username || 'system')}</td>
+          <td><strong>${htmlEscape(row.action || '')}</strong></td>
+          <td>${htmlEscape([row.entity_type, row.entity_label].filter(Boolean).join(' / '))}</td>
+          <td>${htmlEscape(row.details || '')}</td>
+        </tr>`).join('')}</tbody>`
+        : '<tbody><tr><td>No activity matches the current filters.</td></tr></tbody>';
+    }
+
+    async function loadActivityLog() {
+      if (state.currentUser?.role !== 'Admin') return;
+      const limit = document.getElementById('activityLimit')?.value || '100';
+      activityRows = await api(`/api/activity?limit=${encodeURIComponent(limit)}`);
+      const actionEl = document.getElementById('activityAction');
+      const currentAction = actionEl.value || '';
+      const actions = [...new Set(activityRows.map(row => row.action).filter(Boolean))].sort();
+      actionEl.innerHTML = '<option value="">All actions</option>' + actions.map(item => `<option ${item === currentAction ? 'selected' : ''}>${htmlEscape(item)}</option>`).join('');
+      renderActivityLog();
     }
 
     document.getElementById('projectForm').onsubmit = async e => {
       e.preventDefault();
       const data = formDataObj(e.target);
-      if (state.projectId && !projectCreateMode) {
-        await api(`/api/projects/${state.projectId}`, { method:'PUT', body: JSON.stringify(data) });
-      } else {
-        const saved = await api('/api/projects', { method:'POST', body: JSON.stringify(data) });
-        state.projectId = saved.id;
-        localStorage.setItem('selectedProjectId', state.projectId);
-      }
-      setProjectCreateMode(false);
+      if (!state.projectId) return;
+      await api(`/api/projects/${state.projectId}`, { method:'PUT', body: JSON.stringify(data) });
       markSaved();
       await loadProjects();
     };
-    document.getElementById('newProjectBtn').onclick = async () => {
-      if (!(await confirmDiscard())) return;
+    document.getElementById('newProjectForm').onsubmit = async e => {
+      e.preventDefault();
+      const saved = await api('/api/projects', { method:'POST', body: JSON.stringify(formDataObj(e.target)) });
+      state.projectId = saved.id;
+      localStorage.setItem('selectedProjectId', state.projectId);
+      e.target.reset();
       markSaved();
-      setProjectCreateMode(true);
-      updateNavForTab('setup');
-      document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
-      document.querySelectorAll('.tab').forEach(t => t.classList.add('hidden'));
-      document.querySelector('[data-tab="setup"]').classList.add('active');
-      document.getElementById('setup').classList.remove('hidden');
-      document.querySelector('#projectForm input[name="project_code"]').focus();
+      await loadProjects();
+      openTab('setup');
     };
     document.getElementById('archiveProjectBtn').onclick = async () => {
-      if (!state.projectId || projectCreateMode) return;
+      if (!state.projectId) return;
       const project = state.projects.find(p => p.id === state.projectId);
       const ok = window.confirm(`Close and archive ${project?.name || 'this project'}? It will move out of the active project list.`);
       if (!ok) return;
@@ -7097,14 +8823,13 @@ HTML = r"""
       await loadProjects();
       openTab('archivedProjects');
     };
-    document.getElementById('cancelNewProjectBtn').onclick = async () => {
-      setProjectCreateMode(false);
-      markSaved();
-      await refresh();
-    };
     document.getElementById('refreshArchivedProjects').onclick = () => loadArchivedProjects();
     document.getElementById('refreshJobOrderReport').onclick = () => loadJobOrderReport();
     document.getElementById('refreshFieldPos').onclick = () => loadFieldPos();
+    document.getElementById('refreshActivity').onclick = () => loadActivityLog();
+    document.getElementById('activitySearch').oninput = () => renderActivityLog();
+    document.getElementById('activityAction').onchange = () => renderActivityLog();
+    document.getElementById('activityLimit').onchange = () => loadActivityLog();
     document.getElementById('refreshOfficePos').onclick = () => loadOfficePos();
     document.getElementById('officePoSearch').oninput = () => renderOfficePos();
     document.getElementById('officePoStatusFilter').onchange = () => renderOfficePos();
@@ -7122,20 +8847,51 @@ HTML = r"""
       });
       renderJobOrderReport();
     };
+    document.getElementById('fieldPoJobSearch').oninput = event => {
+      document.getElementById('fieldPoJobKey').value = '';
+      updateFieldPoCustomerRequirement();
+      renderFieldPoJobChoices(event.target.value);
+      document.getElementById('fieldPoJobList').classList.remove('hidden');
+    };
+    document.getElementById('fieldPoJobSearch').onfocus = event => {
+      renderFieldPoJobChoices(event.target.value);
+      document.getElementById('fieldPoJobList').classList.remove('hidden');
+    };
+    document.addEventListener('click', event => {
+      if (!event.target.closest('.combo-wrap')) {
+        document.getElementById('fieldPoJobList')?.classList.add('hidden');
+      }
+    });
     document.getElementById('fieldPoForm').onsubmit = async e => {
       e.preventDefault();
       const resultEl = document.getElementById('fieldPoResult');
-      resultEl.textContent = 'Submitting PO request...';
+      if (!document.getElementById('fieldPoJobKey').value) {
+        resultEl.innerHTML = '<span class="bad">Choose a matching Job / Order # / COG from the list.</span>';
+        document.getElementById('fieldPoJobSearch').focus();
+        document.getElementById('fieldPoJobList').classList.remove('hidden');
+        return;
+      }
+      const selectedPoChoice = fieldPoJobChoices.find(item => item.key === document.getElementById('fieldPoJobKey').value);
+      const selectedCogName = String(selectedPoChoice?.primary || '').trim().toLowerCase().replace(/\s+/g, ' ');
+      const selectedRequiresCustomer = document.getElementById('fieldPoJobKey').value.startsWith('cog:') && !COG_CUSTOMER_OPTIONAL_NAMES.has(selectedCogName);
+      if (selectedRequiresCustomer && !String(document.getElementById('fieldPoCustomer').value || '').trim()) {
+        resultEl.innerHTML = '<span class="bad">Enter the customer for this shop / COG PO.</span>';
+        document.getElementById('fieldPoCustomer').focus();
+        return;
+      }
+      resultEl.textContent = 'Creating PO...';
       const form = e.target;
       const data = new FormData(form);
       try {
         const saved = await api('/api/purchase-orders', { method:'POST', body: data });
-        resultEl.innerHTML = `<strong class="good">PO Created: ${htmlEscape(saved.po_number)}</strong>`;
+        resultEl.innerHTML = `<strong class="good">PO Created: ${htmlEscape(saved.po_number)}</strong><div class="muted">Status: ${htmlEscape(saved.status || '')}</div>`;
         form.reset();
+        document.getElementById('fieldPoJobKey').value = '';
+        updateFieldPoCustomerRequirement();
         await loadFieldPoJobs();
         await loadFieldPos();
       } catch (err) {
-        resultEl.innerHTML = `<span class="bad">${htmlEscape(err.message || 'Could not create PO request.')}</span>`;
+        resultEl.innerHTML = `<span class="bad">${htmlEscape(err.message || 'Could not create PO.')}</span>`;
       }
     };
     document.getElementById('subprojectForm').onsubmit = async e => {
@@ -7270,6 +9026,22 @@ HTML = r"""
       markSaved();
       await refresh();
     };
+    document.getElementById('addCogCategory').onclick = async () => {
+      await api('/api/cog-categories', {
+        method: 'POST',
+        body: JSON.stringify({
+          code: document.getElementById('cogCode').value,
+          name: document.getElementById('cogName').value,
+          description: document.getElementById('cogDescription').value
+        })
+      });
+      ['cogCode','cogName','cogDescription'].forEach(id => document.getElementById(id).value = '');
+      markSaved();
+      state.cogCategories = await api('/api/cog-categories');
+      jobOrderReportRows = await api('/api/job-order-report');
+      loadCogCategoryEditor();
+      renderFieldPoJobChoices(document.getElementById('fieldPoJobSearch')?.value || '');
+    };
     document.getElementById('importVendorInvoice').onclick = async () => {
       const fileInput = document.getElementById('vendorInvoiceFile');
       const resultEl = document.getElementById('vendorImportResult');
@@ -7376,6 +9148,12 @@ class Handler(BaseHTTPRequestHandler):
                 if user.get("role") != "Admin":
                     return json_response(self, {"error": "Admin required"}, 403)
                 return json_response(self, app_revision_info())
+            if parsed.path == "/api/admin/database-backup":
+                if user.get("role") != "Admin":
+                    return text_response(self, "Admin required", "text/plain", 403)
+                filename = f"pm-tracker-backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}.sqlite3"
+                log_activity(user, "downloaded backup", "Database", filename)
+                return download_response(self, sqlite_backup_bytes(), filename, "application/vnd.sqlite3")
             if parsed.path == "/":
                 return text_response(self, HTML)
             if parsed.path.startswith("/po/"):
@@ -7478,6 +9256,21 @@ class Handler(BaseHTTPRequestHandler):
                         LEFT JOIN subprojects sp ON sp.id = co.subproject_id
                         WHERE COALESCE(p.status, 'Active') <> 'Archived'
                           AND TRIM(COALESCE(co.job_number, '')) <> ''
+                        UNION ALL
+                        SELECT
+                          'cog:' || cg.id AS job_key,
+                          cg.name AS job_number,
+                          'COG' AS item_type,
+                          '' AS customer,
+                          'COG Category' AS project_name,
+                          cg.code AS project_code,
+                          cg.code AS reference_code,
+                          cg.description,
+                          '' AS project_description,
+                          '' AS location,
+                          'Active' AS status
+                        FROM cog_categories cg
+                        WHERE COALESCE(cg.active, 1) = 1
                         ORDER BY customer, project_name, job_number, item_type
                         """
                     ),
@@ -7501,11 +9294,41 @@ class Handler(BaseHTTPRequestHandler):
                     return json_response(self, rows("SELECT * FROM projects WHERE status = 'Archived' ORDER BY COALESCE(archived_at, closed_at, created_at) DESC, project_code"))
                 return json_response(self, rows("SELECT * FROM projects WHERE COALESCE(status, 'Active') <> 'Archived' ORDER BY project_code"))
             if parsed.path == "/api/me":
-                return json_response(self, user)
+                return json_response(self, current_user_with_permissions(self))
             if parsed.path == "/api/users":
                 if not require_admin(self):
                     return json_response(self, {"error": "Admin required"}, 403)
-                return json_response(self, rows("SELECT id, username, display_name, role, active, COALESCE(must_change_password, 0) AS must_change_password, created_at FROM users ORDER BY username"))
+                return json_response(self, rows("SELECT id, username, display_name, role, active, COALESCE(po_auto_issue, 0) AS po_auto_issue, COALESCE(must_change_password, 0) AS must_change_password, created_at FROM users ORDER BY username"))
+            if parsed.path == "/api/role-permissions":
+                if not require_admin(self):
+                    return json_response(self, {"error": "Admin required"}, 403)
+                return json_response(
+                    self,
+                    {
+                        "roles": list(ROLE_NAMES),
+                        "permissions": PERMISSION_DEFINITIONS,
+                        "matrix": {role: role_permissions(role) for role in ROLE_NAMES},
+                    },
+                )
+            if parsed.path == "/api/activity":
+                if not require_admin(self):
+                    return json_response(self, {"error": "Admin required"}, 403)
+                try:
+                    limit = max(1, min(500, int(qs.get("limit", ["100"])[0] or 100)))
+                except Exception:
+                    limit = 100
+                return json_response(
+                    self,
+                    rows(
+                        """
+                        SELECT *
+                        FROM activity_log
+                        ORDER BY created_at DESC, id DESC
+                        LIMIT ?
+                        """,
+                        (limit,),
+                    ),
+                )
             if parsed.path == "/api/purchase-orders":
                 if not can_use_field_po(user):
                     return json_response(self, {"error": "PO access required."}, 403)
@@ -7521,10 +9344,20 @@ class Handler(BaseHTTPRequestHandler):
                         rows("SELECT * FROM purchase_orders WHERE project_id = ? ORDER BY created_at DESC, id DESC", (project_filter,)),
                     )
                 return json_response(self, rows("SELECT * FROM purchase_orders ORDER BY created_at DESC, id DESC"))
+            if parsed.path == "/api/home-alerts":
+                return json_response(self, home_alerts())
             if parsed.path == "/api/bid-summary":
                 return json_response(self, bid_summary())
             if parsed.path == "/api/texas-financial-summary":
                 return json_response(self, texas_financial_summary())
+            if parsed.path == "/api/texas-upload-reminders":
+                if not require_editor(self):
+                    return json_response(self, {"error": "Admin or standard user access required."}, 403)
+                return json_response(self, texas_upload_reminder_status())
+            if parsed.path == "/api/billing-invoice-reminders":
+                if not require_editor(self):
+                    return json_response(self, {"error": "Admin or standard user access required."}, 403)
+                return json_response(self, billing_invoice_reminder_status())
             if parsed.path == "/api/bids":
                 return json_response(self, rows("SELECT * FROM bid_requests ORDER BY bid_due_date, rfq_no"))
             if parsed.path == "/api/rate-sets":
@@ -7533,6 +9366,8 @@ class Handler(BaseHTTPRequestHandler):
                 return json_response(self, rows("SELECT * FROM subprojects WHERE project_id = ? ORDER BY code", (qs.get("project_id", [""])[0],)))
             if parsed.path == "/api/change-orders":
                 return json_response(self, rows("SELECT * FROM change_orders WHERE project_id = ? ORDER BY co_number", (qs.get("project_id", [""])[0],)))
+            if parsed.path == "/api/cog-categories":
+                return json_response(self, rows("SELECT * FROM cog_categories WHERE COALESCE(active, 1) = 1 ORDER BY name, code"))
             if parsed.path == "/api/customer-invoices":
                 return json_response(
                     self,
@@ -7690,6 +9525,7 @@ class Handler(BaseHTTPRequestHandler):
                     return json_response(self, {"error": "PO access required."}, 403)
                 form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": self.headers.get("Content-Type")})
                 job_key = form.getvalue("job_key")
+                customer_name = str(form.getvalue("customer_name") or "").strip()
                 vendor = str(form.getvalue("vendor") or "").strip()
                 description = str(form.getvalue("description") or "").strip()
                 estimated_amount = money(form.getvalue("estimated_amount"))
@@ -7720,34 +9556,46 @@ class Handler(BaseHTTPRequestHandler):
                             except Exception:
                                 pass
                         return json_response(self, {"error": "That job/order is no longer available."}, 400)
+                    if po_customer_required_for_ref(job_ref) and not customer_name:
+                        if attachment_file:
+                            try:
+                                (UPLOAD_DIR / attachment_file).unlink()
+                            except Exception:
+                                pass
+                        return json_response(self, {"error": "Enter the customer for this shop / COG PO."}, 400)
                     po_number = next_po_number(con)
+                    initial_status = "Issued" if can_auto_issue_po(user) else "Pending Approval"
                     cur = con.execute(
                         """
                         INSERT INTO purchase_orders (
-                          po_number, project_id, subproject_id, change_order_id, job_number, job_label,
+                          po_number, project_id, subproject_id, change_order_id, cog_category_id, job_number, job_label, customer_name,
                           vendor, description, estimated_amount, attachment_file, status,
                           requested_by_user_id, requested_by_username, created_at, updated_at
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending Review', ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             po_number,
                             job_ref["project_id"],
                             job_ref["subproject_id"],
                             job_ref["change_order_id"],
+                            job_ref["cog_category_id"],
                             job_ref["job_number"],
                             job_ref["job_label"],
+                            customer_name,
                             vendor,
                             description,
                             estimated_amount,
                             attachment_file,
+                            initial_status,
                             user["id"],
                             user["username"],
                             now,
                             now,
                         ),
                     )
-                    return json_response(self, {"id": cur.lastrowid, "po_number": po_number})
+                    log_activity(user, "created PO", "Purchase Order", po_number, {"status": initial_status, "vendor": vendor, "estimated_amount": estimated_amount})
+                    return json_response(self, {"id": cur.lastrowid, "po_number": po_number, "status": initial_status})
             if parsed.path.startswith("/api/purchase-orders/") and parsed.path.endswith("/pickup"):
                 user = current_user(self)
                 if not can_use_field_po(user):
@@ -7759,8 +9607,10 @@ class Handler(BaseHTTPRequestHandler):
                         return json_response(self, {"error": "PO not found."}, 404)
                     if is_field_po_only(user) and po["requested_by_user_id"] != user["id"]:
                         return json_response(self, {"error": "PO not found."}, 404)
-                    if po["status"] == "Void":
-                        return json_response(self, {"error": "Cannot upload to a void PO."}, 400)
+                    if po["status"] in ("Closed", "Void"):
+                        return json_response(self, {"error": "Cannot upload to a closed or void PO."}, 400)
+                    if po["status"] == "Pending Approval":
+                        return json_response(self, {"error": "This PO is pending office approval. Upload the pickup ticket after it is issued."}, 400)
                     form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": self.headers.get("Content-Type")})
                     file_item = form["pickup_file"] if "pickup_file" in form else None
                     if file_item is None or not getattr(file_item, "filename", ""):
@@ -7773,13 +9623,206 @@ class Handler(BaseHTTPRequestHandler):
                     path = UPLOAD_DIR / saved_name
                     with open(path, "wb") as f:
                         f.write(file_item.file.read())
+                    now = datetime.now().isoformat(timespec="seconds")
                     con.execute(
-                        "UPDATE purchase_orders SET pickup_file = ?, updated_at = ? WHERE id = ?",
-                        (saved_name, datetime.now().isoformat(timespec="seconds"), po_id),
+                        """
+                        UPDATE purchase_orders
+                        SET pickup_file = ?,
+                            pickup_uploaded_at = ?,
+                            pickup_uploaded_by_user_id = ?,
+                            pickup_uploaded_by_username = ?,
+                            status = 'Picked Up',
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (saved_name, now, user["id"], user["username"], now, po_id),
                     )
-                return json_response(self, {"ok": True, "pickup_file": saved_name})
+                    log_activity(user, "uploaded pickup ticket", "Purchase Order", po["po_number"] if po else po_id, {"pickup_file": saved_name, "uploaded_at": now})
+                return json_response(self, {"ok": True, "pickup_file": saved_name, "status": "Picked Up"})
+            if parsed.path == "/api/role-permissions":
+                if not require_admin(self):
+                    return json_response(self, {"error": "Admin required"}, 403)
+                data = parse_json(self)
+                role = clean_role(data.get("role"))
+                if role == "Admin":
+                    return json_response(self, {"error": "Admin permissions are always full access."}, 400)
+                updates = data.get("permissions") or {}
+                allowed_keys = {p["key"] for p in PERMISSION_DEFINITIONS}
+                now = datetime.now().isoformat(timespec="seconds")
+                with db() as con:
+                    for key, values in updates.items():
+                        if key not in allowed_keys:
+                            continue
+                        can_view = 1 if values.get("can_view") else 0
+                        can_edit = 1 if values.get("can_edit") and can_view else 0
+                        con.execute(
+                            """
+                            INSERT INTO role_permissions (role, permission_key, can_view, can_edit, updated_at)
+                            VALUES (?, ?, ?, ?, ?)
+                            ON CONFLICT(role, permission_key) DO UPDATE SET
+                              can_view = excluded.can_view,
+                              can_edit = excluded.can_edit,
+                              updated_at = excluded.updated_at
+                            """,
+                            (role, key, can_view, can_edit, now),
+                        )
+                log_activity(current_user(self), "updated role permissions", "Role", role, {"permissions": updates})
+                return json_response(self, {"ok": True})
+            if parsed.path == "/api/home-alerts/job-invoice-ack":
+                user = current_user(self)
+                if not require_editor(self):
+                    return json_response(self, {"error": "Read-only users cannot acknowledge alerts."}, 403)
+                data = parse_json(self)
+                target_type = str(data.get("target_type") or "").strip()
+                target_id = str(data.get("target_id") or "").strip()
+                if target_type == "subproject":
+                    target = one(
+                        """
+                        SELECT sp.id, sp.job_number, sp.code AS reference_code, sp.name AS job_name,
+                               p.project_code, p.name AS project_name
+                        FROM subprojects sp
+                        JOIN projects p ON p.id = sp.project_id
+                        WHERE sp.id = ?
+                        """,
+                        (target_id,),
+                    )
+                elif target_type == "change_order":
+                    target = one(
+                        """
+                        SELECT co.id, co.job_number, co.co_number AS reference_code, co.title AS job_name,
+                               p.project_code, p.name AS project_name
+                        FROM change_orders co
+                        JOIN projects p ON p.id = co.project_id
+                        WHERE co.id = ?
+                        """,
+                        (target_id,),
+                    )
+                else:
+                    return json_response(self, {"error": "Choose a valid job target."}, 400)
+                if not target:
+                    return json_response(self, {"error": "Job target not found."}, 404)
+                now = datetime.now().isoformat(timespec="seconds")
+                execute(
+                    """
+                    INSERT INTO job_invoice_alert_acknowledgements (
+                      target_type, target_id, acknowledged_at, acknowledged_by_user_id, acknowledged_by_username, notes
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(target_type, target_id) DO UPDATE SET
+                      acknowledged_at = excluded.acknowledged_at,
+                      acknowledged_by_user_id = excluded.acknowledged_by_user_id,
+                      acknowledged_by_username = excluded.acknowledged_by_username,
+                      notes = excluded.notes
+                    """,
+                    (
+                        target_type,
+                        target_id,
+                        now,
+                        user["id"],
+                        user["username"],
+                        str(data.get("notes") or "Acknowledged from Needs Attention").strip(),
+                    ),
+                )
+                label = " / ".join(str(x or "").strip() for x in (target.get("job_number"), target.get("reference_code"), target.get("job_name")) if str(x or "").strip())
+                log_activity(user, "acknowledged job invoice alert", "Customer Billing", label, {"target_type": target_type, "target_id": target_id, "next_check_days": 5})
+                return json_response(self, {"ok": True, "acknowledged_at": now})
             if not require_editor(self):
                 return json_response(self, {"error": "Read-only users cannot make changes."}, 403)
+            if parsed.path == "/api/texas-upload-reminders":
+                actor = current_user(self)
+                data = parse_json(self)
+                selected_ids = {int(x) for x in data.get("user_ids", []) if str(x).isdigit()}
+                enabled = 1 if str(data.get("enabled", "1")).lower() not in ("0", "false", "no") else 0
+                try:
+                    weekday = max(0, min(6, int(data.get("weekday", 4))))
+                except Exception:
+                    weekday = 4
+                reminder_time = str(data.get("reminder_time") or "15:00").strip()
+                if not re.match(r"^\d{2}:\d{2}$", reminder_time):
+                    reminder_time = "15:00"
+                now = datetime.now().isoformat(timespec="seconds")
+                with db() as con:
+                    con.execute(
+                        """
+                        INSERT INTO texas_upload_reminder_settings (id, enabled, weekday, reminder_time, updated_at)
+                        VALUES (1, ?, ?, ?, ?)
+                        ON CONFLICT(id) DO UPDATE SET
+                          enabled = excluded.enabled,
+                          weekday = excluded.weekday,
+                          reminder_time = excluded.reminder_time,
+                          updated_at = excluded.updated_at
+                        """,
+                        (enabled, weekday, reminder_time, now),
+                    )
+                    con.execute("UPDATE texas_upload_reminder_recipients SET active = 0")
+                    for user_id in selected_ids:
+                        con.execute(
+                            """
+                            INSERT INTO texas_upload_reminder_recipients (user_id, active, created_at)
+                            VALUES (?, 1, ?)
+                            ON CONFLICT(user_id) DO UPDATE SET active = 1
+                            """,
+                            (user_id, now),
+                        )
+                log_activity(actor, "updated reminder setup", "Texas Ops", "P&L upload reminder", {"enabled": enabled, "weekday": weekday, "reminder_time": reminder_time, "recipient_count": len(selected_ids)})
+                return json_response(self, texas_upload_reminder_status())
+            if parsed.path == "/api/texas-upload-reminders/send-now":
+                actor = current_user(self)
+                parse_json(self)
+                result = run_texas_upload_reminder(force=True)
+                log_activity(actor, "ran reminder check", "Texas Ops", "P&L upload reminder", result)
+                result["status"] = texas_upload_reminder_status()
+                return json_response(self, result)
+            if parsed.path == "/api/billing-invoice-reminders":
+                actor = current_user(self)
+                data = parse_json(self)
+                selected_ids = {int(x) for x in data.get("user_ids", []) if str(x).isdigit()}
+                enabled = 1 if str(data.get("enabled", "1")).lower() not in ("0", "false", "no") else 0
+                try:
+                    weekday = max(0, min(6, int(data.get("weekday", 4))))
+                except Exception:
+                    weekday = 4
+                reminder_time = str(data.get("reminder_time") or "15:00").strip()
+                if not re.match(r"^\d{2}:\d{2}$", reminder_time):
+                    reminder_time = "15:00"
+                try:
+                    lookback_days = max(1, min(60, int(data.get("lookback_days", 7))))
+                except Exception:
+                    lookback_days = 7
+                now = datetime.now().isoformat(timespec="seconds")
+                with db() as con:
+                    con.execute(
+                        """
+                        INSERT INTO billing_invoice_reminder_settings (id, enabled, weekday, reminder_time, lookback_days, updated_at)
+                        VALUES (1, ?, ?, ?, ?, ?)
+                        ON CONFLICT(id) DO UPDATE SET
+                          enabled = excluded.enabled,
+                          weekday = excluded.weekday,
+                          reminder_time = excluded.reminder_time,
+                          lookback_days = excluded.lookback_days,
+                          updated_at = excluded.updated_at
+                        """,
+                        (enabled, weekday, reminder_time, lookback_days, now),
+                    )
+                    con.execute("UPDATE billing_invoice_reminder_recipients SET active = 0")
+                    for user_id in selected_ids:
+                        con.execute(
+                            """
+                            INSERT INTO billing_invoice_reminder_recipients (user_id, active, created_at)
+                            VALUES (?, 1, ?)
+                            ON CONFLICT(user_id) DO UPDATE SET active = 1
+                            """,
+                            (user_id, now),
+                        )
+                log_activity(actor, "updated reminder setup", "Customer Billing", "Missing customer invoice reminder", {"enabled": enabled, "weekday": weekday, "reminder_time": reminder_time, "lookback_days": lookback_days, "recipient_count": len(selected_ids)})
+                return json_response(self, billing_invoice_reminder_status())
+            if parsed.path == "/api/billing-invoice-reminders/send-now":
+                actor = current_user(self)
+                parse_json(self)
+                result = run_billing_invoice_reminder(force=True)
+                log_activity(actor, "ran reminder check", "Customer Billing", "Missing customer invoice reminder", result)
+                result["status"] = billing_invoice_reminder_status()
+                return json_response(self, result)
             if parsed.path == "/api/fieldwise-audit-omissions":
                 user = current_user(self)
                 data = parse_json(self)
@@ -7816,6 +9859,7 @@ class Handler(BaseHTTPRequestHandler):
                             datetime.now().isoformat(timespec="seconds"),
                         ),
                     )
+                log_activity(user, "marked ticket OK to omit", "Field Wise Audit", f"{ticket_number} / {order_number}", {"customer": data.get("customer"), "project_name": data.get("project_name"), "reason": data.get("reason")})
                 return json_response(self, {"ok": True})
             if parsed.path == "/api/fieldwise-audit":
                 form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": self.headers.get("Content-Type")})
@@ -7960,16 +10004,21 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/api/texas-financial-delete":
                 report_id = data.get("report_id")
                 with db() as con:
+                    report = con.execute("SELECT * FROM financial_reports WHERE id = ?", (report_id,)).fetchone()
                     metric_count = con.execute("DELETE FROM financial_metrics WHERE report_id = ?", (report_id,)).rowcount
                     report_count = con.execute("DELETE FROM financial_reports WHERE id = ?", (report_id,)).rowcount
+                if report_count:
+                    log_activity(current_user(self), "deleted financial report", "Texas Ops", f"{report['report_date']} / {report['source_file']}", {"report_id": report_id, "report_type": report["report_type"], "deleted_metrics": metric_count})
                 return json_response(self, {"deleted": report_count, "deleted_metrics": metric_count})
             if parsed.path == "/api/users":
                 if not require_admin(self):
                     return json_response(self, {"error": "Admin required"}, 403)
+                po_auto_issue = 1 if str(data.get("po_auto_issue") or "") in ("1", "true", "on") else 0
                 new_id = execute(
-                    "INSERT INTO users (username, display_name, password_hash, role, active, must_change_password, created_at) VALUES (?, ?, ?, ?, 1, 1, ?)",
-                    (data.get("username"), data.get("display_name"), hash_password(DEFAULT_NEW_USER_PASSWORD), clean_role(data.get("role")), now),
+                    "INSERT INTO users (username, display_name, password_hash, role, active, po_auto_issue, must_change_password, created_at) VALUES (?, ?, ?, ?, 1, ?, 1, ?)",
+                    (data.get("username"), data.get("display_name"), hash_password(DEFAULT_NEW_USER_PASSWORD), clean_role(data.get("role")), po_auto_issue, now),
                 )
+                log_activity(current_user(self), "created user", "User", data.get("username"), {"display_name": data.get("display_name"), "role": clean_role(data.get("role")), "po_auto_issue": po_auto_issue})
                 return json_response(self, {"id": new_id})
             if parsed.path.startswith("/api/projects/") and parsed.path.endswith("/archive"):
                 project_id = parsed.path.split("/")[-2]
@@ -8126,6 +10175,29 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     new_id = cur.lastrowid
                 return json_response(self, {"id": new_id})
+            if parsed.path == "/api/cog-categories":
+                code = str(data.get("code") or "").strip().upper()
+                name = str(data.get("name") or "").strip()
+                description = str(data.get("description") or "").strip()
+                if not code:
+                    return json_response(self, {"error": "Internal COG code is required."}, 400)
+                if not name:
+                    return json_response(self, {"error": "COG name is required."}, 400)
+                with db() as con:
+                    existing = con.execute("SELECT id FROM cog_categories WHERE lower(name) = lower(?)", (name,)).fetchone()
+                    if existing:
+                        con.execute(
+                            "UPDATE cog_categories SET code = ?, description = ?, active = 1 WHERE id = ?",
+                            (code, description, existing["id"]),
+                        )
+                        new_id = existing["id"]
+                    else:
+                        cur = con.execute(
+                            "INSERT INTO cog_categories (code, name, description, active, created_at) VALUES (?, ?, ?, 1, ?)",
+                            (code, name, description, datetime.now().isoformat(timespec="seconds")),
+                        )
+                        new_id = cur.lastrowid
+                return json_response(self, {"id": new_id})
             if parsed.path.startswith("/api/change-orders/") and parsed.path.endswith("/copy"):
                 change_order_id = parsed.path.split("/")[-2]
                 new_co_number = str(data.get("co_number") or "").strip()
@@ -8204,6 +10276,8 @@ class Handler(BaseHTTPRequestHandler):
                         """,
                         (data.get("project_id"), data.get("source"), data.get("source_file")),
                     ).rowcount
+                if deleted:
+                    log_activity(current_user(self), "deleted import", str(data.get("source") or "Import"), str(data.get("source_file") or ""), {"project_id": data.get("project_id"), "deleted_records": deleted})
                 return json_response(self, {"deleted": deleted})
             if parsed.path == "/api/cost-records/bulk-update":
                 ids = [str(x) for x in data.get("ids", []) if str(x).isdigit()]
@@ -8418,40 +10492,104 @@ class Handler(BaseHTTPRequestHandler):
                 if not require_admin(self):
                     return json_response(self, {"error": "Admin required"}, 403)
                 user_id = parsed.path.rsplit("/", 1)[-1]
+                target_user = one("SELECT username, display_name, role, active FROM users WHERE id = ?", (user_id,))
                 if "password" in data and data.get("password"):
                     execute("UPDATE users SET password_hash = ?, must_change_password = 1 WHERE id = ?", (hash_password(data.get("password")), user_id))
                 if "role" in data:
                     execute("UPDATE users SET role = ? WHERE id = ?", (clean_role(data.get("role")), user_id))
                 if "active" in data:
                     execute("UPDATE users SET active = ? WHERE id = ?", (1 if str(data.get("active")) == "1" else 0, user_id))
+                if "po_auto_issue" in data:
+                    execute("UPDATE users SET po_auto_issue = ? WHERE id = ?", (1 if str(data.get("po_auto_issue")) == "1" else 0, user_id))
+                log_activity(current_user(self), "updated user", "User", target_user["username"] if target_user else user_id, {"changed_fields": list(data.keys()), "new_role": clean_role(data.get("role")) if "role" in data else None, "active": data.get("active") if "active" in data else None, "po_auto_issue": data.get("po_auto_issue") if "po_auto_issue" in data else None})
                 return json_response(self, {"ok": True})
             if parsed.path.startswith("/api/purchase-orders/"):
                 po_id = parsed.path.rsplit("/", 1)[-1]
-                status = str(data.get("status") or "Pending Review").strip()
-                if status not in ("Pending Review", "Issued", "Received", "Closed", "Void"):
+                actor = current_user(self)
+                status = str(data.get("status") or "Pending Approval").strip()
+                if status not in ("Pending Approval", "Issued", "Picked Up", "Closed", "Void"):
                     return json_response(self, {"error": "Choose a valid PO status."}, 400)
                 vendor = str(data.get("vendor") or "").strip()
+                customer_name = str(data.get("customer_name") or "").strip()
                 description = str(data.get("description") or "").strip()
                 if not vendor:
                     return json_response(self, {"error": "Vendor is required."}, 400)
                 if not description:
                     return json_response(self, {"error": "Details are required."}, 400)
                 with db() as con:
+                    current_po = con.execute("SELECT * FROM purchase_orders WHERE id = ?", (po_id,)).fetchone()
+                    if not current_po:
+                        return json_response(self, {"error": "PO not found."}, 404)
                     job_ref = job_reference_for_po(con, data.get("job_key"))
                     if not job_ref:
                         return json_response(self, {"error": "Choose a valid job/order number."}, 400)
+                    if po_customer_required_for_ref(job_ref) and not customer_name:
+                        return json_response(self, {"error": "Customer is required for shop / COG POs."}, 400)
+                    now = datetime.now().isoformat(timespec="seconds")
+                    close_reason = str(data.get("close_reason") or current_po["close_reason"] or "").strip()
+                    void_reason = str(data.get("void_reason") or current_po["void_reason"] or "").strip()
+                    closed_at = current_po["closed_at"]
+                    closed_by_user_id = current_po["closed_by_user_id"]
+                    closed_by_username = current_po["closed_by_username"]
+                    voided_at = current_po["voided_at"]
+                    voided_by_user_id = current_po["voided_by_user_id"]
+                    voided_by_username = current_po["voided_by_username"]
+                    action_detail = None
+                    if status == "Closed":
+                        if not close_reason:
+                            return json_response(self, {"error": "Close reason is required to close a PO."}, 400)
+                        if current_po["status"] != "Closed" or not closed_at:
+                            closed_at = now
+                            closed_by_user_id = actor["id"]
+                            closed_by_username = actor["username"]
+                            action_detail = ("closed PO", {"close_reason": close_reason, "closed_at": now})
+                        voided_at = None
+                        voided_by_user_id = None
+                        voided_by_username = None
+                        void_reason = ""
+                    elif status == "Void":
+                        if not void_reason:
+                            return json_response(self, {"error": "Void reason is required to void a PO."}, 400)
+                        if current_po["status"] != "Void" or not voided_at:
+                            voided_at = now
+                            voided_by_user_id = actor["id"]
+                            voided_by_username = actor["username"]
+                            action_detail = ("voided PO", {"void_reason": void_reason, "voided_at": now})
+                        closed_at = None
+                        closed_by_user_id = None
+                        closed_by_username = None
+                        close_reason = ""
+                    else:
+                        closed_at = None
+                        closed_by_user_id = None
+                        closed_by_username = None
+                        close_reason = ""
+                        voided_at = None
+                        voided_by_user_id = None
+                        voided_by_username = None
+                        void_reason = ""
                     updated = con.execute(
                         """
                         UPDATE purchase_orders
                         SET project_id = ?,
                             subproject_id = ?,
                             change_order_id = ?,
+                            cog_category_id = ?,
                             job_number = ?,
                             job_label = ?,
+                            customer_name = ?,
                             vendor = ?,
                             description = ?,
                             estimated_amount = ?,
                             status = ?,
+                            closed_at = ?,
+                            closed_by_user_id = ?,
+                            closed_by_username = ?,
+                            close_reason = ?,
+                            voided_at = ?,
+                            voided_by_user_id = ?,
+                            voided_by_username = ?,
+                            void_reason = ?,
                             updated_at = ?
                         WHERE id = ?
                         """,
@@ -8459,18 +10597,31 @@ class Handler(BaseHTTPRequestHandler):
                             job_ref["project_id"],
                             job_ref["subproject_id"],
                             job_ref["change_order_id"],
+                            job_ref["cog_category_id"],
                             job_ref["job_number"],
                             job_ref["job_label"],
+                            customer_name,
                             vendor,
                             description,
                             money(data.get("estimated_amount")),
                             status,
-                            datetime.now().isoformat(timespec="seconds"),
+                            closed_at,
+                            closed_by_user_id,
+                            closed_by_username,
+                            close_reason,
+                            voided_at,
+                            voided_by_user_id,
+                            voided_by_username,
+                            void_reason,
+                            now,
                             po_id,
                         ),
                     ).rowcount
                     if not updated:
                         return json_response(self, {"error": "PO not found."}, 404)
+                if action_detail:
+                    log_activity(actor, action_detail[0], "Purchase Order", current_po["po_number"], action_detail[1])
+                log_activity(actor, "updated PO", "Purchase Order", current_po["po_number"], {"status": status, "vendor": vendor, "estimated_amount": money(data.get("estimated_amount"))})
                 return json_response(self, {"ok": True})
             if parsed.path.startswith("/api/cost-records/"):
                 record_id = parsed.path.rsplit("/", 1)[-1]
@@ -8715,6 +10866,26 @@ class Handler(BaseHTTPRequestHandler):
                 rate = one("SELECT rate_set_id FROM internal_rates WHERE id = ?", (rate_id,))
                 updated = apply_internal_rate(data.get("category_type"), data.get("category"), money(data.get("raw_rate")), rate["rate_set_id"] if rate else None)
                 return json_response(self, {"ok": True, "updated_cost_records": updated})
+            if parsed.path.startswith("/api/cog-categories/"):
+                category_id = parsed.path.rsplit("/", 1)[-1]
+                code = str(data.get("code") or "").strip().upper()
+                name = str(data.get("name") or "").strip()
+                description = str(data.get("description") or "").strip()
+                if not code:
+                    return json_response(self, {"error": "Internal COG code is required."}, 400)
+                if not name:
+                    return json_response(self, {"error": "COG name is required."}, 400)
+                with db() as con:
+                    duplicate = con.execute("SELECT id FROM cog_categories WHERE lower(name) = lower(?) AND id != ?", (name, category_id)).fetchone()
+                    if duplicate:
+                        return json_response(self, {"error": "That COG name already exists."}, 400)
+                    updated = con.execute(
+                        "UPDATE cog_categories SET code = ?, name = ?, description = ?, active = 1 WHERE id = ?",
+                        (code, name, description, category_id),
+                    ).rowcount
+                if not updated:
+                    return json_response(self, {"error": "COG category not found."}, 404)
+                return json_response(self, {"ok": True})
             return json_response(self, {"error": "Not found"}, 404)
         except Exception as e:
             traceback.print_exc()
@@ -8730,9 +10901,29 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path.startswith("/api/fieldwise-audit-omissions/"):
                 omission_id = parsed.path.rsplit("/", 1)[-1]
                 with db() as con:
+                    omission = con.execute("SELECT * FROM fieldwise_audit_omissions WHERE id = ?", (omission_id,)).fetchone()
                     deleted = con.execute("DELETE FROM fieldwise_audit_omissions WHERE id = ?", (omission_id,)).rowcount
                 if not deleted:
                     return json_response(self, {"error": "Omission note not found."}, 404)
+                log_activity(current_user(self), "removed OK-to-omit note", "Field Wise Audit", f"{omission['ticket_number']} / {omission['order_number']}" if omission else omission_id)
+                return json_response(self, {"ok": True})
+            if parsed.path.startswith("/api/cog-categories/"):
+                category_id = parsed.path.rsplit("/", 1)[-1]
+                with db() as con:
+                    updated = con.execute("UPDATE cog_categories SET active = 0 WHERE id = ?", (category_id,)).rowcount
+                if not updated:
+                    return json_response(self, {"error": "COG category not found."}, 404)
+                return json_response(self, {"ok": True})
+            if parsed.path.startswith("/api/purchase-orders/"):
+                if not require_admin(self):
+                    return json_response(self, {"error": "Admin required"}, 403)
+                po_id = parsed.path.rsplit("/", 1)[-1]
+                with db() as con:
+                    po = con.execute("SELECT * FROM purchase_orders WHERE id = ?", (po_id,)).fetchone()
+                    deleted = con.execute("DELETE FROM purchase_orders WHERE id = ?", (po_id,)).rowcount
+                if not deleted:
+                    return json_response(self, {"error": "PO not found."}, 404)
+                log_activity(current_user(self), "deleted PO", "Purchase Order", po["po_number"] if po else po_id, {"vendor": po["vendor"] if po else "", "amount": po["estimated_amount"] if po else 0})
                 return json_response(self, {"ok": True})
             if parsed.path.startswith("/api/subprojects/"):
                 subproject_id = parsed.path.rsplit("/", 1)[-1]
@@ -8811,6 +11002,7 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     init_db()
-    print(f"Project Dashboard running at http://{HOST}:{PORT}")
+    start_background_jobs()
+    print(f"Company Dashboard running at http://{HOST}:{PORT}")
     print("Press Ctrl+C to stop.")
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
