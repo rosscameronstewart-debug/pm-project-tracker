@@ -742,6 +742,33 @@ def init_db():
               sent_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS po_untouched_reminder_recipients (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              user_id INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+              active INTEGER DEFAULT 1,
+              created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS po_untouched_reminder_settings (
+              id INTEGER PRIMARY KEY CHECK (id = 1),
+              enabled INTEGER DEFAULT 1,
+              weekday INTEGER DEFAULT 4,
+              reminder_time TEXT DEFAULT '15:00',
+              untouched_days INTEGER DEFAULT 2,
+              updated_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS po_untouched_reminder_log (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              reminder_date TEXT NOT NULL,
+              recipient TEXT NOT NULL,
+              subject TEXT,
+              status TEXT NOT NULL,
+              error TEXT,
+              po_count INTEGER DEFAULT 0,
+              sent_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS activity_log (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               actor_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
@@ -3341,6 +3368,97 @@ def billing_invoice_reminder_status():
     }
 
 
+def po_untouched_reminder_settings():
+    setting = one("SELECT * FROM po_untouched_reminder_settings WHERE id = 1")
+    if not setting:
+        execute(
+            "INSERT INTO po_untouched_reminder_settings (id, enabled, weekday, reminder_time, untouched_days, updated_at) VALUES (1, 1, 4, '15:00', 2, ?)",
+            (datetime.now().isoformat(timespec="seconds"),),
+        )
+        setting = one("SELECT * FROM po_untouched_reminder_settings WHERE id = 1")
+    result = dict(setting)
+    try:
+        result["weekday"] = max(0, min(6, int(result.get("weekday", 4))))
+    except Exception:
+        result["weekday"] = 4
+    reminder_time = str(result.get("reminder_time") or "15:00").strip()
+    if not re.match(r"^\d{2}:\d{2}$", reminder_time):
+        reminder_time = "15:00"
+    result["reminder_time"] = reminder_time
+    try:
+        result["untouched_days"] = max(1, min(30, int(result.get("untouched_days", 2))))
+    except Exception:
+        result["untouched_days"] = 2
+    result["weekday_label"] = REMINDER_WEEKDAYS[result["weekday"]]
+    result["schedule_label"] = f"Every {result['weekday_label']} at {reminder_time} server time"
+    return result
+
+
+def untouched_purchase_orders(untouched_days=2):
+    cutoff = (datetime.now() - timedelta(days=int(untouched_days or 2))).isoformat(timespec="seconds")
+    return rows(
+        """
+        SELECT
+          po.*,
+          COALESCE(po.updated_at, po.created_at) AS last_touched_at,
+          p.customer AS project_customer,
+          p.name AS project_name,
+          p.project_code
+        FROM purchase_orders po
+        LEFT JOIN projects p ON p.id = po.project_id
+        WHERE COALESCE(po.status, 'Pending Approval') IN ('Pending Approval', 'Issued')
+          AND COALESCE(po.pickup_file, '') = ''
+          AND COALESCE(po.updated_at, po.created_at) <= ?
+        ORDER BY COALESCE(po.updated_at, po.created_at), po.created_at, po.po_number
+        """,
+        (cutoff,),
+    )
+
+
+def active_po_untouched_reminder_recipients():
+    return rows(
+        """
+        SELECT u.id, u.username, u.display_name
+        FROM po_untouched_reminder_recipients r
+        JOIN users u ON u.id = r.user_id
+        WHERE COALESCE(r.active, 1) = 1
+          AND u.active = 1
+        ORDER BY u.display_name, u.username
+        """
+    )
+
+
+def po_untouched_reminder_status():
+    settings = po_untouched_reminder_settings()
+    recipients = rows(
+        """
+        SELECT u.id, u.username, u.display_name, u.role, COALESCE(r.active, 0) AS selected
+        FROM users u
+        LEFT JOIN po_untouched_reminder_recipients r ON r.user_id = u.id AND COALESCE(r.active, 1) = 1
+        WHERE u.active = 1
+        ORDER BY u.display_name, u.username
+        """
+    )
+    logs = rows(
+        """
+        SELECT *
+        FROM po_untouched_reminder_log
+        ORDER BY sent_at DESC, id DESC
+        LIMIT 20
+        """
+    )
+    pos = untouched_purchase_orders(settings["untouched_days"])
+    return {
+        "smtp_configured": bool(SMTP_HOST and SMTP_FROM),
+        "settings": settings,
+        "schedule": settings["schedule_label"],
+        "recipients": recipients,
+        "logs": logs,
+        "purchase_orders": pos[:100],
+        "po_count": len(pos),
+    }
+
+
 def send_email(to_address, subject, body):
     if not SMTP_HOST or not SMTP_FROM:
         raise RuntimeError("Email is not configured. Set PM_TRACKER_SMTP_HOST and PM_TRACKER_SMTP_FROM on the server.")
@@ -3399,6 +3517,22 @@ def billing_invoice_reminder_already_attempted(reminder_date, recipient):
     )
 
 
+def po_untouched_reminder_already_attempted(reminder_date, recipient):
+    return bool(
+        one(
+            """
+            SELECT id
+            FROM po_untouched_reminder_log
+            WHERE reminder_date = ?
+              AND recipient = ?
+              AND status IN ('sent', 'failed')
+            LIMIT 1
+            """,
+            (reminder_date, recipient),
+        )
+    )
+
+
 def log_billing_invoice_reminder(reminder_date, recipient, subject, status, error="", job_count=0):
     execute(
         """
@@ -3406,6 +3540,16 @@ def log_billing_invoice_reminder(reminder_date, recipient, subject, status, erro
         VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         (reminder_date, recipient, subject, status, str(error or ""), int(job_count or 0), datetime.now().isoformat(timespec="seconds")),
+    )
+
+
+def log_po_untouched_reminder(reminder_date, recipient, subject, status, error="", po_count=0):
+    execute(
+        """
+        INSERT INTO po_untouched_reminder_log (reminder_date, recipient, subject, status, error, po_count, sent_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (reminder_date, recipient, subject, status, str(error or ""), int(po_count or 0), datetime.now().isoformat(timespec="seconds")),
     )
 
 
@@ -3438,6 +3582,48 @@ def run_texas_upload_reminder(force=False):
             log_texas_upload_reminder(reminder_date, email, subject, "failed", exc)
             result["failed"] += 1
     result["message"] = f"Sent {result['sent']}, failed {result['failed']}, skipped {result['skipped']}."
+    return result
+
+
+def run_po_untouched_reminder(force=False):
+    settings = po_untouched_reminder_settings()
+    reminder_date = datetime.now().date().isoformat()
+    pos = untouched_purchase_orders(settings["untouched_days"])
+    if not pos:
+        return {"sent": 0, "failed": 0, "skipped": 0, "po_count": 0, "message": "No untouched POs are currently past the alert window."}
+    recipients = active_po_untouched_reminder_recipients()
+    subject = f"Untouched POs need follow-up: {len(pos)}"
+    po_lines = []
+    for po in pos[:200]:
+        label = " / ".join(str(x or "").strip() for x in [po.get("po_number"), po.get("job_number"), po.get("job_label")] if str(x or "").strip())
+        po_lines.append(
+            f"- {label} | status: {po.get('status') or ''} | vendor: {po.get('vendor') or ''} | created by: {po.get('requested_by_username') or ''} | last touched: {po.get('last_touched_at') or po.get('created_at') or ''}"
+        )
+    body = (
+        f"PO follow-up reminder for {reminder_date}\n\n"
+        f"The following POs have not had a pickup ticket uploaded or been closed/voided after {settings['untouched_days']} day(s):\n\n"
+        + "\n".join(po_lines)
+        + "\n\nPlease review Office PO Review in the Company Dashboard."
+    )
+    result = {"sent": 0, "failed": 0, "skipped": 0, "po_count": len(pos), "message": ""}
+    for recipient in recipients:
+        email = str(recipient["username"] or "").strip()
+        if "@" not in email:
+            result["skipped"] += 1
+            if force:
+                log_po_untouched_reminder(reminder_date, email or f"user:{recipient['id']}", subject, "skipped", "Username is not an email address.", len(pos))
+            continue
+        if not force and po_untouched_reminder_already_attempted(reminder_date, email):
+            result["skipped"] += 1
+            continue
+        try:
+            send_email(email, subject, body)
+            log_po_untouched_reminder(reminder_date, email, subject, "sent", "", len(pos))
+            result["sent"] += 1
+        except Exception as exc:
+            log_po_untouched_reminder(reminder_date, email, subject, "failed", exc, len(pos))
+            result["failed"] += 1
+    result["message"] = f"Found {len(pos)} untouched PO(s). Sent {result['sent']}, failed {result['failed']}, skipped {result['skipped']}."
     return result
 
 
@@ -3498,6 +3684,12 @@ def texas_upload_reminder_scheduler():
             billing_due_time = now.hour > billing_hour or (now.hour == billing_hour and now.minute >= billing_minute)
             if int(billing_settings.get("enabled") or 0) and billing_due_day and billing_due_time:
                 run_billing_invoice_reminder(force=False)
+            po_settings = po_untouched_reminder_settings()
+            po_hour, po_minute = [int(x) for x in po_settings["reminder_time"].split(":", 1)]
+            po_due_day = now.weekday() == int(po_settings["weekday"])
+            po_due_time = now.hour > po_hour or (now.hour == po_hour and now.minute >= po_minute)
+            if int(po_settings.get("enabled") or 0) and po_due_day and po_due_time:
+                run_po_untouched_reminder(force=False)
         except Exception:
             traceback.print_exc()
         time.sleep(60)
@@ -4207,6 +4399,33 @@ def import_vendor_invoice_pdf(path, project_id):
                 current["description"] += " " + line
         if current and parse_money_text(current.get("amount")):
             item_lines.append(current)
+    elif "mccody" in lower or "fromthedirtup" in lower:
+        vendor = "McCody Concrete Products"
+        header = re.search(
+            r"DATE\s+INVOICE\s*#\s*\n(?:.*\n){0,3}?\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4})\s+([A-Za-z0-9\-]+)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        invoice_date = date_text(header.group(1).strip()) if header else first_regex([r"\b([0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4})\b"], text)
+        invoice_number = header.group(2).strip() if header else ""
+        if not invoice_number:
+            invoice_number = first_regex([r"Inv_([A-Za-z0-9\-]+)_from_MCCODY"], source_file, flags=re.IGNORECASE)
+        order_number = first_regex([r"JOB\s*/\s*PO\s*#:\s*([A-Za-z0-9\-]+)"], text, flags=re.IGNORECASE)
+        total_due = parse_money_text(first_regex([r"BALANCE\s+DUE\s+\$?([0-9,]+\.[0-9]{2})", r"TOTAL\s+\$?([0-9,]+\.[0-9]{2})"], text, flags=re.IGNORECASE))
+        item_lines = []
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            match = re.match(r"^(.+?)\s+([0-9]+(?:\.[0-9]+)?)\s+([A-Za-z]+)\s+(.+?)\s+([0-9,]+\.[0-9]{2})\s+([0-9,]+\.[0-9]{2})T?$", line)
+            if match and "SUBTOTAL" not in line.upper():
+                item_name, qty, unit, item_id, unit_price, extension = match.groups()
+                item_lines.append({
+                    "product_code": item_id.split()[0] if item_id.split() else item_name[:40],
+                    "description": item_name,
+                    "qty": qty,
+                    "unit_price": unit_price,
+                    "amount": extension,
+                })
+                break
     else:
         vendor = first_regex([r"^([A-Z][A-Za-z0-9 &.\-]+)\s*\n"], text, flags=re.MULTILINE) or "Vendor"
         invoice_number = first_regex([r"Invoice\s*(?:No\.?|#)\s*:?\s*([A-Za-z0-9\-]+)"], text)
@@ -4384,13 +4603,15 @@ LOGIN_HTML = r"""
   </style>
 </head>
 <body>
-  <form class="login" id="loginForm">
+  <form class="login" id="loginForm" method="post" action="/api/login" autocomplete="on">
     <div class="brand">
       <img src="/brand/twin-peaks-logo.png" alt="Twin Peaks Electrical">
       <div><h1>Company Dashboard</h1><div class="subtitle">Twin Peaks Electrical</div></div>
     </div>
-    <label>Username</label><input name="username" autocomplete="username" required autofocus>
-    <label>Password</label><input name="password" type="password" autocomplete="current-password" required>
+    <label for="username">Username</label>
+    <input id="username" name="username" type="text" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="next" required autofocus>
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" autocomplete="current-password" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="done" required>
     <button type="submit">Log In</button>
     <div class="error" id="loginError"></div>
   </form>
@@ -4613,6 +4834,8 @@ HTML = r"""
     body.read-only #sendTexasReminderNow,
     body.read-only #saveBillingReminder,
     body.read-only #sendBillingReminderNow,
+    body.read-only #savePoReminder,
+    body.read-only #sendPoReminderNow,
     body.read-only #importVendorInvoice { display: none !important; }
     body.read-only .home-card[data-open-tab="officePo"] { display: none !important; }
     body.read-only #vendorAllocationForm .actions { display: none !important; }
@@ -5022,6 +5245,34 @@ HTML = r"""
         <div id="billingReminderResult" class="muted"></div>
         <div id="billingReminderJobs" style="margin-top:10px"></div>
         <div id="billingReminderLog" style="margin-top:10px"></div>
+      </div>
+      <div class="panel" style="margin-top:14px">
+        <h2>Untouched PO Reminder</h2>
+        <p class="muted">Send a recurring list of POs that are still pending approval or issued, have no pickup ticket, and have not been updated inside the selected window.</p>
+        <div class="grid cols-4">
+          <label style="display:flex;align-items:center;gap:8px;margin-top:28px"><input id="poReminderEnabled" type="checkbox" style="width:auto"> Enabled</label>
+          <div><label>Day</label><select id="poReminderWeekday">
+            <option value="0">Monday</option>
+            <option value="1">Tuesday</option>
+            <option value="2">Wednesday</option>
+            <option value="3">Thursday</option>
+            <option value="4">Friday</option>
+            <option value="5">Saturday</option>
+            <option value="6">Sunday</option>
+          </select></div>
+          <div><label>Time</label><input id="poReminderTime" type="time" value="15:00"></div>
+          <div><label>Untouched Days</label><input id="poReminderUntouchedDays" type="number" min="1" max="30" value="2"></div>
+        </div>
+        <div id="poReminderStatus" class="muted" style="margin-top:10px"></div>
+        <h3>Recipients</h3>
+        <div id="poReminderRecipients" style="margin-top:10px"></div>
+        <div class="actions">
+          <button class="btn primary" id="savePoReminder" type="button">Save PO Reminder</button>
+          <button class="btn" id="sendPoReminderNow" type="button">Check / Send PO Reminder Now</button>
+        </div>
+        <div id="poReminderResult" class="muted"></div>
+        <div id="poReminderList" style="margin-top:10px"></div>
+        <div id="poReminderLog" style="margin-top:10px"></div>
       </div>
     </section>
 
@@ -6197,6 +6448,7 @@ HTML = r"""
       const data = await api('/api/texas-upload-reminders');
       renderTexasReminderSetup(data);
       await loadBillingReminderSetup();
+      await loadPoReminderSetup();
     }
 
     function renderBillingReminderSetup(data) {
@@ -6238,6 +6490,48 @@ HTML = r"""
     async function loadBillingReminderSetup() {
       const data = await api('/api/billing-invoice-reminders');
       renderBillingReminderSetup(data);
+    }
+
+    function renderPoReminderSetup(data) {
+      document.getElementById('poReminderEnabled').checked = Number(data.settings?.enabled || 0) === 1;
+      document.getElementById('poReminderWeekday').value = String(data.settings?.weekday ?? 4);
+      document.getElementById('poReminderTime').value = data.settings?.reminder_time || '15:00';
+      document.getElementById('poReminderUntouchedDays').value = data.settings?.untouched_days || 2;
+      const smtpText = data.smtp_configured ? '<span class="good">Email sending is configured.</span>' : '<span class="warn">Email sending is not configured on this server yet. Recipient selection can still be saved.</span>';
+      const enabledText = Number(data.settings?.enabled || 0) === 1 ? htmlEscape(data.schedule || 'Weekly reminder') : '<span class="warn">Reminder is disabled.</span>';
+      document.getElementById('poReminderStatus').innerHTML = `${smtpText}<br>${enabledText}<br><strong>${Number(data.po_count || 0)}</strong> PO(s) currently untouched for ${Number(data.settings?.untouched_days || 2)} day(s).`;
+      const recipients = data.recipients || [];
+      document.getElementById('poReminderRecipients').innerHTML = recipients.length ? `<div class="grid cols-2">${recipients.map(user => {
+        const isEmail = String(user.username || '').includes('@');
+        const label = `${user.display_name || user.username}${user.display_name ? ' / ' + user.username : ''}`;
+        return `<label style="display:flex;align-items:flex-start;gap:8px;border:1px solid var(--line);border-radius:6px;padding:9px;background:white">
+          <input type="checkbox" style="width:auto;margin-top:3px" data-po-reminder-user="${user.id}" ${Number(user.selected || 0) ? 'checked' : ''}>
+          <span><strong>${htmlEscape(label)}</strong>${isEmail ? '' : '<div class="muted">Username is not an email address, so email cannot be sent to this user.</div>'}</span>
+        </label>`;
+      }).join('')}</div>` : '<div class="muted">No active users found.</div>';
+      const pos = data.purchase_orders || [];
+      document.getElementById('poReminderList').innerHTML = pos.length ? `<h3>Current Untouched POs</h3><table><thead><tr><th>PO</th><th>Status</th><th>Vendor</th><th>Job / Order / COG</th><th>Created By</th><th>Last Touched</th></tr></thead><tbody>${pos.slice(0, 25).map(po => `<tr>
+        <td><strong>${htmlEscape(po.po_number || '')}</strong></td>
+        <td>${htmlEscape(po.status || '')}</td>
+        <td>${htmlEscape(po.vendor || '')}</td>
+        <td>${htmlEscape(po.job_number || '')}<div class="muted">${htmlEscape(po.job_label || '')}</div></td>
+        <td>${htmlEscape(po.requested_by_username || '')}</td>
+        <td>${htmlEscape(po.last_touched_at || po.created_at || '')}</td>
+      </tr>`).join('')}</tbody></table>${pos.length > 25 ? `<div class="muted">Showing 25 of ${pos.length} POs.</div>` : ''}` : '<div class="good">No untouched POs are past the alert window.</div>';
+      const logs = data.logs || [];
+      document.getElementById('poReminderLog').innerHTML = logs.length ? `<h3>Recent PO Reminder Activity</h3><table><thead><tr><th>Date</th><th>Recipient</th><th>Status</th><th>POs</th><th>Time</th><th>Note</th></tr></thead><tbody>${logs.map(log => `<tr>
+        <td>${htmlEscape(log.reminder_date || '')}</td>
+        <td>${htmlEscape(log.recipient || '')}</td>
+        <td class="${log.status === 'sent' ? 'good' : log.status === 'failed' ? 'bad' : 'warn'}">${htmlEscape(log.status || '')}</td>
+        <td>${Number(log.po_count || 0)}</td>
+        <td>${htmlEscape(log.sent_at || '')}</td>
+        <td>${htmlEscape(log.error || '')}</td>
+      </tr>`).join('')}</tbody></table>` : '<div class="muted">No PO reminder activity yet.</div>';
+    }
+
+    async function loadPoReminderSetup() {
+      const data = await api('/api/po-untouched-reminders');
+      renderPoReminderSetup(data);
     }
 
     async function loadTexasOpsDashboard() {
@@ -6359,6 +6653,29 @@ HTML = r"""
       const result = await api('/api/billing-invoice-reminders/send-now', { method:'POST', body: JSON.stringify({}) });
       resultEl.textContent = result.message || `Found ${result.job_count || 0} job(s). Sent ${result.sent || 0}, failed ${result.failed || 0}, skipped ${result.skipped || 0}.`;
       await loadBillingReminderSetup();
+    };
+    document.getElementById('savePoReminder').onclick = async () => {
+      const userIds = [...document.querySelectorAll('[data-po-reminder-user]:checked')].map(el => Number(el.dataset.poReminderUser));
+      await api('/api/po-untouched-reminders', {
+        method:'POST',
+        body: JSON.stringify({
+          user_ids: userIds,
+          enabled: document.getElementById('poReminderEnabled').checked ? 1 : 0,
+          weekday: document.getElementById('poReminderWeekday').value,
+          reminder_time: document.getElementById('poReminderTime').value,
+          untouched_days: document.getElementById('poReminderUntouchedDays').value
+        })
+      });
+      document.getElementById('poReminderResult').textContent = 'PO reminder saved.';
+      markSaved();
+      await loadPoReminderSetup();
+    };
+    document.getElementById('sendPoReminderNow').onclick = async () => {
+      const resultEl = document.getElementById('poReminderResult');
+      resultEl.textContent = 'Checking untouched POs...';
+      const result = await api('/api/po-untouched-reminders/send-now', { method:'POST', body: JSON.stringify({}) });
+      resultEl.textContent = result.message || `Found ${result.po_count || 0} PO(s). Sent ${result.sent || 0}, failed ${result.failed || 0}, skipped ${result.skipped || 0}.`;
+      await loadPoReminderSetup();
     };
 
     async function loadProjects() {
@@ -9358,6 +9675,10 @@ class Handler(BaseHTTPRequestHandler):
                 if not require_editor(self):
                     return json_response(self, {"error": "Admin or standard user access required."}, 403)
                 return json_response(self, billing_invoice_reminder_status())
+            if parsed.path == "/api/po-untouched-reminders":
+                if not require_editor(self):
+                    return json_response(self, {"error": "Admin or standard user access required."}, 403)
+                return json_response(self, po_untouched_reminder_status())
             if parsed.path == "/api/bids":
                 return json_response(self, rows("SELECT * FROM bid_requests ORDER BY bid_due_date, rfq_no"))
             if parsed.path == "/api/rate-sets":
@@ -9822,6 +10143,56 @@ class Handler(BaseHTTPRequestHandler):
                 result = run_billing_invoice_reminder(force=True)
                 log_activity(actor, "ran reminder check", "Customer Billing", "Missing customer invoice reminder", result)
                 result["status"] = billing_invoice_reminder_status()
+                return json_response(self, result)
+            if parsed.path == "/api/po-untouched-reminders":
+                actor = current_user(self)
+                data = parse_json(self)
+                selected_ids = {int(x) for x in data.get("user_ids", []) if str(x).isdigit()}
+                enabled = 1 if str(data.get("enabled", "1")).lower() not in ("0", "false", "no") else 0
+                try:
+                    weekday = max(0, min(6, int(data.get("weekday", 4))))
+                except Exception:
+                    weekday = 4
+                reminder_time = str(data.get("reminder_time") or "15:00").strip()
+                if not re.match(r"^\d{2}:\d{2}$", reminder_time):
+                    reminder_time = "15:00"
+                try:
+                    untouched_days = max(1, min(30, int(data.get("untouched_days", 2))))
+                except Exception:
+                    untouched_days = 2
+                now = datetime.now().isoformat(timespec="seconds")
+                with db() as con:
+                    con.execute(
+                        """
+                        INSERT INTO po_untouched_reminder_settings (id, enabled, weekday, reminder_time, untouched_days, updated_at)
+                        VALUES (1, ?, ?, ?, ?, ?)
+                        ON CONFLICT(id) DO UPDATE SET
+                          enabled = excluded.enabled,
+                          weekday = excluded.weekday,
+                          reminder_time = excluded.reminder_time,
+                          untouched_days = excluded.untouched_days,
+                          updated_at = excluded.updated_at
+                        """,
+                        (enabled, weekday, reminder_time, untouched_days, now),
+                    )
+                    con.execute("UPDATE po_untouched_reminder_recipients SET active = 0")
+                    for user_id in selected_ids:
+                        con.execute(
+                            """
+                            INSERT INTO po_untouched_reminder_recipients (user_id, active, created_at)
+                            VALUES (?, 1, ?)
+                            ON CONFLICT(user_id) DO UPDATE SET active = 1
+                            """,
+                            (user_id, now),
+                        )
+                log_activity(actor, "updated reminder setup", "Purchase Orders", "Untouched PO reminder", {"enabled": enabled, "weekday": weekday, "reminder_time": reminder_time, "untouched_days": untouched_days, "recipient_count": len(selected_ids)})
+                return json_response(self, po_untouched_reminder_status())
+            if parsed.path == "/api/po-untouched-reminders/send-now":
+                actor = current_user(self)
+                parse_json(self)
+                result = run_po_untouched_reminder(force=True)
+                log_activity(actor, "ran reminder check", "Purchase Orders", "Untouched PO reminder", result)
+                result["status"] = po_untouched_reminder_status()
                 return json_response(self, result)
             if parsed.path == "/api/fieldwise-audit-omissions":
                 user = current_user(self)
