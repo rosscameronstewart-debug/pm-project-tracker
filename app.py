@@ -5904,6 +5904,27 @@ HTML = r"""
       </form>
     </div>
   </div>
+  <div class="modal-backdrop hidden" id="customerAllocationModal">
+    <div class="modal large">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px">
+        <div>
+          <h2 style="margin:0">Edit Customer Invoice Allocation</h2>
+          <p id="customerAllocationSubtitle" class="muted"></p>
+        </div>
+        <button class="btn" id="closeCustomerAllocationModal" type="button">Close</button>
+      </div>
+      <form id="customerAllocationForm">
+        <div id="customerAllocationTargets"></div>
+        <div class="muted" id="customerAllocationTotal"></div>
+        <div class="error" id="customerAllocationError"></div>
+        <div class="actions">
+          <button class="btn" id="addCustomerAllocationEditLine" type="button">Add Line</button>
+          <button class="btn" id="splitCustomerAllocationEditEvenly" type="button">Split Evenly</button>
+          <button class="btn primary" type="submit">Save Allocation</button>
+        </div>
+      </form>
+    </div>
+  </div>
 
   <script>
     const PO_FEATURE_ENABLED = true;
@@ -5917,6 +5938,7 @@ HTML = r"""
     let invoiceGroupSeq = 0;
     let costFilterSeq = 0;
     let vendorAllocationGroups = {};
+    let editingCustomerInvoice = null;
     let jobOrderReportRows = [];
     let jobOrderSort = { field: 'job_number', direction: 'asc' };
     let fieldPoJobChoices = [];
@@ -6336,6 +6358,55 @@ HTML = r"""
       await refresh();
       await loadVendorInvoiceLines();
       await loadVendorAllocationHistory();
+    };
+    document.getElementById('closeCustomerAllocationModal').onclick = closeCustomerAllocationModal;
+    document.getElementById('addCustomerAllocationEditLine').onclick = () => addCustomerAllocationEditLine();
+    document.getElementById('splitCustomerAllocationEditEvenly').onclick = () => {
+      if (!editingCustomerInvoice) return;
+      const rows = [...document.querySelectorAll('[data-customer-allocation-edit-row]')];
+      const amount = Number(editingCustomerInvoice.amount || 0);
+      if (!rows.length || !amount) {
+        updateCustomerAllocationEditTotal();
+        return;
+      }
+      const share = Math.floor((amount / rows.length) * 100) / 100;
+      let allocated = 0;
+      rows.forEach((row, idx) => {
+        const input = row.querySelector('[data-edit-allocation-field="amount"]');
+        const value = idx === rows.length - 1 ? Number((amount - allocated).toFixed(2)) : share;
+        allocated += value;
+        if (input) input.value = value.toFixed(2);
+      });
+      updateCustomerAllocationEditTotal();
+    };
+    document.getElementById('customerAllocationForm').onsubmit = async event => {
+      event.preventDefault();
+      if (!editingCustomerInvoice) return;
+      const error = document.getElementById('customerAllocationError');
+      error.textContent = '';
+      const allocations = collectCustomerAllocationEditRows();
+      const total = allocations.reduce((sum, row) => sum + Number(row.amount || 0), 0);
+      const invoiceAmount = Number(editingCustomerInvoice.amount || 0);
+      if (!allocations.length) {
+        error.textContent = 'Add at least one allocation line.';
+        return;
+      }
+      if (duplicateAllocationTargets(allocations).size) {
+        error.textContent = 'Each job/order can only appear once on this invoice allocation.';
+        return;
+      }
+      if (Math.abs(total - invoiceAmount) >= 0.01) {
+        error.textContent = `Allocation total must equal ${money(invoiceAmount)}.`;
+        return;
+      }
+      await api(`/api/customer-invoice-allocations/${editingCustomerInvoice.id}`, {
+        method: 'PUT',
+        body: JSON.stringify({ allocations })
+      });
+      closeCustomerAllocationModal();
+      markSaved();
+      await refresh();
+      openTab('billing');
     };
 
     function metricAmount(summary, key) {
@@ -9102,7 +9173,10 @@ HTML = r"""
             <td><input data-cinv="${i.id}" data-field="paid_amount" type="number" step="0.01" value="${Number(i.paid_amount || 0).toFixed(2)}"></td>
             <td>${money(openAmount)}</td>
             <td><input data-cinv="${i.id}" data-field="notes" value="${htmlEscape(i.notes || '')}"></td>
-            <td><button class="btn" data-save-customer-invoice="${i.id}" type="button">Save</button></td>
+            <td>
+              <button class="btn" data-edit-customer-allocation="${i.id}" type="button">Edit Allocation</button>
+              <button class="btn" data-save-customer-invoice="${i.id}" type="button">Save</button>
+            </td>
           </tr>`;
         }).join('')}</tbody>`;
       invoices.forEach(i => {
@@ -9118,6 +9192,12 @@ HTML = r"""
         await api(`/api/customer-invoices/${id}`, { method:'PUT', body: JSON.stringify(fields) });
         markSaved();
         await refresh();
+      });
+      tableEl.querySelectorAll('[data-edit-customer-allocation]').forEach(btn => {
+        btn.onclick = () => {
+          const invoice = invoices.find(i => String(i.id) === String(btn.dataset.editCustomerAllocation));
+          if (invoice) openCustomerAllocationModal(invoice);
+        };
       });
     }
 
@@ -9267,6 +9347,89 @@ HTML = r"""
         const notes = row.querySelector('[data-allocation-field="notes"]')?.value || '';
         return { target_key: targetKey, amount, notes };
       }).filter(row => row.target_key && Math.abs(row.amount) >= 0.01);
+    }
+
+    function targetKeyForCustomerAllocation(allocation) {
+      if (allocation.change_order_id) return `co:${allocation.change_order_id}`;
+      if (allocation.subproject_id) return `sp:${allocation.subproject_id}`;
+      return '';
+    }
+
+    function addCustomerAllocationEditLine(values = {}) {
+      const target = document.getElementById('customerAllocationTargets');
+      if (!target) return;
+      const row = document.createElement('div');
+      row.className = 'grid cols-4 customer-allocation-edit-row';
+      row.dataset.customerAllocationEditRow = '1';
+      row.style.marginTop = '8px';
+      row.innerHTML = `
+        <div style="grid-column:span 2"><label>Job / Order</label><select data-edit-allocation-field="target_key">${customerInvoiceTargetOptions(values.target_key || '')}</select></div>
+        <div><label>Amount</label><input data-edit-allocation-field="amount" type="number" step="0.01" value="${Number(values.amount || 0).toFixed(2)}"></div>
+        <div><label>Note</label><input data-edit-allocation-field="notes" value="${htmlEscape(values.notes || '')}" placeholder="Optional"></div>
+        <div class="actions" style="grid-column:1 / -1"><button class="btn danger" data-remove-edit-allocation-line type="button">Remove Line</button></div>`;
+      row.querySelector('[data-remove-edit-allocation-line]').onclick = () => {
+        row.remove();
+        updateCustomerAllocationEditTotal();
+      };
+      row.querySelectorAll('input, select').forEach(el => {
+        el.oninput = updateCustomerAllocationEditTotal;
+        el.onchange = updateCustomerAllocationEditTotal;
+      });
+      target.appendChild(row);
+      updateCustomerAllocationEditTotal();
+    }
+
+    function collectCustomerAllocationEditRows() {
+      return [...document.querySelectorAll('[data-customer-allocation-edit-row]')].map(row => {
+        const targetKey = row.querySelector('[data-edit-allocation-field="target_key"]')?.value || '';
+        const amount = Number(row.querySelector('[data-edit-allocation-field="amount"]')?.value || 0);
+        const notes = row.querySelector('[data-edit-allocation-field="notes"]')?.value || '';
+        return { target_key: targetKey, amount, notes };
+      }).filter(row => row.target_key && Math.abs(row.amount) >= 0.01);
+    }
+
+    function duplicateAllocationTargets(rows) {
+      const seen = new Set();
+      const duplicates = new Set();
+      rows.forEach(row => {
+        if (seen.has(row.target_key)) duplicates.add(row.target_key);
+        seen.add(row.target_key);
+      });
+      return duplicates;
+    }
+
+    function updateCustomerAllocationEditTotal() {
+      const totalEl = document.getElementById('customerAllocationTotal');
+      if (!totalEl || !editingCustomerInvoice) return;
+      const rows = collectCustomerAllocationEditRows();
+      const total = rows.reduce((sum, row) => sum + Number(row.amount || 0), 0);
+      const invoiceAmount = Number(editingCustomerInvoice.amount || 0);
+      const diff = total - invoiceAmount;
+      const duplicates = duplicateAllocationTargets(rows);
+      totalEl.innerHTML = `Allocated ${money(total)} of ${money(invoiceAmount)}${Math.abs(diff) >= 0.01 ? ` <span class="${diff > 0 ? 'bad' : 'warn'}">(${money(Math.abs(diff))} ${diff > 0 ? 'over' : 'remaining'})</span>` : ' <span class="good">(balanced)</span>'}${duplicates.size ? ' <span class="bad">Duplicate job/order selected</span>' : ''}`;
+    }
+
+    function openCustomerAllocationModal(invoice) {
+      editingCustomerInvoice = invoice;
+      const modal = document.getElementById('customerAllocationModal');
+      const target = document.getElementById('customerAllocationTargets');
+      const error = document.getElementById('customerAllocationError');
+      document.getElementById('customerAllocationSubtitle').textContent = `Invoice ${invoice.invoice_number || invoice.id} / total ${money(invoice.amount)}`;
+      target.innerHTML = '';
+      error.textContent = '';
+      const allocations = invoice.allocations && invoice.allocations.length ? invoice.allocations : [{ target_key: targetKeyForCustomerAllocation(invoice), amount: invoice.amount, notes: '' }];
+      allocations.forEach(allocation => addCustomerAllocationEditLine({
+        target_key: allocation.target_key || targetKeyForCustomerAllocation(allocation),
+        amount: allocation.amount,
+        notes: allocation.notes || ''
+      }));
+      modal.classList.remove('hidden');
+      updateCustomerAllocationEditTotal();
+    }
+
+    function closeCustomerAllocationModal() {
+      document.getElementById('customerAllocationModal').classList.add('hidden');
+      editingCustomerInvoice = null;
     }
 
     async function loadUsers() {
@@ -10739,6 +10902,12 @@ class Handler(BaseHTTPRequestHandler):
                 if not allocation_payload:
                     target_key = f"co:{form.getvalue('change_order_id')}" if form.getvalue("change_order_id") else f"sp:{form.getvalue('subproject_id')}" if form.getvalue("subproject_id") else ""
                     allocation_payload = [{"target_key": target_key, "amount": invoice_amount, "notes": ""}]
+                target_keys = [str(item.get("target_key") or "") for item in allocation_payload]
+                valid_target_keys = [key for key in target_keys if key.startswith(("sp:", "co:"))]
+                if len(valid_target_keys) != len(target_keys):
+                    return json_response(self, {"error": "Each allocation line needs a valid job/order target."}, 400)
+                if len(set(valid_target_keys)) != len(valid_target_keys):
+                    return json_response(self, {"error": "Each job/order can only appear once on this invoice allocation."}, 400)
                 allocation_total = sum(money(item.get("amount")) for item in allocation_payload)
                 if not allocation_payload or abs(allocation_total - invoice_amount) >= 0.01:
                     return json_response(self, {"error": "Allocation total must match the invoice amount."}, 400)
@@ -11729,6 +11898,69 @@ class Handler(BaseHTTPRequestHandler):
                                 ),
                             )
                 return json_response(self, {"ok": True})
+            if parsed.path.startswith("/api/customer-invoice-allocations/"):
+                invoice_id = parsed.path.rsplit("/", 1)[-1]
+                actor = current_user(self)
+                allocations = data.get("allocations") or []
+                if not isinstance(allocations, list) or not allocations:
+                    return json_response(self, {"error": "Add at least one allocation line."}, 400)
+                target_keys = [str(item.get("target_key") or "") for item in allocations]
+                valid_target_keys = [key for key in target_keys if key.startswith(("sp:", "co:"))]
+                if len(valid_target_keys) != len(target_keys):
+                    return json_response(self, {"error": "Each allocation line needs a valid job/order target."}, 400)
+                if len(set(valid_target_keys)) != len(valid_target_keys):
+                    return json_response(self, {"error": "Each job/order can only appear once on this invoice allocation."}, 400)
+                with db() as con:
+                    invoice = con.execute("SELECT * FROM customer_invoices WHERE id = ?", (invoice_id,)).fetchone()
+                    if not invoice:
+                        return json_response(self, {"error": "Customer invoice not found."}, 404)
+                    invoice_amount = money(invoice["amount"])
+                    allocation_total = sum(money(item.get("amount")) for item in allocations)
+                    if abs(allocation_total - invoice_amount) >= 0.01:
+                        return json_response(self, {"error": "Allocation total must match the invoice amount."}, 400)
+                    target_rows = []
+                    for item in allocations:
+                        target_type, target_id = str(item.get("target_key")).split(":", 1)
+                        if target_type == "sp":
+                            sp = con.execute("SELECT id FROM subprojects WHERE id = ? AND project_id = ?", (target_id, invoice["project_id"])).fetchone()
+                            if not sp:
+                                return json_response(self, {"error": "One allocation target is not part of this master project."}, 400)
+                            target_rows.append({"subproject_id": sp["id"], "change_order_id": None, "amount": money(item.get("amount")), "notes": str(item.get("notes") or "").strip()})
+                        elif target_type == "co":
+                            co = con.execute("SELECT id, subproject_id FROM change_orders WHERE id = ? AND project_id = ?", (target_id, invoice["project_id"])).fetchone()
+                            if not co:
+                                return json_response(self, {"error": "One allocation target is not part of this master project."}, 400)
+                            target_rows.append({"subproject_id": co["subproject_id"], "change_order_id": co["id"], "amount": money(item.get("amount")), "notes": str(item.get("notes") or "").strip()})
+                    now = datetime.now().isoformat(timespec="seconds")
+                    primary = target_rows[0]
+                    con.execute("DELETE FROM customer_invoice_allocations WHERE customer_invoice_id = ?", (invoice_id,))
+                    for target in target_rows:
+                        con.execute(
+                            """
+                            INSERT INTO customer_invoice_allocations (
+                              customer_invoice_id, project_id, subproject_id, change_order_id, amount,
+                              notes, created_by_user_id, created_by_username, created_at
+                            )
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                invoice_id,
+                                invoice["project_id"],
+                                target["subproject_id"],
+                                target["change_order_id"],
+                                target["amount"],
+                                target["notes"],
+                                actor["id"] if actor else None,
+                                actor["username"] if actor else "",
+                                now,
+                            ),
+                        )
+                    con.execute(
+                        "UPDATE customer_invoices SET subproject_id = ?, change_order_id = ? WHERE id = ?",
+                        (primary["subproject_id"], primary["change_order_id"], invoice_id),
+                    )
+                log_activity(actor, "updated customer invoice allocation", "Customer Billing", invoice_id, {"allocation_count": len(target_rows), "invoice_amount": invoice_amount})
+                return json_response(self, {"ok": True, "allocation_count": len(target_rows)})
             if parsed.path.startswith("/api/internal-rates/"):
                 rate_id = parsed.path.rsplit("/", 1)[-1]
                 execute(
