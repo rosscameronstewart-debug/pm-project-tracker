@@ -316,36 +316,18 @@ def pwa_manifest_json():
 
 def service_worker_js():
     return """
-const CACHE_NAME = 'tpe-po-enabled-v3';
-const SHELL_ASSETS = [
-  '/offline',
-  '/brand/twin-peaks-logo.png'
-];
-
 self.addEventListener('install', event => {
-  event.waitUntil(caches.open(CACHE_NAME).then(cache => cache.addAll(SHELL_ASSETS)));
   self.skipWaiting();
 });
 
 self.addEventListener('activate', event => {
   event.waitUntil(
-    caches.keys().then(keys => Promise.all(keys.filter(key => key !== CACHE_NAME).map(key => caches.delete(key))))
+    caches.keys()
+      .then(keys => Promise.all(keys.map(key => caches.delete(key))))
+      .then(() => self.registration.unregister())
+      .then(() => self.clients.matchAll({ type: 'window' }))
+      .then(clients => Promise.all(clients.map(client => client.navigate(client.url))))
   );
-  self.clients.claim();
-});
-
-self.addEventListener('fetch', event => {
-  const request = event.request;
-  const url = new URL(request.url);
-  if (request.method !== 'GET') return;
-  if (url.pathname.startsWith('/api/')) return;
-  if (request.mode === 'navigate') {
-    event.respondWith(fetch(request).catch(() => caches.match('/offline')));
-    return;
-  }
-  if (url.pathname.startsWith('/brand/')) {
-    event.respondWith(caches.match(request).then(cached => cached || fetch(request)));
-  }
 });
 """.strip()
 
@@ -557,6 +539,19 @@ def init_db():
               created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS customer_invoice_allocations (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              customer_invoice_id INTEGER NOT NULL REFERENCES customer_invoices(id) ON DELETE CASCADE,
+              project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+              subproject_id INTEGER REFERENCES subprojects(id) ON DELETE SET NULL,
+              change_order_id INTEGER REFERENCES change_orders(id) ON DELETE SET NULL,
+              amount REAL DEFAULT 0,
+              notes TEXT,
+              created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+              created_by_username TEXT,
+              created_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS project_invoice_alert_acknowledgements (
               project_id INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
               acknowledged_at TEXT NOT NULL,
@@ -688,6 +683,17 @@ def init_db():
               label TEXT NOT NULL,
               amount REAL DEFAULT 0,
               UNIQUE(report_id, metric_key)
+            );
+
+            CREATE TABLE IF NOT EXISTS texas_ap_snapshots (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              report_date TEXT NOT NULL UNIQUE,
+              ap_total REAL DEFAULT 0,
+              notes TEXT,
+              created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+              created_by_username TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT
             );
 
             CREATE TABLE IF NOT EXISTS texas_upload_reminder_recipients (
@@ -906,6 +912,30 @@ def init_db():
         customer_invoice_cols = [r["name"] for r in con.execute("PRAGMA table_info(customer_invoices)").fetchall()]
         if "invoice_file" not in customer_invoice_cols:
             con.execute("ALTER TABLE customer_invoices ADD COLUMN invoice_file TEXT")
+        con.execute(
+            """
+            INSERT INTO customer_invoice_allocations (
+              customer_invoice_id, project_id, subproject_id, change_order_id, amount,
+              notes, created_by_user_id, created_by_username, created_at
+            )
+            SELECT
+              ci.id,
+              ci.project_id,
+              ci.subproject_id,
+              ci.change_order_id,
+              COALESCE(ci.amount, 0),
+              'Original invoice allocation',
+              NULL,
+              NULL,
+              ci.created_at
+            FROM customer_invoices ci
+            WHERE NOT EXISTS (
+              SELECT 1
+              FROM customer_invoice_allocations cia
+              WHERE cia.customer_invoice_id = ci.id
+            )
+            """
+        )
         cost_cols = [r["name"] for r in con.execute("PRAGMA table_info(cost_records)").fetchall()]
         if "sales_rate" not in cost_cols:
             con.execute("ALTER TABLE cost_records ADD COLUMN sales_rate REAL DEFAULT 0")
@@ -2366,13 +2396,52 @@ def project_summary(project_id):
     )
     customer_invoices = rows(
         """
-        SELECT *
-        FROM customer_invoices
-        WHERE project_id = ?
+        SELECT ci.*, COALESCE(SUM(cia.amount), ci.amount, 0) AS allocated_amount
+        FROM customer_invoices ci
+        LEFT JOIN customer_invoice_allocations cia ON cia.customer_invoice_id = ci.id
+        WHERE ci.project_id = ?
+        GROUP BY ci.id
         ORDER BY invoice_date DESC, id DESC
         """,
         (project_id,),
     )
+    customer_invoice_allocations = rows(
+        """
+        SELECT
+          cia.*,
+          sp.job_number,
+          sp.code AS subproject_code,
+          sp.name AS subproject_name,
+          co.co_number,
+          co.job_number AS co_job_number,
+          co.title AS co_title,
+          COALESCE(co.order_type, 'Change Order') AS order_type
+        FROM customer_invoice_allocations cia
+        LEFT JOIN subprojects sp ON sp.id = cia.subproject_id
+        LEFT JOIN change_orders co ON co.id = cia.change_order_id
+        WHERE cia.project_id = ?
+        ORDER BY cia.id
+        """,
+        (project_id,),
+    )
+    invoices_by_id = {invoice["id"]: invoice for invoice in customer_invoices}
+    for invoice in customer_invoices:
+        invoice["allocations"] = []
+    for allocation in customer_invoice_allocations:
+        if allocation.get("change_order_id"):
+            pieces = [allocation.get("co_number"), allocation.get("co_job_number")]
+            label = " / ".join(str(x) for x in pieces if x) or allocation.get("order_type") or "Change Order"
+            if allocation.get("co_title"):
+                label = f"{label} - {allocation.get('co_title')}"
+        else:
+            pieces = [allocation.get("job_number"), allocation.get("subproject_code")]
+            label = " ".join(str(x) for x in pieces if x) or "Unassigned"
+            if allocation.get("subproject_name"):
+                label = f"{label} - {allocation.get('subproject_name')}"
+        allocation["target_label"] = label
+        invoice = invoices_by_id.get(allocation.get("customer_invoice_id"))
+        if invoice is not None:
+            invoice["allocations"].append(allocation)
     billed_amount = money(billing["billed_amount"])
     paid_amount = money(billing["paid_amount"])
     open_amount = money(billing["open_amount"])
@@ -2653,11 +2722,12 @@ def jobs_missing_recent_customer_invoice_attention(days=5):
           FROM subprojects sp
           JOIN projects p ON p.id = sp.project_id
           LEFT JOIN (
-            SELECT subproject_id, MAX(created_at) AS last_invoice_added_at, MAX(invoice_date) AS last_invoice_date
-            FROM customer_invoices
-            WHERE COALESCE(status, '') <> 'Void'
-              AND change_order_id IS NULL
-            GROUP BY subproject_id
+            SELECT cia.subproject_id, MAX(ci.created_at) AS last_invoice_added_at, MAX(ci.invoice_date) AS last_invoice_date
+            FROM customer_invoice_allocations cia
+            JOIN customer_invoices ci ON ci.id = cia.customer_invoice_id
+            WHERE COALESCE(ci.status, '') <> 'Void'
+              AND cia.change_order_id IS NULL
+            GROUP BY cia.subproject_id
           ) ci ON ci.subproject_id = sp.id
           LEFT JOIN job_invoice_alert_acknowledgements ack ON ack.target_type = 'subproject' AND ack.target_id = sp.id
           WHERE COALESCE(p.status, 'Active') <> 'Archived'
@@ -2696,10 +2766,11 @@ def jobs_missing_recent_customer_invoice_attention(days=5):
           FROM change_orders co
           JOIN projects p ON p.id = co.project_id
           LEFT JOIN (
-            SELECT change_order_id, MAX(created_at) AS last_invoice_added_at, MAX(invoice_date) AS last_invoice_date
-            FROM customer_invoices
-            WHERE COALESCE(status, '') <> 'Void'
-            GROUP BY change_order_id
+            SELECT cia.change_order_id, MAX(ci.created_at) AS last_invoice_added_at, MAX(ci.invoice_date) AS last_invoice_date
+            FROM customer_invoice_allocations cia
+            JOIN customer_invoices ci ON ci.id = cia.customer_invoice_id
+            WHERE COALESCE(ci.status, '') <> 'Void'
+            GROUP BY cia.change_order_id
           ) ci ON ci.change_order_id = co.id
           LEFT JOIN job_invoice_alert_acknowledgements ack ON ack.target_type = 'change_order' AND ack.target_id = co.id
           WHERE COALESCE(p.status, 'Active') <> 'Archived'
@@ -2790,9 +2861,9 @@ def home_alerts():
     alerts = [
         {
             "key": "uncoded_fieldwise",
-            "label": "Uncoded Field Wise Tickets",
+            "label": "Field Wise Review / Coding",
             "count": int(uncoded["ticket_count"] or 0),
-            "detail": f"{int(uncoded['line_count'] or 0)} line(s) need coding",
+            "detail": f"{int(uncoded['line_count'] or 0)} line(s) need review, coding, or rate setup",
             "amount": money(uncoded["total_amount"] if uncoded else 0),
             "severity": "warn" if uncoded and uncoded["ticket_count"] else "ok",
             "tab": "review",
@@ -3081,6 +3152,7 @@ def import_financial_report(path, report_date, report_type):
 
 def texas_financial_summary():
     reports = rows("SELECT * FROM financial_reports ORDER BY report_date DESC, id DESC")
+    ap_snapshots = rows("SELECT * FROM texas_ap_snapshots ORDER BY report_date DESC, id DESC")
     metrics = rows(
         """
         SELECT fr.report_date, fr.report_type, fr.source_file, fm.metric_key, fm.label, fm.amount
@@ -3105,15 +3177,46 @@ def texas_financial_summary():
         "amount": current_assets / current_liabilities if same_current_date and current_liabilities else 0,
         "report_date": latest.get("current_assets", {}).get("report_date") if same_current_date else "",
     }
+    latest_ap = ap_snapshots[0] if ap_snapshots else None
+    manual_ap_total = money(latest_ap["ap_total"] if latest_ap else 0)
+    future_current_liabilities = current_liabilities + manual_ap_total
+    latest["manual_accounts_payable"] = {
+        "label": "Provided AP",
+        "amount": manual_ap_total,
+        "report_date": latest_ap["report_date"] if latest_ap else "",
+    }
+    latest["future_current_liabilities"] = {
+        "label": "Future Current Liabilities",
+        "amount": future_current_liabilities,
+        "report_date": latest_ap["report_date"] if latest_ap else latest.get("current_liabilities", {}).get("report_date", ""),
+    }
+    latest["future_working_capital"] = {
+        "label": "Future Working Capital",
+        "amount": current_assets - future_current_liabilities if current_assets or future_current_liabilities else 0,
+        "report_date": latest_ap["report_date"] if latest_ap else latest.get("current_assets", {}).get("report_date", ""),
+    }
+    latest["future_current_ratio"] = {
+        "label": "Future Current Ratio",
+        "amount": current_assets / future_current_liabilities if current_assets and future_current_liabilities else 0,
+        "report_date": latest_ap["report_date"] if latest_ap else latest.get("current_assets", {}).get("report_date", ""),
+    }
     history = {}
     for metric in metrics:
         history.setdefault(metric["metric_key"], []).append({"report_date": metric["report_date"], "amount": metric["amount"]})
+    if ap_snapshots:
+        history["manual_accounts_payable"] = [{"report_date": ap["report_date"], "amount": money(ap["ap_total"])} for ap in sorted(ap_snapshots, key=lambda p: p["report_date"])]
     by_date = {}
     for metric in metrics:
         bucket = by_date.setdefault(metric["report_date"], {})
         bucket[metric["metric_key"]] = money(metric["amount"])
+    for ap in ap_snapshots:
+        bucket = by_date.setdefault(ap["report_date"], {})
+        bucket["manual_accounts_payable"] = money(ap["ap_total"])
     working_capital_history = []
     current_ratio_history = []
+    future_current_liabilities_history = []
+    future_working_capital_history = []
+    future_current_ratio_history = []
     for report_date, metric_set in by_date.items():
         if "current_assets" in metric_set and "current_liabilities" in metric_set:
             current_assets_for_date = metric_set["current_assets"]
@@ -3121,10 +3224,22 @@ def texas_financial_summary():
             working_capital_history.append({"report_date": report_date, "amount": current_assets_for_date - current_liabilities_for_date})
             if current_liabilities_for_date:
                 current_ratio_history.append({"report_date": report_date, "amount": current_assets_for_date / current_liabilities_for_date})
+            if "manual_accounts_payable" in metric_set:
+                future_liabilities_for_date = current_liabilities_for_date + metric_set["manual_accounts_payable"]
+                future_current_liabilities_history.append({"report_date": report_date, "amount": future_liabilities_for_date})
+                future_working_capital_history.append({"report_date": report_date, "amount": current_assets_for_date - future_liabilities_for_date})
+                if future_liabilities_for_date:
+                    future_current_ratio_history.append({"report_date": report_date, "amount": current_assets_for_date / future_liabilities_for_date})
     if working_capital_history:
         history["working_capital"] = sorted(working_capital_history, key=lambda p: p["report_date"])
     if current_ratio_history:
         history["current_ratio"] = sorted(current_ratio_history, key=lambda p: p["report_date"])
+    if future_current_liabilities_history:
+        history["future_current_liabilities"] = sorted(future_current_liabilities_history, key=lambda p: p["report_date"])
+    if future_working_capital_history:
+        history["future_working_capital"] = sorted(future_working_capital_history, key=lambda p: p["report_date"])
+    if future_current_ratio_history:
+        history["future_current_ratio"] = sorted(future_current_ratio_history, key=lambda p: p["report_date"])
     reports_by_week = {}
     for report in reports:
         date = report["report_date"] or ""
@@ -3151,7 +3266,7 @@ def texas_financial_summary():
         bucket["status"] = status
         week_status.append(bucket)
     week_status.sort(key=lambda x: x["report_date"], reverse=True)
-    return {"reports": reports[:24], "report_weeks": week_status[:24], "latest_metrics": latest, "history": history}
+    return {"reports": reports[:24], "report_weeks": week_status[:24], "ap_snapshots": ap_snapshots[:24], "latest_metrics": latest, "history": history}
 
 
 def texas_pnl_uploaded_for_date(report_date):
@@ -3287,7 +3402,8 @@ def jobs_missing_recent_customer_invoice(lookback_days=7):
           SUM(CASE WHEN ci.created_at >= ? THEN 1 ELSE 0 END) AS recent_invoice_count
         FROM subprojects sp
         JOIN projects p ON p.id = sp.project_id
-        LEFT JOIN customer_invoices ci ON ci.subproject_id = sp.id AND ci.change_order_id IS NULL AND COALESCE(ci.status, '') <> 'Void'
+        LEFT JOIN customer_invoice_allocations cia ON cia.subproject_id = sp.id AND cia.change_order_id IS NULL
+        LEFT JOIN customer_invoices ci ON ci.id = cia.customer_invoice_id AND COALESCE(ci.status, '') <> 'Void'
         WHERE COALESCE(p.status, 'Active') <> 'Archived'
           AND TRIM(COALESCE(sp.job_number, '')) <> ''
         GROUP BY sp.id
@@ -3311,7 +3427,8 @@ def jobs_missing_recent_customer_invoice(lookback_days=7):
           SUM(CASE WHEN ci.created_at >= ? THEN 1 ELSE 0 END) AS recent_invoice_count
         FROM change_orders co
         JOIN projects p ON p.id = co.project_id
-        LEFT JOIN customer_invoices ci ON ci.change_order_id = co.id AND COALESCE(ci.status, '') <> 'Void'
+        LEFT JOIN customer_invoice_allocations cia ON cia.change_order_id = co.id
+        LEFT JOIN customer_invoices ci ON ci.id = cia.customer_invoice_id AND COALESCE(ci.status, '') <> 'Void'
         WHERE COALESCE(p.status, 'Active') <> 'Archived'
           AND TRIM(COALESCE(co.job_number, '')) <> ''
           AND COALESCE(co.status, '') NOT IN ('Rejected', 'Void')
@@ -4617,7 +4734,14 @@ LOGIN_HTML = r"""
   </form>
   <script>
     if ('serviceWorker' in navigator) {
-      window.addEventListener('load', () => navigator.serviceWorker.register('/service-worker.js').catch(() => {}));
+      window.addEventListener('load', async () => {
+        const registrations = await navigator.serviceWorker.getRegistrations();
+        await Promise.all(registrations.map(registration => registration.unregister()));
+        if ('caches' in window) {
+          const keys = await caches.keys();
+          await Promise.all(keys.map(key => caches.delete(key)));
+        }
+      });
     }
     document.getElementById('loginForm').onsubmit = async event => {
       event.preventDefault();
@@ -5184,6 +5308,20 @@ HTML = r"""
         </form>
       </div>
       <div class="grid cols-4" id="financialKpis" style="margin-top:14px"></div>
+      <div class="panel" style="margin-top:14px">
+        <h2>Texas AP For Future View</h2>
+        <p class="muted">Enter the weekly Texas AP total when accounting cannot provide AP by class. This does not change the uploaded balance sheet; it adds a projected view to the snapshot below.</p>
+        <form id="texasApForm">
+          <div class="grid cols-4">
+            <div><label>Week Ending</label><input name="report_date" type="date" required></div>
+            <div><label>AP Total</label><input name="ap_total" type="number" step="0.01" required></div>
+            <div style="grid-column:span 2"><label>Notes</label><input name="notes" placeholder="Optional note about the AP report source"></div>
+          </div>
+          <div class="actions"><button class="btn primary" type="submit">Save AP Total</button></div>
+          <div class="muted" id="texasApResult"></div>
+        </form>
+        <div id="texasApHistory" style="margin-top:12px"></div>
+      </div>
       <div class="dashboard-split">
         <div class="panel"><h2>Profitability Trend</h2><div id="financialProfitTrend"></div></div>
         <div class="panel"><h2>Balance Sheet Snapshot</h2><div id="financialBalanceSnapshot"></div></div>
@@ -5504,6 +5642,16 @@ HTML = r"""
         </div>
         <div class="grid cols-4">
           <div><label>Paid Amount</label><input name="paid_amount" type="number" step="0.01" value="0"></div>
+        </div>
+        <div class="panel soft-panel" style="margin-top:12px">
+          <h3>Invoice Allocation</h3>
+          <p class="muted">Use one line for a normal invoice, or add lines to split this customer invoice across multiple jobs.</p>
+          <div id="customerInvoiceAllocations"></div>
+          <div class="actions">
+            <button class="btn" id="addCustomerInvoiceAllocation" type="button">Add Allocation Line</button>
+            <button class="btn" id="splitCustomerInvoiceEvenly" type="button">Split Evenly</button>
+          </div>
+          <div class="muted" id="customerInvoiceAllocationTotal"></div>
         </div>
         <label>Our Invoice PDF</label><input name="invoice_file" type="file" accept=".pdf" required>
         <label>Notes</label><textarea name="notes" placeholder="Billing notes, customer comments, payment reference"></textarea>
@@ -6235,7 +6383,7 @@ HTML = r"""
     }
 
     function metricTrendValue(metricKey, value) {
-      return metricKey === 'current_ratio' ? Number(value || 0).toFixed(2) : money(value);
+      return ['current_ratio', 'future_current_ratio'].includes(metricKey) ? Number(value || 0).toFixed(2) : money(value);
     }
 
     function singleMetricTrendGraph(points, metricKey, label, range=financialTrendRange(), options={}) {
@@ -6407,6 +6555,31 @@ HTML = r"""
       }).join('')}</tbody></table>`;
     }
 
+    function renderTexasApHistory(summary) {
+      const entries = summary.ap_snapshots || [];
+      const target = document.getElementById('texasApHistory');
+      if (!target) return;
+      target.innerHTML = entries.length
+        ? `<table><thead><tr><th>Week Ending</th><th>AP Total</th><th>Entered By</th><th>Notes</th><th></th></tr></thead><tbody>${entries.map(entry => `
+          <tr>
+            <td>${htmlEscape(entry.report_date || '')}</td>
+            <td><strong>${money(entry.ap_total)}</strong></td>
+            <td>${htmlEscape(entry.created_by_username || '')}<div class="muted">${htmlEscape(entry.updated_at || entry.created_at || '')}</div></td>
+            <td>${htmlEscape(entry.notes || '')}</td>
+            <td><button class="btn danger" type="button" data-delete-texas-ap="${entry.id}">Remove</button></td>
+          </tr>`).join('')}</tbody></table>`
+        : '<div class="muted">No Texas AP totals entered yet.</div>';
+      target.querySelectorAll('[data-delete-texas-ap]').forEach(btn => btn.onclick = async () => {
+        if (!window.confirm('Remove this Texas AP total?')) return;
+        await api('/api/texas-ap-delete', {
+          method: 'POST',
+          body: JSON.stringify({ id: btn.dataset.deleteTexasAp })
+        });
+        markSaved();
+        await loadTexasOpsDashboard();
+      });
+    }
+
     function renderTexasReminderSetup(data) {
       const statusEl = document.getElementById('texasReminderStatus');
       const recipientsEl = document.getElementById('texasReminderRecipients');
@@ -6542,14 +6715,20 @@ HTML = r"""
       const cash = metricAmount(summary, 'cash');
       const workingCapital = metricAmount(summary, 'working_capital');
       const currentRatio = metricAmount(summary, 'current_ratio');
+      const futureWorkingCapital = metricAmount(summary, 'future_working_capital');
+      const futureCurrentRatio = metricAmount(summary, 'future_current_ratio');
       const balanceRows = [
         { key: 'cash', label: 'Cash', value: money(cash), helpText: 'Cash is pulled from the latest Balance Sheet cash or bank accounts line.' },
         { key: 'accounts_receivable', label: 'Accounts Receivable', value: money(metricAmount(summary, 'accounts_receivable')), helpText: 'Accounts Receivable comes from the latest Balance Sheet AR line.' },
         { key: 'accounts_payable', label: 'Accounts Payable', value: money(metricAmount(summary, 'accounts_payable')), helpText: 'Accounts Payable comes from the latest Balance Sheet AP line when present.' },
+        { key: 'manual_accounts_payable', label: 'Provided Texas AP', value: money(metricAmount(summary, 'manual_accounts_payable')), helpText: 'Provided Texas AP is the weekly AP total entered below because accounting cannot provide AP by Texas class.' },
         { key: 'current_assets', label: 'Current Assets', value: money(metricAmount(summary, 'current_assets')), helpText: 'Current Assets comes from the latest Balance Sheet total current assets line.' },
         { key: 'current_liabilities', label: 'Current Liabilities', value: money(metricAmount(summary, 'current_liabilities')), helpText: 'Current Liabilities comes from the latest Balance Sheet total current liabilities line.' },
+        { key: 'future_current_liabilities', label: 'Future Current Liabilities', value: money(metricAmount(summary, 'future_current_liabilities')), helpText: 'Future Current Liabilities equals imported Current Liabilities plus the latest provided Texas AP total.' },
         { key: 'working_capital', label: 'Working Capital', value: `<span class="${workingCapital >= 0 ? 'good' : 'bad'}">${money(workingCapital)}</span>`, helpText: 'Working Capital equals Current Assets minus Current Liabilities. It only calculates when both values come from the same report date.' },
+        { key: 'future_working_capital', label: 'Future Working Capital', value: `<span class="${futureWorkingCapital >= 0 ? 'good' : 'bad'}">${money(futureWorkingCapital)}</span>`, helpText: 'Future Working Capital equals imported Current Assets minus Future Current Liabilities.' },
         { key: 'current_ratio', label: 'Current Ratio', value: currentRatio ? currentRatio.toFixed(2) : '', helpText: 'Current Ratio equals Current Assets divided by Current Liabilities. It only calculates when both values come from the same report date.' },
+        { key: 'future_current_ratio', label: 'Future Current Ratio', value: futureCurrentRatio ? futureCurrentRatio.toFixed(2) : '', helpText: 'Future Current Ratio equals imported Current Assets divided by Future Current Liabilities.' },
         { key: 'total_assets', label: 'Total Assets', value: money(metricAmount(summary, 'total_assets')), helpText: 'Total Assets comes from the latest Balance Sheet total assets line.' },
         { key: 'total_liabilities', label: 'Total Liabilities', value: money(metricAmount(summary, 'total_liabilities')), helpText: 'Total Liabilities comes from the latest Balance Sheet total liabilities line.' },
         { key: 'equity', label: 'Equity', value: money(metricAmount(summary, 'equity')), helpText: 'Equity comes from the latest Balance Sheet equity or total equity line.' },
@@ -6576,6 +6755,7 @@ HTML = r"""
           openMetricTrendModal(summary, row.dataset.financialMetric, row.dataset.financialLabel);
         };
       });
+      renderTexasApHistory(summary);
       document.getElementById('financialReports').innerHTML = renderFinancialReportHistory(summary);
       document.querySelectorAll('[data-delete-financial-report]').forEach(btn => btn.onclick = async () => {
         const report = summary.reports.find(r => String(r.id) === String(btn.dataset.deleteFinancialReport));
@@ -6607,6 +6787,24 @@ HTML = r"""
         showFinancialDuplicateModal(payload.duplicates || []);
       } catch (err) {
         resultEl.textContent = `Import failed: ${err.message}`;
+      }
+    };
+    document.getElementById('texasApForm').onsubmit = async event => {
+      event.preventDefault();
+      const form = event.target;
+      const resultEl = document.getElementById('texasApResult');
+      resultEl.textContent = 'Saving AP total...';
+      try {
+        await api('/api/texas-ap', {
+          method: 'POST',
+          body: JSON.stringify(formDataObj(form))
+        });
+        resultEl.textContent = 'AP total saved.';
+        form.reset();
+        markSaved();
+        await loadTexasOpsDashboard();
+      } catch (err) {
+        resultEl.textContent = `Save failed: ${err.message}`;
       }
     };
     document.getElementById('saveTexasReminderRecipients').onclick = async () => {
@@ -7111,6 +7309,11 @@ HTML = r"""
         const el = document.getElementById(id);
         if (el) el.innerHTML = coOpts;
       });
+      document.querySelectorAll('[data-customer-invoice-allocation-row] select[data-allocation-field="target_key"]').forEach(el => {
+        const current = el.value;
+        el.innerHTML = customerInvoiceTargetOptions(current);
+      });
+      ensureCustomerInvoiceAllocationLine();
       const project = state.projects.find(p => p.id === state.projectId);
       const rateSetOptions = state.rateSets.map(r => `<option value="${r.id}">${r.name}${r.effective_date ? ' - ' + r.effective_date : ''}</option>`).join('');
       ['projectRateSet','newProjectRateSet','rateSetSelect'].forEach(id => {
@@ -7319,24 +7522,50 @@ HTML = r"""
       if (selectedCo) {
         label = `${selectedCo.order_type || 'Change Order'} ${selectedCo.co_number || ''}${selectedCo.job_number ? ' / ' + selectedCo.job_number : ''}`;
         contractValue = Number(selectedCo.sales_value || 0);
-        invoices = invoices.filter(i => String(i.change_order_id || '') === String(selectedCo.id));
       } else if (selectedSubproject) {
         label = `${selectedSubproject.job_number || ''} ${selectedSubproject.code || ''}`;
         contractValue = Number(selectedSubproject.sales_value || selectedSubproject.contract_value || 0);
-        const subprojectCoIds = summary.change_orders
-          .filter(co => String(co.subproject_id || '') === String(selectedSubproject.id))
-          .map(co => String(co.id));
-        invoices = invoices.filter(i =>
-          String(i.subproject_id || '') === String(selectedSubproject.id) ||
-          subprojectCoIds.includes(String(i.change_order_id || ''))
-        );
+      }
+      const subprojectCoIds = selectedSubproject ? summary.change_orders
+        .filter(co => String(co.subproject_id || '') === String(selectedSubproject.id))
+        .map(co => String(co.id)) : [];
+      const invoiceScopeAmount = invoice => {
+        if (!selectedCo && !selectedSubproject) return Number(invoice.amount || 0);
+        const allocations = invoice.allocations || [];
+        if (selectedCo) {
+          return allocations
+            .filter(a => String(a.change_order_id || '') === String(selectedCo.id))
+            .reduce((sum, a) => sum + Number(a.amount || 0), 0);
+        }
+        if (selectedSubproject) {
+          return allocations
+            .filter(a =>
+              String(a.subproject_id || '') === String(selectedSubproject.id) ||
+              subprojectCoIds.includes(String(a.change_order_id || ''))
+            )
+            .reduce((sum, a) => sum + Number(a.amount || 0), 0);
+        }
+        return Number(invoice.amount || 0);
+      };
+      if (selectedCo || selectedSubproject) {
+        invoices = invoices
+          .map(invoice => {
+            const scopeAmount = invoiceScopeAmount(invoice);
+            const allocatedTotal = Number(invoice.allocated_amount || invoice.amount || 0) || Number(invoice.amount || 0) || 1;
+            return {
+              ...invoice,
+              scope_amount: scopeAmount,
+              scope_paid_amount: Number(invoice.paid_amount || 0) * (scopeAmount / allocatedTotal),
+            };
+          })
+          .filter(invoice => Math.abs(Number(invoice.scope_amount || 0)) >= 0.01);
       }
       const active = invoices.filter(i => i.status !== 'Void');
-      const billed = active.reduce((sum, i) => sum + Number(i.amount || 0), 0);
-      const paid = active.reduce((sum, i) => sum + Number(i.paid_amount || 0), 0);
+      const billed = active.reduce((sum, i) => sum + Number(i.scope_amount ?? i.amount ?? 0), 0);
+      const paid = active.reduce((sum, i) => sum + Number(i.scope_paid_amount ?? i.paid_amount ?? 0), 0);
       const open = active
         .filter(i => !['Draft','Paid'].includes(i.status || ''))
-        .reduce((sum, i) => sum + Math.max(0, Number(i.amount || 0) - Number(i.paid_amount || 0)), 0);
+        .reduce((sum, i) => sum + Math.max(0, Number(i.scope_amount ?? i.amount ?? 0) - Number(i.scope_paid_amount ?? i.paid_amount ?? 0)), 0);
       const remaining = Math.max(0, contractValue - billed);
       let stage = 'Not billed';
       if (contractValue && paid >= contractValue) stage = 'Paid in full';
@@ -8851,16 +9080,21 @@ HTML = r"""
       const spOpts = '<option value="">Unassigned</option>' + state.subprojects.map(s => `<option value="${s.id}">${s.job_number || ''} ${s.code}</option>`).join('');
       const coOpts = '<option value="">Base Contract</option>' + state.changeOrders.map(c => `<option value="${c.id}">${[c.co_number, c.job_number].filter(Boolean).join(' / ')}</option>`).join('');
       tableEl.innerHTML = `
-        <thead><tr><th>Invoice #</th><th>File</th><th>Type</th><th>Subproject</th><th>CO</th><th>Invoice Date</th><th>Due Date</th><th>Status</th><th>Amount</th><th>Paid</th><th>Open</th><th>Notes</th><th></th></tr></thead>
+        <thead><tr><th>Invoice #</th><th>File</th><th>Type</th><th>Subproject</th><th>CO</th><th>Allocation</th><th>Invoice Date</th><th>Due Date</th><th>Status</th><th>Amount</th><th>Paid</th><th>Open</th><th>Notes</th><th></th></tr></thead>
         <tbody>${invoices.map(i => {
           const openAmount = Math.max(0, Number(i.amount || 0) - Number(i.paid_amount || 0));
           const invoiceFile = i.invoice_file ? pdfLink({ source_file: i.invoice_file }) : '<span class="muted">Missing</span>';
+          const allocations = i.allocations || [];
+          const allocationSummary = allocations.length
+            ? `<div class="muted">${allocations.length} allocation${allocations.length === 1 ? '' : 's'}</div>${allocations.map(a => `<div>${htmlEscape(a.target_label || 'Unassigned')}: <strong>${money(a.amount)}</strong></div>`).join('')}`
+            : '<span class="muted">No allocations</span>';
           return `<tr>
             <td><input data-cinv="${i.id}" data-field="invoice_number" value="${htmlEscape(i.invoice_number || '')}"></td>
             <td>${invoiceFile}</td>
             <td><select data-cinv="${i.id}" data-field="billing_type">${['Progress','Base Contract','Change Order','T&M','Retainage','Final'].map(v => `<option ${i.billing_type === v ? 'selected' : ''}>${v}</option>`).join('')}</select></td>
             <td><select data-cinv="${i.id}" data-field="subproject_id">${spOpts}</select></td>
             <td><select data-cinv="${i.id}" data-field="change_order_id">${coOpts}</select></td>
+            <td>${allocationSummary}</td>
             <td><input data-cinv="${i.id}" data-field="invoice_date" type="date" value="${htmlEscape(i.invoice_date || '')}"></td>
             <td><input data-cinv="${i.id}" data-field="due_date" type="date" value="${htmlEscape(i.due_date || '')}"></td>
             <td><select data-cinv="${i.id}" data-field="status">${['Draft','Sent','Partial','Paid','Overdue','Void'].map(v => `<option ${i.status === v ? 'selected' : ''}>${v}</option>`).join('')}</select></td>
@@ -8970,6 +9204,69 @@ HTML = r"""
       document.getElementById('currentUser').textContent = `${me.display_name || me.username}${readOnly || me.role === 'Field PO' ? ' / ' + me.role : ''}`;
       applyPermissionVisibility();
       if (Number(me.must_change_password || 0)) openAccountModal(true);
+    }
+
+    function customerInvoiceTargetOptions(selectedKey = '') {
+      const subprojectOptions = state.subprojects.map(s => {
+        const key = `sp:${s.id}`;
+        return `<option value="${key}" ${selectedKey === key ? 'selected' : ''}>${htmlEscape([s.job_number, s.code].filter(Boolean).join(' '))} - ${htmlEscape(s.name || '')}</option>`;
+      }).join('');
+      const changeOrderOptions = state.changeOrders.map(c => {
+        const key = `co:${c.id}`;
+        const type = c.order_type || 'Change Order';
+        const label = [[c.co_number, c.job_number].filter(Boolean).join(' / '), c.title || type].filter(Boolean).join(' - ');
+        return `<option value="${key}" ${selectedKey === key ? 'selected' : ''}>${htmlEscape(label)}</option>`;
+      }).join('');
+      return `<option value="">Choose allocation target...</option>${subprojectOptions}${changeOrderOptions}`;
+    }
+
+    function addCustomerInvoiceAllocationLine(values = {}) {
+      const target = document.getElementById('customerInvoiceAllocations');
+      if (!target) return;
+      const row = document.createElement('div');
+      row.className = 'grid cols-4 customer-invoice-allocation-row';
+      row.dataset.customerInvoiceAllocationRow = '1';
+      row.style.marginTop = '8px';
+      row.innerHTML = `
+        <div style="grid-column:span 2"><label>Job / Order</label><select data-allocation-field="target_key">${customerInvoiceTargetOptions(values.target_key || '')}</select></div>
+        <div><label>Amount</label><input data-allocation-field="amount" type="number" step="0.01" value="${Number(values.amount || 0).toFixed(2)}"></div>
+        <div><label>Note</label><input data-allocation-field="notes" value="${htmlEscape(values.notes || '')}" placeholder="Optional"></div>
+        <div class="actions" style="grid-column:1 / -1"><button class="btn danger" data-remove-allocation-line type="button">Remove Line</button></div>`;
+      row.querySelector('[data-remove-allocation-line]').onclick = () => {
+        row.remove();
+        updateCustomerInvoiceAllocationTotal();
+      };
+      row.querySelectorAll('input, select').forEach(el => el.oninput = updateCustomerInvoiceAllocationTotal);
+      target.appendChild(row);
+      updateCustomerInvoiceAllocationTotal();
+    }
+
+    function ensureCustomerInvoiceAllocationLine() {
+      const target = document.getElementById('customerInvoiceAllocations');
+      if (!target || target.querySelector('[data-customer-invoice-allocation-row]')) return;
+      const sp = document.getElementById('billingSubproject')?.value || '';
+      const co = document.getElementById('billingCo')?.value || '';
+      const amount = document.querySelector('#customerInvoiceForm input[name="amount"]')?.value || 0;
+      addCustomerInvoiceAllocationLine({ target_key: co ? `co:${co}` : sp ? `sp:${sp}` : '', amount });
+    }
+
+    function updateCustomerInvoiceAllocationTotal() {
+      const totalEl = document.getElementById('customerInvoiceAllocationTotal');
+      if (!totalEl) return;
+      const total = [...document.querySelectorAll('[data-customer-invoice-allocation-row] [data-allocation-field="amount"]')]
+        .reduce((sum, input) => sum + Number(input.value || 0), 0);
+      const invoiceAmount = Number(document.querySelector('#customerInvoiceForm input[name="amount"]')?.value || 0);
+      const diff = total - invoiceAmount;
+      totalEl.innerHTML = `Allocated ${money(total)} of ${money(invoiceAmount)}${Math.abs(diff) >= 0.01 ? ` <span class="${diff > 0 ? 'bad' : 'warn'}">(${money(Math.abs(diff))} ${diff > 0 ? 'over' : 'remaining'})</span>` : ' <span class="good">(balanced)</span>'}`;
+    }
+
+    function collectCustomerInvoiceAllocations() {
+      return [...document.querySelectorAll('[data-customer-invoice-allocation-row]')].map(row => {
+        const targetKey = row.querySelector('[data-allocation-field="target_key"]')?.value || '';
+        const amount = Number(row.querySelector('[data-allocation-field="amount"]')?.value || 0);
+        const notes = row.querySelector('[data-allocation-field="notes"]')?.value || '';
+        return { target_key: targetKey, amount, notes };
+      }).filter(row => row.target_key && Math.abs(row.amount) >= 0.01);
     }
 
     async function loadUsers() {
@@ -9240,12 +9537,55 @@ HTML = r"""
       await api('/api/invoices', { method:'POST', body: JSON.stringify({ ...formDataObj(e.target), project_id: state.projectId }) });
       e.target.reset(); markSaved(); await refresh();
     };
+    document.getElementById('addCustomerInvoiceAllocation').onclick = () => addCustomerInvoiceAllocationLine();
+    document.getElementById('splitCustomerInvoiceEvenly').onclick = () => {
+      const rows = [...document.querySelectorAll('[data-customer-invoice-allocation-row]')];
+      const amount = Number(document.querySelector('#customerInvoiceForm input[name="amount"]')?.value || 0);
+      if (!rows.length || !amount) {
+        updateCustomerInvoiceAllocationTotal();
+        return;
+      }
+      const share = Math.floor((amount / rows.length) * 100) / 100;
+      let allocated = 0;
+      rows.forEach((row, idx) => {
+        const input = row.querySelector('[data-allocation-field="amount"]');
+        const value = idx === rows.length - 1 ? Number((amount - allocated).toFixed(2)) : share;
+        allocated += value;
+        if (input) input.value = value.toFixed(2);
+      });
+      updateCustomerInvoiceAllocationTotal();
+    };
+    document.querySelector('#customerInvoiceForm input[name="amount"]').oninput = updateCustomerInvoiceAllocationTotal;
+    document.getElementById('billingSubproject').onchange = () => {
+      const first = document.querySelector('[data-customer-invoice-allocation-row] select[data-allocation-field="target_key"]');
+      if (first && !first.value) first.value = document.getElementById('billingSubproject').value ? `sp:${document.getElementById('billingSubproject').value}` : '';
+      updateCustomerInvoiceAllocationTotal();
+    };
+    document.getElementById('billingCo').onchange = () => {
+      const first = document.querySelector('[data-customer-invoice-allocation-row] select[data-allocation-field="target_key"]');
+      if (first && document.getElementById('billingCo').value) first.value = `co:${document.getElementById('billingCo').value}`;
+      updateCustomerInvoiceAllocationTotal();
+    };
     document.getElementById('customerInvoiceForm').onsubmit = async e => {
       e.preventDefault();
       const data = new FormData(e.target);
       data.append('project_id', state.projectId);
+      const allocations = collectCustomerInvoiceAllocations();
+      const invoiceAmount = Number(data.get('amount') || 0);
+      const allocationTotal = allocations.reduce((sum, row) => sum + Number(row.amount || 0), 0);
+      if (!allocations.length) {
+        alert('Add at least one allocation line for this customer invoice.');
+        return;
+      }
+      if (Math.abs(allocationTotal - invoiceAmount) >= 0.01) {
+        alert(`Allocation total must equal the invoice amount. Allocated ${money(allocationTotal)} of ${money(invoiceAmount)}.`);
+        return;
+      }
+      data.append('allocations', JSON.stringify(allocations));
       await api('/api/customer-invoices', { method:'POST', body: data });
       e.target.reset();
+      document.getElementById('customerInvoiceAllocations').innerHTML = '';
+      ensureCustomerInvoiceAllocationLine();
       markSaved();
       fillSelects();
       await refresh();
@@ -9403,7 +9743,14 @@ HTML = r"""
 
     updateCoPricingFields();
     if ('serviceWorker' in navigator) {
-      window.addEventListener('load', () => navigator.serviceWorker.register('/service-worker.js').catch(() => {}));
+      window.addEventListener('load', async () => {
+        const registrations = await navigator.serviceWorker.getRegistrations();
+        await Promise.all(registrations.map(registration => registration.unregister()));
+        if ('caches' in window) {
+          const keys = await caches.keys();
+          await Promise.all(keys.map(key => caches.delete(key)));
+        }
+      });
     }
     (async () => {
       await loadCurrentUser();
@@ -9690,20 +10037,58 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/api/cog-categories":
                 return json_response(self, rows("SELECT * FROM cog_categories WHERE COALESCE(active, 1) = 1 ORDER BY name, code"))
             if parsed.path == "/api/customer-invoices":
-                return json_response(
-                    self,
-                    rows(
-                        """
-                        SELECT ci.*, sp.job_number, sp.code AS subproject_code, co.co_number, co.job_number AS co_job_number
-                        FROM customer_invoices ci
-                        LEFT JOIN subprojects sp ON sp.id = ci.subproject_id
-                        LEFT JOIN change_orders co ON co.id = ci.change_order_id
-                        WHERE ci.project_id = ?
-                        ORDER BY ci.invoice_date DESC, ci.id DESC
-                        """,
-                        (qs.get("project_id", [""])[0],),
-                    ),
+                project_id = qs.get("project_id", [""])[0]
+                invoice_rows = rows(
+                    """
+                    SELECT ci.*, COALESCE(SUM(cia.amount), ci.amount, 0) AS allocated_amount,
+                           sp.job_number, sp.code AS subproject_code, co.co_number, co.job_number AS co_job_number
+                    FROM customer_invoices ci
+                    LEFT JOIN customer_invoice_allocations cia ON cia.customer_invoice_id = ci.id
+                    LEFT JOIN subprojects sp ON sp.id = ci.subproject_id
+                    LEFT JOIN change_orders co ON co.id = ci.change_order_id
+                    WHERE ci.project_id = ?
+                    GROUP BY ci.id
+                    ORDER BY ci.invoice_date DESC, ci.id DESC
+                    """,
+                    (project_id,),
                 )
+                allocation_rows = rows(
+                    """
+                    SELECT
+                      cia.*,
+                      sp.job_number,
+                      sp.code AS subproject_code,
+                      sp.name AS subproject_name,
+                      co.co_number,
+                      co.job_number AS co_job_number,
+                      co.title AS co_title,
+                      COALESCE(co.order_type, 'Change Order') AS order_type
+                    FROM customer_invoice_allocations cia
+                    LEFT JOIN subprojects sp ON sp.id = cia.subproject_id
+                    LEFT JOIN change_orders co ON co.id = cia.change_order_id
+                    WHERE cia.project_id = ?
+                    ORDER BY cia.id
+                    """,
+                    (project_id,),
+                )
+                by_invoice = {}
+                for invoice in invoice_rows:
+                    invoice["allocations"] = []
+                    by_invoice[invoice["id"]] = invoice
+                for allocation in allocation_rows:
+                    if allocation.get("change_order_id"):
+                        pieces = [allocation.get("co_number"), allocation.get("co_job_number")]
+                        label = " / ".join(str(x) for x in pieces if x) or allocation.get("order_type") or "Change Order"
+                        if allocation.get("co_title"):
+                            label = f"{label} - {allocation.get('co_title')}"
+                    else:
+                        pieces = [allocation.get("job_number"), allocation.get("subproject_code")]
+                        label = " ".join(str(x) for x in pieces if x) or "Unassigned"
+                        if allocation.get("subproject_name"):
+                            label = f"{label} - {allocation.get('subproject_name')}"
+                    allocation["target_label"] = label
+                    by_invoice.get(allocation["customer_invoice_id"], {}).get("allocations", []).append(allocation)
+                return json_response(self, invoice_rows)
             if parsed.path == "/api/internal-rates":
                 return json_response(self, rows("SELECT * FROM internal_rates WHERE active = 1 ORDER BY rate_set_id, category_type, category"))
             if parsed.path == "/api/cost-records":
@@ -10332,6 +10717,7 @@ class Handler(BaseHTTPRequestHandler):
                 return json_response(self, {"imported": imported, "metric_count": metric_count, "details": details, "duplicates": duplicates, "skipped_duplicates": len(duplicates)})
 
             if parsed.path == "/api/customer-invoices":
+                actor = current_user(self)
                 now = datetime.now().isoformat(timespec="seconds")
                 form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": self.headers.get("Content-Type")})
                 file_item = form["invoice_file"] if "invoice_file" in form else None
@@ -10344,34 +10730,126 @@ class Handler(BaseHTTPRequestHandler):
                 path = UPLOAD_DIR / saved_name
                 with open(path, "wb") as f:
                     f.write(file_item.file.read())
-                new_id = execute(
-                    """
-                    INSERT INTO customer_invoices (
-                      project_id, subproject_id, change_order_id, invoice_number, billing_type,
-                      invoice_date, due_date, status, amount, paid_amount, invoice_file, notes, created_at
+                project_id = form.getvalue("project_id")
+                invoice_amount = money(form.getvalue("amount"))
+                try:
+                    allocation_payload = json.loads(form.getvalue("allocations") or "[]")
+                except json.JSONDecodeError:
+                    allocation_payload = []
+                if not allocation_payload:
+                    target_key = f"co:{form.getvalue('change_order_id')}" if form.getvalue("change_order_id") else f"sp:{form.getvalue('subproject_id')}" if form.getvalue("subproject_id") else ""
+                    allocation_payload = [{"target_key": target_key, "amount": invoice_amount, "notes": ""}]
+                allocation_total = sum(money(item.get("amount")) for item in allocation_payload)
+                if not allocation_payload or abs(allocation_total - invoice_amount) >= 0.01:
+                    return json_response(self, {"error": "Allocation total must match the invoice amount."}, 400)
+                with db() as con:
+                    target_rows = []
+                    for item in allocation_payload:
+                        target_key = str(item.get("target_key") or "")
+                        if ":" not in target_key:
+                            return json_response(self, {"error": "Each allocation line needs a job/order target."}, 400)
+                        target_type, target_id = target_key.split(":", 1)
+                        if target_type == "sp":
+                            sp = con.execute("SELECT id FROM subprojects WHERE id = ? AND project_id = ?", (target_id, project_id)).fetchone()
+                            if not sp:
+                                return json_response(self, {"error": "One allocation target is not part of this master project."}, 400)
+                            target_rows.append({"subproject_id": sp["id"], "change_order_id": None, "amount": money(item.get("amount")), "notes": str(item.get("notes") or "").strip()})
+                        elif target_type == "co":
+                            co = con.execute("SELECT id, subproject_id FROM change_orders WHERE id = ? AND project_id = ?", (target_id, project_id)).fetchone()
+                            if not co:
+                                return json_response(self, {"error": "One allocation target is not part of this master project."}, 400)
+                            target_rows.append({"subproject_id": co["subproject_id"], "change_order_id": co["id"], "amount": money(item.get("amount")), "notes": str(item.get("notes") or "").strip()})
+                        else:
+                            return json_response(self, {"error": "Each allocation target must be a subproject or change order."}, 400)
+                    primary = target_rows[0] if target_rows else {"subproject_id": None, "change_order_id": None}
+                    cursor = con.execute(
+                        """
+                        INSERT INTO customer_invoices (
+                          project_id, subproject_id, change_order_id, invoice_number, billing_type,
+                          invoice_date, due_date, status, amount, paid_amount, invoice_file, notes, created_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            project_id,
+                            primary["subproject_id"],
+                            primary["change_order_id"],
+                            form.getvalue("invoice_number"),
+                            form.getvalue("billing_type") or "Progress",
+                            form.getvalue("invoice_date"),
+                            form.getvalue("due_date"),
+                            form.getvalue("status") or "Draft",
+                            invoice_amount,
+                            money(form.getvalue("paid_amount")),
+                            saved_name,
+                            form.getvalue("notes"),
+                            now,
+                        ),
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        form.getvalue("project_id"),
-                        form.getvalue("subproject_id") or None,
-                        form.getvalue("change_order_id") or None,
-                        form.getvalue("invoice_number"),
-                        form.getvalue("billing_type") or "Progress",
-                        form.getvalue("invoice_date"),
-                        form.getvalue("due_date"),
-                        form.getvalue("status") or "Draft",
-                        money(form.getvalue("amount")),
-                        money(form.getvalue("paid_amount")),
-                        saved_name,
-                        form.getvalue("notes"),
-                        now,
-                    ),
-                )
+                    new_id = cursor.lastrowid
+                    for target in target_rows:
+                        con.execute(
+                            """
+                            INSERT INTO customer_invoice_allocations (
+                              customer_invoice_id, project_id, subproject_id, change_order_id, amount,
+                              notes, created_by_user_id, created_by_username, created_at
+                            )
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                new_id,
+                                project_id,
+                                target["subproject_id"],
+                                target["change_order_id"],
+                                target["amount"],
+                                target["notes"],
+                                actor["id"] if actor else None,
+                                actor["username"] if actor else "",
+                                now,
+                            ),
+                        )
                 return json_response(self, {"id": new_id})
 
             data = parse_json(self)
             now = datetime.now().isoformat(timespec="seconds")
+            if parsed.path == "/api/texas-ap":
+                actor = current_user(self)
+                if not require_editor(self):
+                    return json_response(self, {"error": "Admin or standard user access required."}, 403)
+                report_date = date_text(data.get("report_date"))
+                if not report_date:
+                    return json_response(self, {"error": "Choose a week ending date."}, 400)
+                ap_total = money(data.get("ap_total"))
+                notes = str(data.get("notes") or "").strip()
+                with db() as con:
+                    con.execute(
+                        """
+                        INSERT INTO texas_ap_snapshots (
+                          report_date, ap_total, notes, created_by_user_id, created_by_username, created_at, updated_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(report_date) DO UPDATE SET
+                          ap_total = excluded.ap_total,
+                          notes = excluded.notes,
+                          created_by_user_id = excluded.created_by_user_id,
+                          created_by_username = excluded.created_by_username,
+                          updated_at = excluded.updated_at
+                        """,
+                        (report_date, ap_total, notes, actor["id"], actor.get("username"), now, now),
+                    )
+                log_activity(actor, "saved Texas AP total", "Texas Ops", report_date, {"ap_total": ap_total, "notes": notes})
+                return json_response(self, {"ok": True, "report_date": report_date, "ap_total": ap_total})
+            if parsed.path == "/api/texas-ap-delete":
+                actor = current_user(self)
+                if not require_editor(self):
+                    return json_response(self, {"error": "Admin or standard user access required."}, 403)
+                ap_id = data.get("id")
+                with db() as con:
+                    entry = con.execute("SELECT * FROM texas_ap_snapshots WHERE id = ?", (ap_id,)).fetchone()
+                    deleted = con.execute("DELETE FROM texas_ap_snapshots WHERE id = ?", (ap_id,)).rowcount
+                if deleted and entry:
+                    log_activity(actor, "deleted Texas AP total", "Texas Ops", entry["report_date"], {"ap_total": entry["ap_total"], "notes": entry["notes"]})
+                return json_response(self, {"deleted": deleted})
             if parsed.path == "/api/texas-financial-delete":
                 report_id = data.get("report_id")
                 with db() as con:
@@ -11206,27 +11684,50 @@ class Handler(BaseHTTPRequestHandler):
                 return json_response(self, {"ok": True})
             if parsed.path.startswith("/api/customer-invoices/"):
                 invoice_id = parsed.path.rsplit("/", 1)[-1]
-                execute(
-                    """
-                    UPDATE customer_invoices
-                    SET subproject_id = ?, change_order_id = ?, invoice_number = ?, billing_type = ?,
-                        invoice_date = ?, due_date = ?, status = ?, amount = ?, paid_amount = ?, notes = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        data.get("subproject_id") or None,
-                        data.get("change_order_id") or None,
-                        data.get("invoice_number"),
-                        data.get("billing_type") or "Progress",
-                        data.get("invoice_date"),
-                        data.get("due_date"),
-                        data.get("status") or "Draft",
-                        money(data.get("amount")),
-                        money(data.get("paid_amount")),
-                        data.get("notes"),
-                        invoice_id,
-                    ),
-                )
+                with db() as con:
+                    invoice = con.execute("SELECT * FROM customer_invoices WHERE id = ?", (invoice_id,)).fetchone()
+                    con.execute(
+                        """
+                        UPDATE customer_invoices
+                        SET subproject_id = ?, change_order_id = ?, invoice_number = ?, billing_type = ?,
+                            invoice_date = ?, due_date = ?, status = ?, amount = ?, paid_amount = ?, notes = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            data.get("subproject_id") or None,
+                            data.get("change_order_id") or None,
+                            data.get("invoice_number"),
+                            data.get("billing_type") or "Progress",
+                            data.get("invoice_date"),
+                            data.get("due_date"),
+                            data.get("status") or "Draft",
+                            money(data.get("amount")),
+                            money(data.get("paid_amount")),
+                            data.get("notes"),
+                            invoice_id,
+                        ),
+                    )
+                    if invoice:
+                        existing_count = con.execute("SELECT COUNT(*) AS c FROM customer_invoice_allocations WHERE customer_invoice_id = ?", (invoice_id,)).fetchone()["c"]
+                        if existing_count <= 1:
+                            con.execute("DELETE FROM customer_invoice_allocations WHERE customer_invoice_id = ?", (invoice_id,))
+                            con.execute(
+                                """
+                                INSERT INTO customer_invoice_allocations (
+                                  customer_invoice_id, project_id, subproject_id, change_order_id, amount, notes, created_at
+                                )
+                                VALUES (?, ?, ?, ?, ?, ?, ?)
+                                """,
+                                (
+                                    invoice_id,
+                                    invoice["project_id"],
+                                    data.get("subproject_id") or None,
+                                    data.get("change_order_id") or None,
+                                    money(data.get("amount")),
+                                    "Updated single-invoice allocation",
+                                    datetime.now().isoformat(timespec="seconds"),
+                                ),
+                            )
                 return json_response(self, {"ok": True})
             if parsed.path.startswith("/api/internal-rates/"):
                 rate_id = parsed.path.rsplit("/", 1)[-1]
@@ -11304,6 +11805,7 @@ class Handler(BaseHTTPRequestHandler):
                         return json_response(self, {"error": "Subproject not found."}, 404)
                     con.execute("UPDATE change_orders SET subproject_id = NULL WHERE subproject_id = ?", (subproject_id,))
                     con.execute("UPDATE customer_invoices SET subproject_id = NULL WHERE subproject_id = ?", (subproject_id,))
+                    con.execute("UPDATE customer_invoice_allocations SET subproject_id = NULL WHERE subproject_id = ?", (subproject_id,))
                     con.execute(
                         """
                         UPDATE cost_records
@@ -11337,6 +11839,7 @@ class Handler(BaseHTTPRequestHandler):
                     if not change_order:
                         return json_response(self, {"error": "Change order not found."}, 404)
                     con.execute("UPDATE customer_invoices SET change_order_id = NULL WHERE change_order_id = ?", (change_order_id,))
+                    con.execute("UPDATE customer_invoice_allocations SET change_order_id = NULL WHERE change_order_id = ?", (change_order_id,))
                     con.execute(
                         """
                         UPDATE cost_records
