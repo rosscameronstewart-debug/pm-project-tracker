@@ -1933,7 +1933,9 @@ def labor_category(item):
         category = " ".join(parts[1:])
     else:
         category = str(item or "").strip()
-    category = category.replace(" Reg", " ST").replace(" - ", " ")
+    category = re.sub(r"\s*-\s*Reg\b", " ST", category, flags=re.IGNORECASE)
+    category = re.sub(r"\bReg\b", "ST", category, flags=re.IGNORECASE)
+    category = category.replace(" - ", " ")
     return re.sub(r"\s+", " ", category).strip()
 
 
