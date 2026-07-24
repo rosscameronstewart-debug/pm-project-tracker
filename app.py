@@ -64,7 +64,9 @@ CO_MATERIAL_MARGIN = 0.35
 CO_MATERIAL_COST_FACTOR = 1 - CO_MATERIAL_MARGIN
 COG_CUSTOMER_OPTIONAL_NAMES = {"expenses", "truck & auto expense", "truck and auto expense"}
 ROLE_NAMES = ("Admin", "User", "Read Only", "TX/Read Only", "Field PO")
-PERMISSION_DEFINITIONS = [
+MCC_FEATURE_ENABLED = False
+HIDDEN_PERMISSION_KEYS = set() if MCC_FEATURE_ENABLED else {"mcc_quotes", "mcc_quote_setup"}
+ALL_PERMISSION_DEFINITIONS = [
     {"key": "projects", "label": "Project Dashboard", "group": "Projects"},
     {"key": "project_setup", "label": "Project Setup", "group": "Projects"},
     {"key": "fieldwise", "label": "Field Wise Import", "group": "Projects"},
@@ -73,6 +75,8 @@ PERMISSION_DEFINITIONS = [
     {"key": "customer_billing", "label": "Customer Billing", "group": "Projects"},
     {"key": "fieldwise_audit", "label": "Field Wise Audit", "group": "Company"},
     {"key": "bids", "label": "Bid Tracking", "group": "Company"},
+    {"key": "mcc_quotes", "label": "MCC Quote Builder", "group": "Quoting"},
+    {"key": "mcc_quote_setup", "label": "MCC Pricing Setup", "group": "Quoting"},
     {"key": "job_order_report", "label": "Job Order Quick Reference", "group": "Company"},
     {"key": "archived_projects", "label": "Archived Projects", "group": "Projects"},
     {"key": "texas_ops", "label": "Texas Operations", "group": "Texas"},
@@ -83,6 +87,7 @@ PERMISSION_DEFINITIONS = [
     {"key": "activity", "label": "Activity Log", "group": "Admin"},
     {"key": "admin", "label": "Admin / Users / Backups", "group": "Admin"},
 ]
+PERMISSION_DEFINITIONS = [p for p in ALL_PERMISSION_DEFINITIONS if p["key"] not in HIDDEN_PERMISSION_KEYS]
 DEFAULT_ROLE_PERMISSIONS = {
     "Admin": {p["key"]: (1, 1) for p in PERMISSION_DEFINITIONS},
     "User": {p["key"]: (1, 1) for p in PERMISSION_DEFINITIONS if p["key"] not in ("admin", "activity")},
@@ -367,6 +372,10 @@ def purchase_order_html(po):
     if po["pickup_file"]:
         safe_name = quote(po["pickup_file"])
         pickup = f'<p><strong>Pickup Ticket:</strong> <a href="/uploads/{safe_name}" target="_blank" rel="noopener">{html_escape(po["pickup_file"])}</a></p>'
+    invoice = ""
+    if "invoice_file" in po.keys() and po["invoice_file"]:
+        safe_name = quote(po["invoice_file"])
+        invoice = f'<p><strong>Vendor Invoice:</strong> <a href="/uploads/{safe_name}" target="_blank" rel="noopener">{html_escape(po["invoice_file"])}</a></p>'
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -407,6 +416,7 @@ def purchase_order_html(po):
       <div class="box" style="margin-top:14px"><div class="label">PO Details</div><div class="desc">{html_escape(po["description"])}</div></div>
       {attachment}
       {pickup}
+      {invoice}
     </div>
   </main>
 </body>
@@ -638,6 +648,86 @@ def init_db():
               created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS mcc_quote_items (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              category TEXT NOT NULL,
+              item_name TEXT NOT NULL,
+              description TEXT,
+              unit_label TEXT DEFAULT 'Each',
+              default_qty REAL DEFAULT 1,
+              unit_price REAL DEFAULT 0,
+              markup_percent REAL DEFAULT 0,
+              sort_order INTEGER DEFAULT 0,
+              active INTEGER DEFAULT 1,
+              vendor_quote_file TEXT,
+              vendor_quote_uploaded_at TEXT,
+              filter_unit_price REAL DEFAULT 0,
+              filter_markup_percent REAL DEFAULT 0,
+              filter_vendor_quote_file TEXT,
+              filter_vendor_quote_uploaded_at TEXT,
+              pricing_updated_at TEXT,
+              updated_at TEXT,
+              UNIQUE(category, item_name)
+            );
+
+            CREATE TABLE IF NOT EXISTS mcc_quotes (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              quote_number TEXT NOT NULL UNIQUE,
+              customer TEXT,
+              project_name TEXT,
+              building_name TEXT,
+              salesperson TEXT,
+              status TEXT DEFAULT 'Draft',
+              notes TEXT,
+              subtotal REAL DEFAULT 0,
+              markup_percent REAL DEFAULT 0,
+              total REAL DEFAULT 0,
+              created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+              created_by_username TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS mcc_quote_lines (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              quote_id INTEGER NOT NULL REFERENCES mcc_quotes(id) ON DELETE CASCADE,
+              quote_item_id INTEGER REFERENCES mcc_quote_items(id) ON DELETE SET NULL,
+              category TEXT,
+              item_name TEXT,
+              description TEXT,
+              unit_label TEXT,
+              qty REAL DEFAULT 0,
+              unit_price REAL DEFAULT 0,
+              markup_percent REAL DEFAULT 0,
+              line_total REAL DEFAULT 0,
+              vendor_quote_file TEXT,
+              notes TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS mcc_vfd_prices (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              horsepower TEXT NOT NULL,
+              nema_rating TEXT NOT NULL,
+              unit_price REAL DEFAULT 0,
+              markup_percent REAL DEFAULT 0,
+              active INTEGER DEFAULT 1,
+              vendor_quote_file TEXT,
+              vendor_quote_uploaded_at TEXT,
+              pricing_updated_at TEXT,
+              updated_at TEXT,
+              UNIQUE(horsepower, nema_rating)
+            );
+
+            CREATE TABLE IF NOT EXISTS mcc_vfd_filter_prices (
+              id INTEGER PRIMARY KEY CHECK (id = 1),
+              unit_price REAL DEFAULT 0,
+              markup_percent REAL DEFAULT 0,
+              vendor_quote_file TEXT,
+              vendor_quote_uploaded_at TEXT,
+              pricing_updated_at TEXT,
+              updated_at TEXT
+            );
+
             CREATE TABLE IF NOT EXISTS users (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               username TEXT NOT NULL UNIQUE,
@@ -804,6 +894,11 @@ def init_db():
               pickup_uploaded_at TEXT,
               pickup_uploaded_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
               pickup_uploaded_by_username TEXT,
+              invoice_file TEXT,
+              invoice_uploaded_at TEXT,
+              invoice_uploaded_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+              invoice_uploaded_by_username TEXT,
+              invoice_cost_record_id INTEGER REFERENCES cost_records(id) ON DELETE SET NULL,
               status TEXT DEFAULT 'Pending Approval',
               closed_at TEXT,
               closed_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
@@ -976,6 +1071,41 @@ def init_db():
             con.execute("UPDATE users SET po_auto_issue = 1 WHERE role IN ('Admin', 'User')")
         if "must_change_password" not in user_cols:
             con.execute("ALTER TABLE users ADD COLUMN must_change_password INTEGER DEFAULT 0")
+        mcc_item_cols = [r["name"] for r in con.execute("PRAGMA table_info(mcc_quote_items)").fetchall()]
+        if "vendor_quote_file" not in mcc_item_cols:
+            con.execute("ALTER TABLE mcc_quote_items ADD COLUMN vendor_quote_file TEXT")
+        if "vendor_quote_uploaded_at" not in mcc_item_cols:
+            con.execute("ALTER TABLE mcc_quote_items ADD COLUMN vendor_quote_uploaded_at TEXT")
+        if "markup_percent" not in mcc_item_cols:
+            con.execute("ALTER TABLE mcc_quote_items ADD COLUMN markup_percent REAL DEFAULT 0")
+        if "pricing_updated_at" not in mcc_item_cols:
+            con.execute("ALTER TABLE mcc_quote_items ADD COLUMN pricing_updated_at TEXT")
+            con.execute("UPDATE mcc_quote_items SET pricing_updated_at = COALESCE(updated_at, vendor_quote_uploaded_at) WHERE pricing_updated_at IS NULL")
+        mcc_line_cols = [r["name"] for r in con.execute("PRAGMA table_info(mcc_quote_lines)").fetchall()]
+        if "vendor_quote_file" not in mcc_line_cols:
+            con.execute("ALTER TABLE mcc_quote_lines ADD COLUMN vendor_quote_file TEXT")
+        if "markup_percent" not in mcc_line_cols:
+            con.execute("ALTER TABLE mcc_quote_lines ADD COLUMN markup_percent REAL DEFAULT 0")
+        mcc_vfd_cols = [r["name"] for r in con.execute("PRAGMA table_info(mcc_vfd_prices)").fetchall()]
+        if "vendor_quote_file" not in mcc_vfd_cols:
+            con.execute("ALTER TABLE mcc_vfd_prices ADD COLUMN vendor_quote_file TEXT")
+        if "vendor_quote_uploaded_at" not in mcc_vfd_cols:
+            con.execute("ALTER TABLE mcc_vfd_prices ADD COLUMN vendor_quote_uploaded_at TEXT")
+        if "filter_unit_price" not in mcc_vfd_cols:
+            con.execute("ALTER TABLE mcc_vfd_prices ADD COLUMN filter_unit_price REAL DEFAULT 0")
+        if "filter_markup_percent" not in mcc_vfd_cols:
+            con.execute("ALTER TABLE mcc_vfd_prices ADD COLUMN filter_markup_percent REAL DEFAULT 0")
+        if "filter_vendor_quote_file" not in mcc_vfd_cols:
+            con.execute("ALTER TABLE mcc_vfd_prices ADD COLUMN filter_vendor_quote_file TEXT")
+        if "filter_vendor_quote_uploaded_at" not in mcc_vfd_cols:
+            con.execute("ALTER TABLE mcc_vfd_prices ADD COLUMN filter_vendor_quote_uploaded_at TEXT")
+        if "pricing_updated_at" not in mcc_vfd_cols:
+            con.execute("ALTER TABLE mcc_vfd_prices ADD COLUMN pricing_updated_at TEXT")
+            con.execute("UPDATE mcc_vfd_prices SET pricing_updated_at = COALESCE(updated_at, vendor_quote_uploaded_at) WHERE pricing_updated_at IS NULL")
+        con.execute(
+            "INSERT OR IGNORE INTO mcc_vfd_filter_prices (id, unit_price, markup_percent, updated_at) VALUES (1, 0, 0, ?)",
+            (datetime.now().isoformat(timespec="seconds"),),
+        )
         po_cols = [r["name"] for r in con.execute("PRAGMA table_info(purchase_orders)").fetchall()]
         if "pickup_file" not in po_cols:
             con.execute("ALTER TABLE purchase_orders ADD COLUMN pickup_file TEXT")
@@ -987,6 +1117,11 @@ def init_db():
             "pickup_uploaded_at": "TEXT",
             "pickup_uploaded_by_user_id": "INTEGER",
             "pickup_uploaded_by_username": "TEXT",
+            "invoice_file": "TEXT",
+            "invoice_uploaded_at": "TEXT",
+            "invoice_uploaded_by_user_id": "INTEGER",
+            "invoice_uploaded_by_username": "TEXT",
+            "invoice_cost_record_id": "INTEGER",
             "closed_at": "TEXT",
             "closed_by_user_id": "INTEGER",
             "closed_by_username": "TEXT",
@@ -1041,6 +1176,36 @@ def init_db():
             default_rate_set_id = default_rate_set["id"]
         con.execute("UPDATE internal_rates SET rate_set_id = ? WHERE rate_set_id IS NULL", (default_rate_set_id,))
         con.execute("UPDATE projects SET rate_set_id = ? WHERE rate_set_id IS NULL", (default_rate_set_id,))
+        mcc_count = con.execute("SELECT COUNT(*) count FROM mcc_quote_items").fetchone()["count"]
+        if not mcc_count:
+            now_seed = datetime.now().isoformat(timespec="seconds")
+            default_mcc_items = [
+                ("Building", "Base MCC Building Shell", "Base skid/building package for an MCC building quote.", "Each", 1, 125000, 10),
+                ("Building", "Insulation Package", "Wall and roof insulation package.", "Each", 1, 18500, 20),
+                ("Building", "Interior Liner Panel Package", "Interior wall and ceiling liner package.", "Each", 1, 24000, 30),
+                ("Electrical", "Main MCC Lineup", "Main MCC lineup allowance.", "Each", 1, 95000, 100),
+                ("Electrical", "Additional MCC Section", "Additional MCC section or bucket allowance.", "Each", 1, 14500, 110),
+                ("Electrical", "VFD Package", "VFD section/package allowance.", "Each", 1, 22500, 120),
+                ("Electrical", "Lighting And Receptacles", "Interior lighting, exterior lighting, and receptacle allowance.", "Each", 1, 16500, 130),
+                ("Electrical", "Grounding Package", "Grounding and bonding allowance.", "Each", 1, 8500, 140),
+                ("Mechanical", "HVAC Unit", "Wall or roof HVAC unit installed allowance.", "Each", 1, 18500, 200),
+                ("Mechanical", "Ventilation Package", "Fans, louvers, dampers, and controls allowance.", "Each", 1, 9500, 210),
+                ("Controls", "PLC / Controls Panel", "PLC or local controls panel allowance.", "Each", 1, 28000, 300),
+                ("Controls", "Fire And Gas Detection", "Fire, gas, horn/strobe, and detection allowance.", "Each", 1, 19500, 310),
+                ("Site / Install", "Cable Tray Package", "Cable tray, supports, and fittings allowance.", "Each", 1, 12500, 400),
+                ("Site / Install", "Startup And Commissioning", "Startup support and commissioning allowance.", "Each", 1, 15000, 410),
+                ("Commercial", "Engineering / Drawings", "Engineering, submittals, and drawing package.", "Each", 1, 22000, 500),
+                ("Commercial", "Freight / Delivery", "Freight, delivery, and handling allowance.", "Each", 1, 18000, 510),
+            ]
+            con.executemany(
+                """
+                INSERT INTO mcc_quote_items (
+                  category, item_name, description, unit_label, default_qty, unit_price, sort_order, active, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+                """,
+                [(*item, now_seed) for item in default_mcc_items],
+            )
         user_count = con.execute("SELECT COUNT(*) count FROM users").fetchone()["count"]
         if not user_count:
             con.execute(
@@ -4692,6 +4857,96 @@ def import_vendor_invoice_pdf(path, project_id):
     return {"count": count, "skipped": skipped, "order_number": order_number, "matched_subproject_id": matched_subproject_id, "vendor": vendor, "invoice_number": invoice_number, "duplicate": False}
 
 
+def sync_po_invoice_cost_record(con, po, invoice_file, actor):
+    if not po["project_id"]:
+        return None
+    now = datetime.now().isoformat(timespec="seconds")
+    amount = money(po["estimated_amount"])
+    notes = json.dumps(
+        {
+            "po_id": po["id"],
+            "po_number": po["po_number"],
+            "uploaded_by": actor["username"] if actor else "",
+            "uploaded_at": now,
+            "job_number": po["job_number"],
+            "job_label": po["job_label"],
+        },
+        default=str,
+    )
+    description = f"PO invoice {po['po_number']}: {po['description'] or ''}".strip()
+    cost_record_id = po["invoice_cost_record_id"] if "invoice_cost_record_id" in po.keys() else None
+    if cost_record_id:
+        existing = con.execute("SELECT id FROM cost_records WHERE id = ?", (cost_record_id,)).fetchone()
+        if not existing:
+            cost_record_id = None
+    if cost_record_id:
+        con.execute(
+            """
+            UPDATE cost_records
+            SET project_id = ?,
+                subproject_id = ?,
+                change_order_id = ?,
+                source_file = ?,
+                ticket_or_invoice = ?,
+                record_date = ?,
+                status = 'Imported',
+                cost_type = 'Material',
+                item = 'PO Invoice',
+                description = ?,
+                qty = 1,
+                rate = ?,
+                amount = ?,
+                raw_rate = ?,
+                raw_cost_source = 'PO invoice upload',
+                vendor = ?,
+                notes = ?
+            WHERE id = ?
+            """,
+            (
+                po["project_id"],
+                po["subproject_id"],
+                po["change_order_id"],
+                invoice_file,
+                po["po_number"],
+                now[:10],
+                description,
+                amount,
+                amount,
+                amount,
+                po["vendor"],
+                notes,
+                cost_record_id,
+            ),
+        )
+        return cost_record_id
+    cur = con.execute(
+        """
+        INSERT INTO cost_records (
+          project_id, subproject_id, change_order_id, source, source_file, ticket_or_invoice,
+          record_date, status, cost_type, item, description, qty, rate, amount, raw_rate,
+          raw_cost_source, vendor, notes, created_at
+        )
+        VALUES (?, ?, ?, 'Vendor Invoice', ?, ?, ?, 'Imported', 'Material', 'PO Invoice', ?, 1, ?, ?, ?, 'PO invoice upload', ?, ?, ?)
+        """,
+        (
+            po["project_id"],
+            po["subproject_id"],
+            po["change_order_id"],
+            invoice_file,
+            po["po_number"],
+            now[:10],
+            description,
+            amount,
+            amount,
+            amount,
+            po["vendor"],
+            notes,
+            now,
+        ),
+    )
+    return cur.lastrowid
+
+
 LOGIN_HTML = r"""
 <!doctype html>
 <html lang="en">
@@ -4954,8 +5209,17 @@ HTML = r"""
     body.read-only [data-save-office-po],
     body.read-only [data-save-cog],
     body.read-only [data-delete-cog],
+    body.read-only [data-save-mcc-item],
+    body.read-only [data-delete-mcc-item],
+    body.read-only [data-save-mcc-vfd-price],
+    body.read-only [data-delete-mcc-vfd-price],
+    body.read-only [data-upload-mcc-vfd-vendor-quote],
+    body.read-only [data-upload-mcc-vfd-filter-vendor-quote],
+    body.read-only [data-upload-mcc-vendor-quote],
     body.read-only #addRate,
     body.read-only #addCogCategory,
+    body.read-only #addMccQuoteItem,
+    body.read-only #addMccVfdPrice,
     body.read-only #saveTexasReminderRecipients,
     body.read-only #sendTexasReminderNow,
     body.read-only #saveBillingReminder,
@@ -5681,6 +5945,74 @@ HTML = r"""
         </div>
         <div class="muted" id="projectPoCount" style="margin-top:8px"></div>
         <div class="table-wrap" style="margin-top:10px"><table id="projectPoTable"></table></div>
+      </div>
+    </section>
+
+    <section id="mccQuotes" class="tab hidden">
+      <div class="panel">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
+          <div>
+            <h2>MCC Quote Builder</h2>
+            <p class="muted">Select what the customer needs and pricing will populate from the editable MCC catalog.</p>
+          </div>
+          <button class="btn" id="newMccQuote" type="button">New Quote</button>
+        </div>
+        <form id="mccQuoteForm">
+          <div class="grid cols-4">
+            <div><label>Customer</label><input name="customer" placeholder="Customer name" required></div>
+            <div><label>Project / Location</label><input name="project_name" placeholder="MCC building project"></div>
+            <div><label>Building Name</label><input name="building_name" placeholder="MCC Building 1"></div>
+            <div><label>Salesperson</label><input name="salesperson" placeholder="Salesperson"></div>
+          </div>
+          <div class="grid cols-4">
+            <div><label>Status</label><select name="status"><option>Draft</option><option>Presented</option><option>Accepted</option><option>Rejected</option></select></div>
+            <input name="markup_percent" id="mccQuoteMarkup" type="hidden" value="0">
+            <div style="grid-column:span 3"><label>Notes</label><input name="notes" placeholder="Scope notes or customer comments"></div>
+          </div>
+          <div class="grid cols-4" id="mccQuoteTotals" style="margin-top:12px"></div>
+          <div id="mccQuoteItems" style="margin-top:12px"></div>
+          <div class="actions">
+            <button class="btn primary" type="submit">Save Quote</button>
+            <button class="btn" id="updateMccQuotePricing" type="button">Update Pricing From Database</button>
+          </div>
+        </form>
+      </div>
+      <div class="panel" style="margin-top:14px">
+        <h2>Saved MCC Quotes</h2>
+        <div class="table-wrap"><table id="mccQuoteHistoryTable"></table></div>
+      </div>
+    </section>
+
+    <section id="mccQuoteSetup" class="tab hidden">
+      <div class="panel">
+        <h2>MCC Pricing Setup</h2>
+        <p class="muted">Maintain reusable pricing items used by the MCC Quote Builder. Update these as material, labor, or package pricing changes.</p>
+        <div class="grid cols-4">
+          <div><label>Category</label><input id="mccItemCategory" placeholder="Electrical"></div>
+          <div><label>Item Name</label><input id="mccItemName" placeholder="Additional MCC Section"></div>
+          <div><label>Unit</label><input id="mccItemUnit" placeholder="Each" value="Each"></div>
+          <div><label>Default Qty</label><input id="mccItemQty" type="number" step="0.01" value="1"></div>
+          <div><label>Base Unit Price</label><input id="mccItemPrice" type="number" step="0.01" value="0"></div>
+          <div><label>Markup %</label><input id="mccItemMarkup" type="number" step="0.01" value="0"></div>
+          <div><label>Sort Order</label><input id="mccItemSort" type="number" step="1" value="0"></div>
+          <div style="grid-column:span 2"><label>Description</label><input id="mccItemDescription" placeholder="What this option includes"></div>
+        </div>
+        <div class="actions"><button class="btn primary" id="addMccQuoteItem" type="button">Add Pricing Item</button></div>
+        <div class="table-wrap" style="margin-top:12px"><table id="mccQuoteItemTable"></table></div>
+      </div>
+      <div class="panel" style="margin-top:14px">
+        <h2>VFD Package Pricing</h2>
+        <p class="muted">Maintain VFD package pricing by horsepower and enclosure. The quote builder pulls these prices when VFD Package is selected.</p>
+        <div class="grid cols-4">
+          <div><label>Horsepower</label><input id="mccVfdHp" placeholder="25"></div>
+          <div><label>NEMA</label><select id="mccVfdNema"><option>NEMA 1</option><option>NEMA 3R</option></select></div>
+          <div><label>Base Unit Price</label><input id="mccVfdPrice" type="number" step="0.01" value="0"></div>
+          <div><label>Markup %</label><input id="mccVfdMarkup" type="number" step="0.01" value="0"></div>
+          <div><label>Filter Base Price</label><input id="mccVfdFilterUnitPrice" type="number" step="0.01" value="0"></div>
+          <div><label>Filter Markup %</label><input id="mccVfdFilterMarkupPercent" type="number" step="0.01" value="0"></div>
+        </div>
+        <div class="actions"><button class="btn primary" id="addMccVfdPrice" type="button">Add VFD Price</button></div>
+        <div class="table-wrap" style="margin-top:12px"><table id="mccVfdPriceTable"></table></div>
       </div>
     </section>
 
@@ -7272,9 +7604,18 @@ HTML = r"""
           const statusOptions = ['Pending Approval','Issued','Picked Up','Closed','Void'].map(statusOption => `<option ${po.status === statusOption ? 'selected' : ''}>${statusOption}</option>`).join('');
           const eventLines = [
             po.pickup_uploaded_at ? `Pickup uploaded ${String(po.pickup_uploaded_at).slice(0, 16).replace('T', ' ')}${po.pickup_uploaded_by_username ? ' by ' + po.pickup_uploaded_by_username : ''}` : '',
+            po.invoice_uploaded_at ? `Vendor invoice uploaded ${String(po.invoice_uploaded_at).slice(0, 16).replace('T', ' ')}${po.invoice_uploaded_by_username ? ' by ' + po.invoice_uploaded_by_username : ''}` : '',
             po.closed_at ? `Closed ${String(po.closed_at).slice(0, 16).replace('T', ' ')}${po.closed_by_username ? ' by ' + po.closed_by_username : ''}` : '',
             po.voided_at ? `Voided ${String(po.voided_at).slice(0, 16).replace('T', ' ')}${po.voided_by_username ? ' by ' + po.voided_by_username : ''}` : ''
           ].filter(Boolean).map(line => `<div class="muted">${htmlEscape(line)}</div>`).join('');
+          const invoiceBlock = po.invoice_file
+            ? `<div><a class="pdf-link" href="/uploads/${encodeURIComponent(po.invoice_file)}" target="_blank" rel="noopener">Vendor invoice</a></div>`
+            : '<div class="muted">No vendor invoice</div>';
+          const invoiceUpload = `<form class="pickup-upload" data-office-po-invoice="${po.id}" style="margin-top:8px">
+              <label style="margin-top:0">Upload vendor invoice</label>
+              <input name="invoice_file" type="file" accept=".pdf,.png,.jpg,.jpeg,.webp" required>
+              <button class="btn" type="submit">Upload Invoice</button>
+            </form>`;
           return `
           <tr>
             <td><strong>${htmlEscape(po.po_number || '')}</strong><div class="muted">${htmlEscape((po.created_at || '').slice(0, 16).replace('T', ' '))}</div></td>
@@ -7285,20 +7626,43 @@ HTML = r"""
             <td>${htmlEscape(po.requested_by_username || '')}</td>
             <td><select data-office-po-field="${po.id}" data-field="status">${statusOptions}</select>${eventLines}</td>
             <td><textarea data-office-po-field="${po.id}" data-field="close_reason" placeholder="Required when closing">${htmlEscape(po.close_reason || '')}</textarea><textarea data-office-po-field="${po.id}" data-field="void_reason" placeholder="Required when voiding" style="margin-top:6px">${htmlEscape(po.void_reason || '')}</textarea></td>
-            <td><textarea data-office-po-field="${po.id}" data-field="description">${htmlEscape(po.description || '')}</textarea>${po.attachment_file ? `<div><a class="pdf-link" href="/uploads/${encodeURIComponent(po.attachment_file)}" target="_blank" rel="noopener">Attachment</a></div>` : ''}${po.pickup_file ? `<div><a class="pdf-link" href="/uploads/${encodeURIComponent(po.pickup_file)}" target="_blank" rel="noopener">Pickup ticket</a></div>` : '<div class="muted">No pickup ticket</div>'}</td>
+            <td><textarea data-office-po-field="${po.id}" data-field="description">${htmlEscape(po.description || '')}</textarea>${po.attachment_file ? `<div><a class="pdf-link" href="/uploads/${encodeURIComponent(po.attachment_file)}" target="_blank" rel="noopener">Attachment</a></div>` : ''}${po.pickup_file ? `<div><a class="pdf-link" href="/uploads/${encodeURIComponent(po.pickup_file)}" target="_blank" rel="noopener">Pickup ticket</a></div>` : '<div class="muted">No pickup ticket</div>'}${invoiceBlock}${invoiceUpload}</td>
             <td class="actions-cell"><a class="btn" href="/po/${po.id}" target="_blank" rel="noopener">Open</a><button class="btn" data-save-office-po="${po.id}" type="button">Save</button>${state.currentUser?.role === 'Admin' ? `<button class="btn danger" data-delete-office-po="${po.id}" type="button">Delete</button>` : ''}</td>
           </tr>`;
         }).join('')}</tbody>`
         : '<tbody><tr><td>No POs match those filters.</td></tr></tbody>';
-      document.querySelectorAll(`#${config.tableId} [data-save-office-po]`).forEach(btn => btn.onclick = async () => {
-        const id = btn.dataset.saveOfficePo;
+      function collectOfficePoFields(id) {
         const fields = {};
         document.querySelectorAll(`#${config.tableId} [data-office-po-field="${id}"]`).forEach(el => fields[el.dataset.field] = el.value);
+        return fields;
+      }
+      document.querySelectorAll(`#${config.tableId} [data-save-office-po]`).forEach(btn => btn.onclick = async () => {
+        const id = btn.dataset.saveOfficePo;
+        const fields = collectOfficePoFields(id);
         await api(`/api/purchase-orders/${id}`, {
           method: 'PUT',
           body: JSON.stringify(fields)
         });
         await config.reload();
+      });
+      document.querySelectorAll(`#${config.tableId} [data-office-po-invoice]`).forEach(form => form.onsubmit = async event => {
+        event.preventDefault();
+        const id = form.dataset.officePoInvoice;
+        const fields = collectOfficePoFields(id);
+        const button = form.querySelector('button');
+        try {
+          if (button) button.textContent = 'Uploading...';
+          await api(`/api/purchase-orders/${id}`, {
+            method: 'PUT',
+            body: JSON.stringify(fields)
+          });
+          const data = new FormData(form);
+          await api(`/api/purchase-orders/${id}/invoice`, { method: 'POST', body: data });
+          await config.reload();
+        } catch (err) {
+          window.alert(err.message || 'Could not upload vendor invoice.');
+          if (button) button.textContent = 'Upload Invoice';
+        }
       });
       document.querySelectorAll(`#${config.tableId} [data-delete-office-po]`).forEach(btn => btn.onclick = async () => {
         const id = btn.dataset.deleteOfficePo;
@@ -9203,6 +9567,500 @@ HTML = r"""
       });
     }
 
+    let mccQuoteItems = [];
+    let mccSavedQuotes = [];
+    let mccVfdPrices = [];
+    let editingMccQuoteId = null;
+
+    function resetMccQuoteForm() {
+      const form = document.getElementById('mccQuoteForm');
+      if (!form) return;
+      editingMccQuoteId = null;
+      form.reset();
+      form.elements.status.value = 'Draft';
+      form.elements.markup_percent.value = '0';
+      renderMccQuoteItems();
+    }
+
+    async function loadMccQuoteBuilder() {
+      mccQuoteItems = await api('/api/mcc-quote-items');
+      mccVfdPrices = await api('/api/mcc-vfd-prices');
+      mccSavedQuotes = await api('/api/mcc-quotes');
+      renderMccQuoteItems();
+      renderMccQuoteHistory();
+      updateMccQuoteTotals();
+    }
+
+    const defaultVfdHorsepowerOptions = ['5','7.5','10','15','20','25','30','40','50','60','75','100','125','150','200','250','300'];
+    const vfdNemaOptions = ['NEMA 1', 'NEMA 3R'];
+    const isVfdMccItem = item => String(item.item_name || '').toLowerCase().includes('vfd');
+
+    function mccMarkedUpUnitPrice(item) {
+      return Number(item.unit_price || 0) * (1 + Number(item.markup_percent || 0) / 100);
+    }
+
+    const normalizeVfdHp = value => String(value || '').trim().replace(/\.0$/, '');
+    const normalizeVfdNema = value => String(value || 'NEMA 1').trim().toUpperCase().replace(/\s+/g, ' ');
+
+    function vfdHorsepowerOptions() {
+      const seen = new Set();
+      return [...defaultVfdHorsepowerOptions, ...mccVfdPrices.map(row => normalizeVfdHp(row.horsepower))]
+        .filter(Boolean)
+        .filter(hp => {
+          const key = normalizeVfdHp(hp);
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        })
+        .sort((a, b) => Number(a) - Number(b));
+    }
+
+    function mccVfdPriceFor(horsepower, nemaRating, fallbackPrice) {
+      const hp = normalizeVfdHp(horsepower);
+      const nema = normalizeVfdNema(nemaRating);
+      const price = mccVfdPrices.find(row =>
+        Number(row.active || 0) &&
+        normalizeVfdHp(row.horsepower) === hp &&
+        normalizeVfdNema(row.nema_rating) === nema
+      );
+      if (!price) return { unitPrice: fallbackPrice, markupPercent: 0, vendorQuoteFile: '', filterUnitPrice: 0, filterMarkupPercent: 0, filterVendorQuoteFile: '', missing: true };
+      return {
+        unitPrice: Number(price.unit_price || 0) * (1 + Number(price.markup_percent || 0) / 100),
+        markupPercent: Number(price.markup_percent || 0),
+        vendorQuoteFile: price.vendor_quote_file || '',
+        filterUnitPrice: Number(price.filter_unit_price || 0) * (1 + Number(price.filter_markup_percent || 0) / 100),
+        filterMarkupPercent: Number(price.filter_markup_percent || 0),
+        filterVendorQuoteFile: price.filter_vendor_quote_file || '',
+        missing: false,
+      };
+    }
+
+    function mccVfdDetailRow(item) {
+      if (!isVfdMccItem(item)) return '';
+      return `
+        <tr class="hidden" data-mcc-vfd-detail-row="${item.id}">
+          <td></td>
+          <td colspan="7">
+            <div class="panel soft-panel" style="margin:4px 0">
+              <strong>VFD horsepower schedule</strong>
+              <div class="muted">One drive line will be saved for each quantity. Price pulls from VFD Package Pricing.</div>
+              <div data-mcc-vfd-details="${item.id}" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;margin-top:8px"></div>
+            </div>
+          </td>
+        </tr>`;
+    }
+
+    function syncMccVfdDetailRows() {
+      mccQuoteItems.filter(isVfdMccItem).forEach(item => {
+        const included = document.querySelector(`[data-mcc-include="${item.id}"]`)?.checked;
+        const qty = Math.max(0, Math.floor(Number(document.querySelector(`[data-mcc-qty="${item.id}"]`)?.value || 0)));
+        const row = document.querySelector(`[data-mcc-vfd-detail-row="${item.id}"]`);
+        const target = document.querySelector(`[data-mcc-vfd-details="${item.id}"]`);
+        if (!row || !target) return;
+        row.classList.toggle('hidden', !included || qty < 1);
+        const existing = Array.from(target.querySelectorAll('[data-mcc-vfd-drive]')).map(block => ({
+          hp: block.querySelector('[data-mcc-vfd-hp]')?.value || vfdHorsepowerOptions()[0],
+          nema: block.querySelector('[data-mcc-vfd-nema]')?.value || vfdNemaOptions[0],
+          filterNeeded: block.querySelector('[data-mcc-vfd-filter]')?.value || 'No',
+        }));
+        target.innerHTML = Array.from({ length: qty }, (_, index) => {
+          const hpOptions = vfdHorsepowerOptions();
+          const value = existing[index] || { hp: hpOptions[0], nema: vfdNemaOptions[0], filterNeeded: 'No' };
+          return `
+            <div class="panel" data-mcc-vfd-drive="${item.id}" data-drive-index="${index}" style="padding:8px">
+              <label>Drive ${index + 1} HP
+                <select data-mcc-vfd-hp="${item.id}">
+                  ${hpOptions.map(option => `<option value="${option}" ${option === value.hp ? 'selected' : ''}>${option} HP</option>`).join('')}
+                </select>
+              </label>
+              <label>NEMA
+                <select data-mcc-vfd-nema="${item.id}">
+                  ${vfdNemaOptions.map(option => `<option value="${option}" ${option === value.nema ? 'selected' : ''}>${option}</option>`).join('')}
+                </select>
+              </label>
+              <label>Filter Needed
+                <select data-mcc-vfd-filter="${item.id}">
+                  <option value="No" ${value.filterNeeded !== 'Yes' ? 'selected' : ''}>No</option>
+                  <option value="Yes" ${value.filterNeeded === 'Yes' ? 'selected' : ''}>Yes</option>
+                </select>
+              </label>
+              <div class="muted" data-mcc-vfd-drive-price="${item.id}">$0.00</div>
+            </div>`;
+        }).join('');
+        target.querySelectorAll('select').forEach(select => select.onchange = updateMccQuoteTotals);
+      });
+    }
+
+    function renderMccQuoteItems() {
+      const target = document.getElementById('mccQuoteItems');
+      if (!target) return;
+      if (!mccQuoteItems.length) {
+        target.innerHTML = '<div class="muted">No MCC pricing items have been set up yet.</div>';
+        return;
+      }
+      const byCategory = {};
+      mccQuoteItems.forEach(item => {
+        const key = item.category || 'General';
+        if (!byCategory[key]) byCategory[key] = [];
+        byCategory[key].push(item);
+      });
+      target.innerHTML = Object.entries(byCategory).map(([category, items]) => `
+        <div class="panel soft-panel" style="margin-top:10px">
+          <h3>${htmlEscape(category)}</h3>
+          <div class="table-wrap"><table>
+            <thead><tr><th>Include</th><th>Item</th><th>Description</th><th>Vendor Quote</th><th>Qty</th><th>Unit</th><th>Unit Price</th><th>Total</th></tr></thead>
+            <tbody>${items.map(item => `
+              <tr data-mcc-quote-line="${item.id}">
+                <td><input data-mcc-include="${item.id}" type="checkbox" style="width:auto"></td>
+                <td><strong>${htmlEscape(item.item_name || '')}</strong></td>
+                <td>${htmlEscape(item.description || '')}</td>
+                <td>${item.vendor_quote_file ? pdfLink({ source_file: item.vendor_quote_file }) : '<span class="muted">Not attached</span>'}</td>
+                <td><input data-mcc-qty="${item.id}" type="number" step="${isVfdMccItem(item) ? '1' : '0.01'}" min="0" value="${Number(item.default_qty || 1)}"></td>
+                <td>${htmlEscape(item.unit_label || 'Each')}</td>
+                <td>${isVfdMccItem(item) ? `<span data-mcc-vfd-rollup-price="${item.id}">From schedule</span>` : `<input data-mcc-price="${item.id}" type="number" step="0.01" value="${mccMarkedUpUnitPrice(item).toFixed(2)}">`}</td>
+                <td data-mcc-line-total="${item.id}">$0.00</td>
+              </tr>
+              ${mccVfdDetailRow(item)}
+            `).join('')}</tbody>
+          </table></div>
+        </div>
+      `).join('');
+      target.querySelectorAll('input').forEach(input => {
+        input.oninput = updateMccQuoteTotals;
+        input.onchange = updateMccQuoteTotals;
+      });
+      updateMccQuoteTotals();
+    }
+
+    function selectedMccQuoteLines() {
+      return mccQuoteItems.flatMap(item => {
+        const included = document.querySelector(`[data-mcc-include="${item.id}"]`)?.checked;
+        const qty = Number(document.querySelector(`[data-mcc-qty="${item.id}"]`)?.value || 0);
+        const unitPrice = Number(document.querySelector(`[data-mcc-price="${item.id}"]`)?.value || 0);
+        const markupPercent = Number(item.markup_percent || 0);
+        if (isVfdMccItem(item) && included && Math.floor(qty) > 0) {
+          return Array.from(document.querySelectorAll(`[data-mcc-vfd-drive="${item.id}"]`)).map((block, index) => {
+            const hp = block.querySelector('[data-mcc-vfd-hp]')?.value || '';
+            const nema = block.querySelector('[data-mcc-vfd-nema]')?.value || 'NEMA 1';
+            const filterNeeded = block.querySelector('[data-mcc-vfd-filter]')?.value === 'Yes';
+            const price = mccVfdPriceFor(hp, nema, mccMarkedUpUnitPrice(item));
+            const unitPriceWithAdder = price.unitPrice + (filterNeeded ? price.filterUnitPrice : 0);
+            return {
+              quote_item_id: item.id,
+              category: item.category,
+              item_name: `${item.item_name} - ${hp} HP ${nema}${filterNeeded ? ' With Filter' : ''}`,
+              description: `${item.description || ''} Drive ${index + 1}: ${hp} HP ${nema}${filterNeeded ? ' with filter' : ''}${price.missing ? ' (price fallback used)' : ''}`.trim(),
+              unit_label: item.unit_label,
+              vendor_quote_file: price.vendorQuoteFile || item.vendor_quote_file || '',
+              qty: 1,
+              unit_price: unitPriceWithAdder,
+              markup_percent: price.markupPercent,
+              line_total: unitPriceWithAdder,
+              included: true,
+            };
+          });
+        }
+        const lineTotal = qty * unitPrice;
+        return {
+          quote_item_id: item.id,
+          category: item.category,
+          item_name: item.item_name,
+          description: item.description,
+          unit_label: item.unit_label,
+          vendor_quote_file: item.vendor_quote_file || '',
+          qty,
+          unit_price: unitPrice,
+          markup_percent: markupPercent,
+          line_total: lineTotal,
+          included,
+        };
+      }).filter(line => line.included && Math.abs(line.qty) > 0);
+    }
+
+    function parseSavedVfdLine(line) {
+      const text = `${line.item_name || ''} ${line.description || ''}`;
+      const hpMatch = text.match(/-\s*([0-9.]+)\s*HP/i) || text.match(/Drive\s+\d+:\s*([0-9.]+)\s*HP/i);
+      const nemaMatch = text.match(/NEMA\s*3R/i) || text.match(/NEMA\s*1/i);
+      return {
+        hp: hpMatch ? normalizeVfdHp(hpMatch[1]) : vfdHorsepowerOptions()[0],
+        nema: nemaMatch ? normalizeVfdNema(nemaMatch[0]).replace('NEMA ', 'NEMA ') : 'NEMA 1',
+        filterNeeded: /with filter/i.test(text) ? 'Yes' : 'No',
+      };
+    }
+
+    function applyMccQuoteToForm(quote, useLatestPricing=false) {
+      const form = document.getElementById('mccQuoteForm');
+      if (!form) return;
+      editingMccQuoteId = quote.id || null;
+      ['customer','project_name','building_name','salesperson','status','notes','markup_percent'].forEach(name => {
+        if (form.elements[name]) form.elements[name].value = quote[name] ?? '';
+      });
+      renderMccQuoteItems();
+      const linesByItem = {};
+      (quote.lines || []).forEach(line => {
+        const key = String(line.quote_item_id || '');
+        if (!linesByItem[key]) linesByItem[key] = [];
+        linesByItem[key].push(line);
+      });
+      mccQuoteItems.forEach(item => {
+        const itemLines = linesByItem[String(item.id)] || [];
+        if (!itemLines.length) return;
+        const includeEl = document.querySelector(`[data-mcc-include="${item.id}"]`);
+        const qtyEl = document.querySelector(`[data-mcc-qty="${item.id}"]`);
+        const priceEl = document.querySelector(`[data-mcc-price="${item.id}"]`);
+        if (includeEl) includeEl.checked = true;
+        if (isVfdMccItem(item)) {
+          if (qtyEl) qtyEl.value = itemLines.length;
+          syncMccVfdDetailRows();
+          const blocks = Array.from(document.querySelectorAll(`[data-mcc-vfd-drive="${item.id}"]`));
+          itemLines.forEach((line, index) => {
+            const block = blocks[index];
+            if (!block) return;
+            const parsed = parseSavedVfdLine(line);
+            const hpEl = block.querySelector('[data-mcc-vfd-hp]');
+            const nemaEl = block.querySelector('[data-mcc-vfd-nema]');
+            const filterEl = block.querySelector('[data-mcc-vfd-filter]');
+            if (hpEl) hpEl.value = parsed.hp;
+            if (nemaEl) nemaEl.value = parsed.nema;
+            if (filterEl) filterEl.value = parsed.filterNeeded;
+          });
+        } else {
+          const line = itemLines[0];
+          if (qtyEl) qtyEl.value = Number(line.qty || 0);
+          if (priceEl && !useLatestPricing) priceEl.value = Number(line.unit_price || 0).toFixed(2);
+          if (priceEl && useLatestPricing) priceEl.value = mccMarkedUpUnitPrice(item).toFixed(2);
+        }
+      });
+      if (useLatestPricing) {
+        updateMccQuoteTotals();
+      } else {
+        updateMccQuoteTotals();
+        (quote.lines || []).forEach(line => {
+          if (!line.quote_item_id) return;
+          const totalEl = document.querySelector(`[data-mcc-line-total="${line.quote_item_id}"]`);
+          if (totalEl && !isVfdMccItem(mccQuoteItems.find(item => String(item.id) === String(line.quote_item_id)) || {})) {
+            const itemTotal = (linesByItem[String(line.quote_item_id)] || []).reduce((sum, row) => sum + Number(row.line_total || 0), 0);
+            totalEl.textContent = money(itemTotal);
+          }
+        });
+      }
+    }
+
+    async function editMccQuote(id) {
+      const quote = await api(`/api/mcc-quotes/${id}`);
+      applyMccQuoteToForm(quote, false);
+      window.scrollTo({ top: document.getElementById('mccQuotes').offsetTop, behavior: 'smooth' });
+    }
+
+    function updateMccQuoteTotals() {
+      syncMccVfdDetailRows();
+      mccQuoteItems.forEach(item => {
+        const rawQty = Number(document.querySelector(`[data-mcc-qty="${item.id}"]`)?.value || 0);
+        const qty = isVfdMccItem(item) ? Math.floor(rawQty) : rawQty;
+        const unitPrice = Number(document.querySelector(`[data-mcc-price="${item.id}"]`)?.value || 0);
+        const totalEl = document.querySelector(`[data-mcc-line-total="${item.id}"]`);
+        if (isVfdMccItem(item)) {
+          const driveBlocks = Array.from(document.querySelectorAll(`[data-mcc-vfd-drive="${item.id}"]`));
+          const total = driveBlocks.reduce((sum, block) => {
+            const hp = block.querySelector('[data-mcc-vfd-hp]')?.value || '';
+            const nema = block.querySelector('[data-mcc-vfd-nema]')?.value || 'NEMA 1';
+            const filterNeeded = block.querySelector('[data-mcc-vfd-filter]')?.value === 'Yes';
+            const price = mccVfdPriceFor(hp, nema, mccMarkedUpUnitPrice(item));
+            const unitPriceWithAdder = price.unitPrice + (filterNeeded ? price.filterUnitPrice : 0);
+            const priceEl = block.querySelector('[data-mcc-vfd-drive-price]');
+            if (priceEl) priceEl.textContent = `${money(unitPriceWithAdder)}${filterNeeded ? ' incl. filter' : ''}${price.missing ? ' fallback' : ''}`;
+            return sum + unitPriceWithAdder;
+          }, 0);
+          const rollupEl = document.querySelector(`[data-mcc-vfd-rollup-price="${item.id}"]`);
+          if (rollupEl) rollupEl.textContent = driveBlocks.length ? 'From schedule' : 'From schedule';
+          if (totalEl) totalEl.textContent = money(total);
+        } else if (totalEl) totalEl.textContent = money(qty * unitPrice);
+      });
+      const lines = selectedMccQuoteLines();
+      const subtotal = lines.reduce((sum, line) => sum + Number(line.line_total || 0), 0);
+      const markupPercent = Number(document.getElementById('mccQuoteMarkup')?.value || 0);
+      const markupAmount = subtotal * (markupPercent / 100);
+      const total = subtotal + markupAmount;
+      const target = document.getElementById('mccQuoteTotals');
+      if (target) {
+        target.innerHTML = `
+          <div class="panel kpi"><div class="label">Selected Items</div><div class="value">${lines.length}</div></div>
+          <div class="panel kpi"><div class="label">Subtotal</div><div class="value">${money(subtotal)}</div></div>
+          <div class="panel kpi"><div class="label">Quote Total</div><div class="value">${money(total)}</div></div>`;
+      }
+      return { subtotal, markupPercent, total, lines };
+    }
+
+    function renderMccQuoteHistory() {
+      const tableEl = document.getElementById('mccQuoteHistoryTable');
+      if (!tableEl) return;
+      tableEl.innerHTML = mccSavedQuotes.length ? `
+        <thead><tr><th>Quote #</th><th>Customer</th><th>Project</th><th>Building</th><th>Status</th><th>Total</th><th>Created</th><th></th></tr></thead>
+        <tbody>${mccSavedQuotes.map(q => `<tr>
+          <td><strong>${htmlEscape(q.quote_number || '')}</strong></td>
+          <td>${htmlEscape(q.customer || '')}</td>
+          <td>${htmlEscape(q.project_name || '')}</td>
+          <td>${htmlEscape(q.building_name || '')}</td>
+          <td>${htmlEscape(q.status || '')}</td>
+          <td>${money(q.total)}</td>
+          <td>${htmlEscape((q.created_at || '').replace('T', ' '))}</td>
+          <td><button class="btn" data-edit-mcc-quote="${q.id}" type="button">Edit</button></td>
+        </tr>`).join('')}</tbody>`
+        : '<tbody><tr><td>No MCC quotes saved yet.</td></tr></tbody>';
+      tableEl.querySelectorAll('[data-edit-mcc-quote]').forEach(btn => btn.onclick = () => editMccQuote(btn.dataset.editMccQuote));
+    }
+
+    async function loadMccQuoteSetup() {
+      const tableEl = document.getElementById('mccQuoteItemTable');
+      if (!tableEl) return;
+      const items = await api('/api/mcc-quote-items?include_inactive=1');
+      if (!items.length) {
+        tableEl.innerHTML = '<tbody><tr><td>No MCC pricing items have been set up yet.</td></tr></tbody>';
+        await loadMccVfdPricingSetup();
+        return;
+      }
+      tableEl.innerHTML = `
+        <thead><tr><th>Category</th><th>Item</th><th>Description</th><th>Vendor Quote</th><th>Unit</th><th>Default Qty</th><th>Base Unit Price</th><th>Markup %</th><th>Last Pricing Update</th><th>Sort</th><th>Active</th><th></th></tr></thead>
+        <tbody>${items.map(item => `<tr>
+          <td><input data-mcc-item="${item.id}" data-field="category" value="${htmlEscape(item.category || '')}"></td>
+          <td><input data-mcc-item="${item.id}" data-field="item_name" value="${htmlEscape(item.item_name || '')}"></td>
+          <td><input data-mcc-item="${item.id}" data-field="description" value="${htmlEscape(item.description || '')}"></td>
+          <td>
+            <div>${item.vendor_quote_file ? pdfLink({ source_file: item.vendor_quote_file }) : '<span class="muted">No file</span>'}</div>
+            <input data-mcc-vendor-file="${item.id}" type="file" accept=".pdf,.png,.jpg,.jpeg,.webp">
+            <button class="btn" data-upload-mcc-vendor-quote="${item.id}" type="button">Upload</button>
+          </td>
+          <td><input data-mcc-item="${item.id}" data-field="unit_label" value="${htmlEscape(item.unit_label || 'Each')}"></td>
+          <td><input data-mcc-item="${item.id}" data-field="default_qty" type="number" step="0.01" value="${Number(item.default_qty || 1)}"></td>
+          <td><input data-mcc-item="${item.id}" data-field="unit_price" type="number" step="0.01" value="${Number(item.unit_price || 0).toFixed(2)}"></td>
+          <td><input data-mcc-item="${item.id}" data-field="markup_percent" type="number" step="0.01" value="${Number(item.markup_percent || 0).toFixed(2)}"></td>
+          <td>${htmlEscape((item.pricing_updated_at || '').replace('T', ' ')) || '<span class="muted">Not recorded</span>'}</td>
+          <td><input data-mcc-item="${item.id}" data-field="sort_order" type="number" step="1" value="${Number(item.sort_order || 0)}"></td>
+          <td><select data-mcc-item="${item.id}" data-field="active"><option value="1" ${Number(item.active || 0) ? 'selected' : ''}>Active</option><option value="0" ${!Number(item.active || 0) ? 'selected' : ''}>Inactive</option></select></td>
+          <td>
+            <button class="btn" data-save-mcc-item="${item.id}" type="button">Save</button>
+            <button class="btn danger" data-delete-mcc-item="${item.id}" type="button">Delete</button>
+          </td>
+        </tr>`).join('')}</tbody>`;
+      tableEl.querySelectorAll('[data-save-mcc-item]').forEach(btn => btn.onclick = async () => {
+        const id = btn.dataset.saveMccItem;
+        const data = {};
+        tableEl.querySelectorAll(`[data-mcc-item="${id}"]`).forEach(el => data[el.dataset.field] = el.value);
+        await api(`/api/mcc-quote-items/${id}`, { method:'PUT', body: JSON.stringify(data) });
+        markSaved();
+        await loadMccQuoteSetup();
+      });
+      tableEl.querySelectorAll('[data-delete-mcc-item]').forEach(btn => btn.onclick = async () => {
+        const id = btn.dataset.deleteMccItem;
+        const itemName = tableEl.querySelector(`[data-mcc-item="${id}"][data-field="item_name"]`)?.value || 'this pricing item';
+        if (!window.confirm(`Delete ${itemName}?`)) return;
+        await api(`/api/mcc-quote-items/${id}`, { method:'DELETE' });
+        markSaved();
+        await loadMccQuoteSetup();
+        if (document.getElementById('mccQuotes') && !document.getElementById('mccQuotes').classList.contains('hidden')) {
+          await loadMccQuoteBuilder();
+        }
+      });
+      tableEl.querySelectorAll('[data-upload-mcc-vendor-quote]').forEach(btn => btn.onclick = async () => {
+        const id = btn.dataset.uploadMccVendorQuote;
+        const input = tableEl.querySelector(`[data-mcc-vendor-file="${id}"]`);
+        if (!input?.files?.length) {
+          window.alert('Choose a vendor quote file first.');
+          return;
+        }
+        const formData = new FormData();
+        formData.append('file', input.files[0]);
+        await api(`/api/mcc-quote-items/${id}/vendor-quote`, { method:'POST', body: formData });
+        markSaved();
+        await loadMccQuoteSetup();
+      });
+      await loadMccVfdPricingSetup();
+    }
+
+    async function loadMccVfdPricingSetup() {
+      const tableEl = document.getElementById('mccVfdPriceTable');
+      if (!tableEl) return;
+      mccVfdPrices = await api('/api/mcc-vfd-prices?include_inactive=1');
+      await loadMccVfdFilterPricingSetup();
+      if (!mccVfdPrices.length) {
+        tableEl.innerHTML = '<tbody><tr><td>No VFD package pricing has been set up yet.</td></tr></tbody>';
+        return;
+      }
+      tableEl.innerHTML = `
+        <thead><tr><th>Horsepower</th><th>NEMA</th><th>Drive Vendor Quote</th><th>Drive Base Price</th><th>Drive Markup %</th><th>Drive Final</th><th>Filter Base Price</th><th>Filter Markup %</th><th>Filter Vendor Quote</th><th>Filter Final</th><th>Last Pricing Update</th><th>Active</th><th></th></tr></thead>
+        <tbody>${mccVfdPrices.map(row => {
+          const finalPrice = Number(row.unit_price || 0) * (1 + Number(row.markup_percent || 0) / 100);
+          const filterFinalPrice = Number(row.filter_unit_price || 0) * (1 + Number(row.filter_markup_percent || 0) / 100);
+          return `<tr>
+            <td><input data-mcc-vfd-price="${row.id}" data-field="horsepower" value="${htmlEscape(row.horsepower || '')}"></td>
+            <td><select data-mcc-vfd-price="${row.id}" data-field="nema_rating">${vfdNemaOptions.map(option => `<option value="${option}" ${normalizeVfdNema(row.nema_rating) === normalizeVfdNema(option) ? 'selected' : ''}>${option}</option>`).join('')}</select></td>
+            <td>
+              <div>${row.vendor_quote_file ? pdfLink({ source_file: row.vendor_quote_file }) : '<span class="muted">No file</span>'}</div>
+              <input data-mcc-vfd-vendor-file="${row.id}" type="file" accept=".pdf,.png,.jpg,.jpeg,.webp">
+              <button class="btn" data-upload-mcc-vfd-vendor-quote="${row.id}" type="button">Upload</button>
+            </td>
+            <td><input data-mcc-vfd-price="${row.id}" data-field="unit_price" type="number" step="0.01" value="${Number(row.unit_price || 0).toFixed(2)}"></td>
+            <td><input data-mcc-vfd-price="${row.id}" data-field="markup_percent" type="number" step="0.01" value="${Number(row.markup_percent || 0).toFixed(2)}"></td>
+            <td>${money(finalPrice)}</td>
+            <td><input data-mcc-vfd-price="${row.id}" data-field="filter_unit_price" type="number" step="0.01" value="${Number(row.filter_unit_price || 0).toFixed(2)}"></td>
+            <td><input data-mcc-vfd-price="${row.id}" data-field="filter_markup_percent" type="number" step="0.01" value="${Number(row.filter_markup_percent || 0).toFixed(2)}"></td>
+            <td>
+              <div>${row.filter_vendor_quote_file ? pdfLink({ source_file: row.filter_vendor_quote_file }) : '<span class="muted">No file</span>'}</div>
+              <input data-mcc-vfd-filter-vendor-file="${row.id}" type="file" accept=".pdf,.png,.jpg,.jpeg,.webp">
+              <button class="btn" data-upload-mcc-vfd-filter-vendor-quote="${row.id}" type="button">Upload</button>
+            </td>
+            <td>${money(filterFinalPrice)}</td>
+            <td>${htmlEscape((row.pricing_updated_at || '').replace('T', ' ')) || '<span class="muted">Not recorded</span>'}</td>
+            <td><select data-mcc-vfd-price="${row.id}" data-field="active"><option value="1" ${Number(row.active || 0) ? 'selected' : ''}>Active</option><option value="0" ${!Number(row.active || 0) ? 'selected' : ''}>Inactive</option></select></td>
+            <td>
+              <button class="btn" data-save-mcc-vfd-price="${row.id}" type="button">Save</button>
+              <button class="btn danger" data-delete-mcc-vfd-price="${row.id}" type="button">Delete</button>
+            </td>
+          </tr>`;
+        }).join('')}</tbody>`;
+      tableEl.querySelectorAll('[data-save-mcc-vfd-price]').forEach(btn => btn.onclick = async () => {
+        const id = btn.dataset.saveMccVfdPrice;
+        const data = {};
+        tableEl.querySelectorAll(`[data-mcc-vfd-price="${id}"]`).forEach(el => data[el.dataset.field] = el.value);
+        await api(`/api/mcc-vfd-prices/${id}`, { method:'PUT', body: JSON.stringify(data) });
+        markSaved();
+        await loadMccVfdPricingSetup();
+      });
+      tableEl.querySelectorAll('[data-upload-mcc-vfd-vendor-quote]').forEach(btn => btn.onclick = async () => {
+        const id = btn.dataset.uploadMccVfdVendorQuote;
+        const input = tableEl.querySelector(`[data-mcc-vfd-vendor-file="${id}"]`);
+        if (!input?.files?.length) {
+          window.alert('Choose a vendor quote file first.');
+          return;
+        }
+        const formData = new FormData();
+        formData.append('file', input.files[0]);
+        await api(`/api/mcc-vfd-prices/${id}/vendor-quote`, { method:'POST', body: formData });
+        markSaved();
+        await loadMccVfdPricingSetup();
+      });
+      tableEl.querySelectorAll('[data-upload-mcc-vfd-filter-vendor-quote]').forEach(btn => btn.onclick = async () => {
+        const id = btn.dataset.uploadMccVfdFilterVendorQuote;
+        const input = tableEl.querySelector(`[data-mcc-vfd-filter-vendor-file="${id}"]`);
+        if (!input?.files?.length) {
+          window.alert('Choose a filter vendor quote file first.');
+          return;
+        }
+        const formData = new FormData();
+        formData.append('file', input.files[0]);
+        await api(`/api/mcc-vfd-prices/${id}/filter-vendor-quote`, { method:'POST', body: formData });
+        markSaved();
+        await loadMccVfdPricingSetup();
+      });
+      tableEl.querySelectorAll('[data-delete-mcc-vfd-price]').forEach(btn => btn.onclick = async () => {
+        const id = btn.dataset.deleteMccVfdPrice;
+        if (!window.confirm('Delete this VFD package price?')) return;
+        await api(`/api/mcc-vfd-prices/${id}`, { method:'DELETE' });
+        markSaved();
+        await loadMccVfdPricingSetup();
+      });
+    }
+
     async function loadBidDashboard() {
       const summary = await api('/api/bid-summary');
       document.getElementById('bidKpis').innerHTML = `
@@ -9756,6 +10614,40 @@ HTML = r"""
       await refresh();
       openTab('billing');
     };
+    document.getElementById('newMccQuote').onclick = resetMccQuoteForm;
+    document.getElementById('mccQuoteMarkup').oninput = updateMccQuoteTotals;
+    document.getElementById('updateMccQuotePricing').onclick = async () => {
+      if (!editingMccQuoteId) {
+        window.alert('Open a saved quote first, then update pricing from the database.');
+        return;
+      }
+      const quote = await api(`/api/mcc-quotes/${editingMccQuoteId}`);
+      applyMccQuoteToForm(quote, true);
+      window.alert('Pricing has been refreshed from the current setup. Click Save Quote to keep the update.');
+    };
+    document.getElementById('mccQuoteForm').onsubmit = async e => {
+      e.preventDefault();
+      const form = e.target;
+      const totals = updateMccQuoteTotals();
+      if (!totals.lines.length) {
+        window.alert('Select at least one MCC pricing item.');
+        return;
+      }
+      await api(editingMccQuoteId ? `/api/mcc-quotes/${editingMccQuoteId}` : '/api/mcc-quotes', {
+        method: editingMccQuoteId ? 'PUT' : 'POST',
+        body: JSON.stringify({
+          ...formDataObj(form),
+          subtotal: totals.subtotal,
+          markup_percent: totals.markupPercent,
+          total: totals.total,
+          lines: totals.lines,
+        })
+      });
+      editingMccQuoteId = null;
+      form.reset();
+      markSaved();
+      await loadMccQuoteBuilder();
+    };
     document.getElementById('bidForm').onsubmit = async e => {
       e.preventDefault();
       await api('/api/bids', { method:'POST', body: JSON.stringify(formDataObj(e.target)) });
@@ -9863,6 +10755,50 @@ HTML = r"""
       jobOrderReportRows = await api('/api/job-order-report');
       loadCogCategoryEditor();
       renderFieldPoJobChoices(document.getElementById('fieldPoJobSearch')?.value || '');
+    };
+    document.getElementById('addMccQuoteItem').onclick = async () => {
+      await api('/api/mcc-quote-items', {
+        method: 'POST',
+        body: JSON.stringify({
+          category: document.getElementById('mccItemCategory').value,
+          item_name: document.getElementById('mccItemName').value,
+          description: document.getElementById('mccItemDescription').value,
+          unit_label: document.getElementById('mccItemUnit').value,
+          default_qty: document.getElementById('mccItemQty').value,
+          unit_price: document.getElementById('mccItemPrice').value,
+          markup_percent: document.getElementById('mccItemMarkup').value,
+          sort_order: document.getElementById('mccItemSort').value,
+        })
+      });
+      ['mccItemCategory','mccItemName','mccItemDescription'].forEach(id => document.getElementById(id).value = '');
+      document.getElementById('mccItemUnit').value = 'Each';
+      document.getElementById('mccItemQty').value = '1';
+      document.getElementById('mccItemPrice').value = '0';
+      document.getElementById('mccItemMarkup').value = '0';
+      document.getElementById('mccItemSort').value = '0';
+      markSaved();
+      await loadMccQuoteSetup();
+    };
+    document.getElementById('addMccVfdPrice').onclick = async () => {
+      await api('/api/mcc-vfd-prices', {
+        method: 'POST',
+        body: JSON.stringify({
+          horsepower: document.getElementById('mccVfdHp').value,
+          nema_rating: document.getElementById('mccVfdNema').value,
+          unit_price: document.getElementById('mccVfdPrice').value,
+          markup_percent: document.getElementById('mccVfdMarkup').value,
+          filter_unit_price: document.getElementById('mccVfdFilterUnitPrice').value,
+          filter_markup_percent: document.getElementById('mccVfdFilterMarkupPercent').value,
+        })
+      });
+      document.getElementById('mccVfdHp').value = '';
+      document.getElementById('mccVfdNema').value = 'NEMA 1';
+      document.getElementById('mccVfdPrice').value = '0';
+      document.getElementById('mccVfdMarkup').value = '0';
+      document.getElementById('mccVfdFilterUnitPrice').value = '0';
+      document.getElementById('mccVfdFilterMarkupPercent').value = '0';
+      markSaved();
+      await loadMccVfdPricingSetup();
     };
     document.getElementById('importVendorInvoice').onclick = async () => {
       const fileInput = document.getElementById('vendorInvoiceFile');
@@ -10177,6 +11113,51 @@ class Handler(BaseHTTPRequestHandler):
                 return json_response(self, home_alerts())
             if parsed.path == "/api/bid-summary":
                 return json_response(self, bid_summary())
+            if parsed.path == "/api/mcc-quote-items":
+                if not can_view_permission(user, "mcc_quotes") and not can_view_permission(user, "mcc_quote_setup"):
+                    return json_response(self, {"error": "Quoting access required."}, 403)
+                include_inactive = qs.get("include_inactive", [""])[0] == "1"
+                sql = "SELECT * FROM mcc_quote_items"
+                if not include_inactive:
+                    sql += " WHERE COALESCE(active, 1) = 1"
+                sql += " ORDER BY sort_order, category, item_name"
+                return json_response(self, rows(sql))
+            if parsed.path == "/api/mcc-vfd-prices":
+                if not can_view_permission(user, "mcc_quotes") and not can_view_permission(user, "mcc_quote_setup"):
+                    return json_response(self, {"error": "Quoting access required."}, 403)
+                include_inactive = qs.get("include_inactive", [""])[0] == "1"
+                sql = "SELECT * FROM mcc_vfd_prices"
+                if not include_inactive:
+                    sql += " WHERE COALESCE(active, 1) = 1"
+                sql += " ORDER BY CAST(horsepower AS REAL), nema_rating"
+                return json_response(self, rows(sql))
+            if parsed.path == "/api/mcc-vfd-filter-price":
+                if not can_view_permission(user, "mcc_quotes") and not can_view_permission(user, "mcc_quote_setup"):
+                    return json_response(self, {"error": "Quoting access required."}, 403)
+                return json_response(self, one("SELECT * FROM mcc_vfd_filter_prices WHERE id = 1") or {})
+            if parsed.path == "/api/mcc-quotes":
+                if not can_view_permission(user, "mcc_quotes"):
+                    return json_response(self, {"error": "Quoting access required."}, 403)
+                return json_response(
+                    self,
+                    rows(
+                        """
+                        SELECT *
+                        FROM mcc_quotes
+                        ORDER BY created_at DESC, id DESC
+                        LIMIT 100
+                        """
+                    ),
+                )
+            if parsed.path.startswith("/api/mcc-quotes/"):
+                if not can_view_permission(user, "mcc_quotes"):
+                    return json_response(self, {"error": "Quoting access required."}, 403)
+                quote_id = parsed.path.rsplit("/", 1)[-1]
+                quote = one("SELECT * FROM mcc_quotes WHERE id = ?", (quote_id,))
+                if not quote:
+                    return json_response(self, {"error": "MCC quote not found."}, 404)
+                quote["lines"] = rows("SELECT * FROM mcc_quote_lines WHERE quote_id = ? ORDER BY id", (quote_id,))
+                return json_response(self, quote)
             if parsed.path == "/api/texas-financial-summary":
                 return json_response(self, texas_financial_summary())
             if parsed.path == "/api/texas-upload-reminders":
@@ -10390,6 +11371,117 @@ class Handler(BaseHTTPRequestHandler):
                 with db() as con:
                     con.execute("DELETE FROM user_sessions WHERE user_id = ? AND session_token <> ?", (user["id"], token or ""))
                 return json_response(self, {"ok": True})
+            if parsed.path.startswith("/api/mcc-quote-items/") and parsed.path.endswith("/vendor-quote"):
+                actor = current_user(self)
+                if not can_edit_permission(actor, "mcc_quote_setup"):
+                    return json_response(self, {"error": "MCC pricing setup edit access required."}, 403)
+                item_id = parsed.path.split("/")[-2]
+                form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": self.headers.get("Content-Type")})
+                file_item = form["file"] if "file" in form else None
+                if file_item is None or not getattr(file_item, "filename", ""):
+                    return json_response(self, {"error": "Choose a vendor quote file."}, 400)
+                safe_name = Path(file_item.filename).name
+                suffix = Path(safe_name).suffix.lower()
+                if suffix not in (".pdf", ".png", ".jpg", ".jpeg", ".webp"):
+                    return json_response(self, {"error": "Vendor quote must be a PDF or image."}, 400)
+                now = datetime.now().isoformat(timespec="seconds")
+                saved_name = f"{datetime.now().strftime('%Y%m%d%H%M%S')}-mcc-vendor-quote-{safe_name}"
+                path = UPLOAD_DIR / saved_name
+                with db() as con:
+                    item = con.execute("SELECT id, category, item_name FROM mcc_quote_items WHERE id = ?", (item_id,)).fetchone()
+                    if not item:
+                        return json_response(self, {"error": "MCC pricing item not found."}, 404)
+                    with open(path, "wb") as f:
+                        f.write(file_item.file.read())
+                    con.execute(
+                        "UPDATE mcc_quote_items SET vendor_quote_file = ?, vendor_quote_uploaded_at = ?, pricing_updated_at = ?, updated_at = ? WHERE id = ?",
+                        (saved_name, now, now, now, item_id),
+                    )
+                    log_activity(actor, "uploaded MCC vendor quote", "Quoting", f"{item['category']} / {item['item_name']}", {"file": saved_name})
+                return json_response(self, {"ok": True, "vendor_quote_file": saved_name})
+            if parsed.path.startswith("/api/mcc-vfd-prices/") and parsed.path.endswith("/vendor-quote"):
+                actor = current_user(self)
+                if not can_edit_permission(actor, "mcc_quote_setup"):
+                    return json_response(self, {"error": "MCC pricing setup edit access required."}, 403)
+                price_id = parsed.path.split("/")[-2]
+                form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": self.headers.get("Content-Type")})
+                file_item = form["file"] if "file" in form else None
+                if file_item is None or not getattr(file_item, "filename", ""):
+                    return json_response(self, {"error": "Choose a vendor quote file."}, 400)
+                safe_name = Path(file_item.filename).name
+                suffix = Path(safe_name).suffix.lower()
+                if suffix not in (".pdf", ".png", ".jpg", ".jpeg", ".webp"):
+                    return json_response(self, {"error": "Vendor quote must be a PDF or image."}, 400)
+                now = datetime.now().isoformat(timespec="seconds")
+                saved_name = f"{datetime.now().strftime('%Y%m%d%H%M%S')}-mcc-vfd-vendor-quote-{safe_name}"
+                path = UPLOAD_DIR / saved_name
+                with db() as con:
+                    price = con.execute("SELECT id, horsepower, nema_rating FROM mcc_vfd_prices WHERE id = ?", (price_id,)).fetchone()
+                    if not price:
+                        return json_response(self, {"error": "VFD package price not found."}, 404)
+                    with open(path, "wb") as f:
+                        f.write(file_item.file.read())
+                    con.execute(
+                        "UPDATE mcc_vfd_prices SET vendor_quote_file = ?, vendor_quote_uploaded_at = ?, pricing_updated_at = ?, updated_at = ? WHERE id = ?",
+                        (saved_name, now, now, now, price_id),
+                    )
+                    log_activity(actor, "uploaded VFD vendor quote", "Quoting", f"{price['horsepower']} HP {price['nema_rating']}", {"file": saved_name})
+                return json_response(self, {"ok": True, "vendor_quote_file": saved_name})
+            if parsed.path.startswith("/api/mcc-vfd-prices/") and parsed.path.endswith("/filter-vendor-quote"):
+                actor = current_user(self)
+                if not can_edit_permission(actor, "mcc_quote_setup"):
+                    return json_response(self, {"error": "MCC pricing setup edit access required."}, 403)
+                price_id = parsed.path.split("/")[-2]
+                form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": self.headers.get("Content-Type")})
+                file_item = form["file"] if "file" in form else None
+                if file_item is None or not getattr(file_item, "filename", ""):
+                    return json_response(self, {"error": "Choose a filter vendor quote file."}, 400)
+                safe_name = Path(file_item.filename).name
+                suffix = Path(safe_name).suffix.lower()
+                if suffix not in (".pdf", ".png", ".jpg", ".jpeg", ".webp"):
+                    return json_response(self, {"error": "Vendor quote must be a PDF or image."}, 400)
+                now = datetime.now().isoformat(timespec="seconds")
+                saved_name = f"{datetime.now().strftime('%Y%m%d%H%M%S')}-mcc-vfd-filter-vendor-quote-{safe_name}"
+                path = UPLOAD_DIR / saved_name
+                with db() as con:
+                    price = con.execute("SELECT id, horsepower, nema_rating FROM mcc_vfd_prices WHERE id = ?", (price_id,)).fetchone()
+                    if not price:
+                        return json_response(self, {"error": "VFD package price not found."}, 404)
+                    with open(path, "wb") as f:
+                        f.write(file_item.file.read())
+                    con.execute(
+                        "UPDATE mcc_vfd_prices SET filter_vendor_quote_file = ?, filter_vendor_quote_uploaded_at = ?, pricing_updated_at = ?, updated_at = ? WHERE id = ?",
+                        (saved_name, now, now, now, price_id),
+                    )
+                    log_activity(actor, "uploaded VFD filter vendor quote", "Quoting", f"{price['horsepower']} HP {price['nema_rating']} filter", {"file": saved_name})
+                return json_response(self, {"ok": True, "filter_vendor_quote_file": saved_name})
+            if parsed.path == "/api/mcc-vfd-filter-price/vendor-quote":
+                actor = current_user(self)
+                if not can_edit_permission(actor, "mcc_quote_setup"):
+                    return json_response(self, {"error": "MCC pricing setup edit access required."}, 403)
+                form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": self.headers.get("Content-Type")})
+                file_item = form["file"] if "file" in form else None
+                if file_item is None or not getattr(file_item, "filename", ""):
+                    return json_response(self, {"error": "Choose a vendor quote file."}, 400)
+                safe_name = Path(file_item.filename).name
+                suffix = Path(safe_name).suffix.lower()
+                if suffix not in (".pdf", ".png", ".jpg", ".jpeg", ".webp"):
+                    return json_response(self, {"error": "Vendor quote must be a PDF or image."}, 400)
+                now = datetime.now().isoformat(timespec="seconds")
+                saved_name = f"{datetime.now().strftime('%Y%m%d%H%M%S')}-mcc-vfd-filter-vendor-quote-{safe_name}"
+                path = UPLOAD_DIR / saved_name
+                with open(path, "wb") as f:
+                    f.write(file_item.file.read())
+                execute(
+                    """
+                    UPDATE mcc_vfd_filter_prices
+                    SET vendor_quote_file = ?, vendor_quote_uploaded_at = ?, pricing_updated_at = ?, updated_at = ?
+                    WHERE id = 1
+                    """,
+                    (saved_name, now, now, now),
+                )
+                log_activity(actor, "uploaded VFD filter vendor quote", "Quoting", "VFD Filter Adder", {"file": saved_name})
+                return json_response(self, {"ok": True, "vendor_quote_file": saved_name})
             if parsed.path == "/api/purchase-orders":
                 user = current_user(self)
                 if not can_use_field_po(user):
@@ -10510,6 +11602,60 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     log_activity(user, "uploaded pickup ticket", "Purchase Order", po["po_number"] if po else po_id, {"pickup_file": saved_name, "uploaded_at": now})
                 return json_response(self, {"ok": True, "pickup_file": saved_name, "status": "Picked Up"})
+            if parsed.path.startswith("/api/purchase-orders/") and parsed.path.endswith("/invoice"):
+                actor = current_user(self)
+                if not can_edit_permission(actor, "po_review"):
+                    return json_response(self, {"error": "Office PO access required."}, 403)
+                po_id = parsed.path.split("/")[-2]
+                form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": self.headers.get("Content-Type")})
+                file_item = form["invoice_file"] if "invoice_file" in form else None
+                if file_item is None or not getattr(file_item, "filename", ""):
+                    return json_response(self, {"error": "Choose a vendor invoice PDF or image."}, 400)
+                safe_name = Path(file_item.filename).name
+                suffix = Path(safe_name).suffix.lower()
+                if suffix not in (".pdf", ".png", ".jpg", ".jpeg", ".webp"):
+                    return json_response(self, {"error": "Vendor invoice must be a PDF or image."}, 400)
+                saved_name = f"{datetime.now().strftime('%Y%m%d%H%M%S')}-po-invoice-{safe_name}"
+                path = UPLOAD_DIR / saved_name
+                with open(path, "wb") as f:
+                    f.write(file_item.file.read())
+                now = datetime.now().isoformat(timespec="seconds")
+                with db() as con:
+                    po = con.execute("SELECT * FROM purchase_orders WHERE id = ?", (po_id,)).fetchone()
+                    if not po:
+                        try:
+                            path.unlink()
+                        except OSError:
+                            pass
+                        return json_response(self, {"error": "PO not found."}, 404)
+                    if po["status"] == "Void":
+                        try:
+                            path.unlink()
+                        except OSError:
+                            pass
+                        return json_response(self, {"error": "Cannot upload an invoice to a void PO."}, 400)
+                    cost_record_id = sync_po_invoice_cost_record(con, po, saved_name, actor)
+                    con.execute(
+                        """
+                        UPDATE purchase_orders
+                        SET invoice_file = ?,
+                            invoice_uploaded_at = ?,
+                            invoice_uploaded_by_user_id = ?,
+                            invoice_uploaded_by_username = ?,
+                            invoice_cost_record_id = ?,
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (saved_name, now, actor["id"], actor["username"], cost_record_id, now, po_id),
+                    )
+                    log_activity(
+                        actor,
+                        "uploaded vendor invoice to PO",
+                        "Purchase Order",
+                        po["po_number"],
+                        {"invoice_file": saved_name, "uploaded_at": now, "cost_record_id": cost_record_id},
+                    )
+                return json_response(self, {"ok": True, "invoice_file": saved_name, "cost_record_id": cost_record_id})
             if parsed.path == "/api/role-permissions":
                 if not require_admin(self):
                     return json_response(self, {"error": "Admin required"}, 403)
@@ -11218,6 +12364,159 @@ class Handler(BaseHTTPRequestHandler):
                         )
                         new_id = cur.lastrowid
                 return json_response(self, {"id": new_id})
+            if parsed.path == "/api/mcc-quote-items":
+                actor = current_user(self)
+                if not can_edit_permission(actor, "mcc_quote_setup"):
+                    return json_response(self, {"error": "MCC pricing setup edit access required."}, 403)
+                category = str(data.get("category") or "").strip()
+                item_name = str(data.get("item_name") or "").strip()
+                if not category:
+                    return json_response(self, {"error": "Category is required."}, 400)
+                if not item_name:
+                    return json_response(self, {"error": "Item name is required."}, 400)
+                now = datetime.now().isoformat(timespec="seconds")
+                new_id = execute(
+                    """
+                    INSERT INTO mcc_quote_items (
+                      category, item_name, description, unit_label, default_qty, unit_price, markup_percent, sort_order, active, pricing_updated_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                    ON CONFLICT(category, item_name) DO UPDATE SET
+                      description = excluded.description,
+                      unit_label = excluded.unit_label,
+                      default_qty = excluded.default_qty,
+                      unit_price = excluded.unit_price,
+                      markup_percent = excluded.markup_percent,
+                      sort_order = excluded.sort_order,
+                      active = 1,
+                      pricing_updated_at = excluded.pricing_updated_at,
+                      updated_at = excluded.updated_at
+                    """,
+                    (
+                        category,
+                        item_name,
+                        str(data.get("description") or "").strip(),
+                        str(data.get("unit_label") or "Each").strip() or "Each",
+                        money(data.get("default_qty") or 1),
+                        money(data.get("unit_price")),
+                        money(data.get("markup_percent")),
+                        int(money(data.get("sort_order"))),
+                        now,
+                        now,
+                    ),
+                )
+                log_activity(actor, "saved MCC pricing item", "Quoting", f"{category} / {item_name}", {"unit_price": money(data.get("unit_price")), "markup_percent": money(data.get("markup_percent"))})
+                return json_response(self, {"id": new_id})
+            if parsed.path == "/api/mcc-vfd-prices":
+                actor = current_user(self)
+                if not can_edit_permission(actor, "mcc_quote_setup"):
+                    return json_response(self, {"error": "MCC pricing setup edit access required."}, 403)
+                horsepower = str(data.get("horsepower") or "").strip()
+                nema_rating = str(data.get("nema_rating") or "NEMA 1").strip().upper().replace("NEMA", "NEMA ")
+                nema_rating = " ".join(nema_rating.split())
+                if not horsepower:
+                    return json_response(self, {"error": "Horsepower is required."}, 400)
+                if nema_rating not in ("NEMA 1", "NEMA 3R"):
+                    return json_response(self, {"error": "Choose NEMA 1 or NEMA 3R."}, 400)
+                now = datetime.now().isoformat(timespec="seconds")
+                new_id = execute(
+                    """
+                    INSERT INTO mcc_vfd_prices (
+                      horsepower, nema_rating, unit_price, markup_percent, filter_unit_price, filter_markup_percent, active, pricing_updated_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+                    ON CONFLICT(horsepower, nema_rating) DO UPDATE SET
+                      unit_price = excluded.unit_price,
+                      markup_percent = excluded.markup_percent,
+                      filter_unit_price = excluded.filter_unit_price,
+                      filter_markup_percent = excluded.filter_markup_percent,
+                      active = 1,
+                      pricing_updated_at = excluded.pricing_updated_at,
+                      updated_at = excluded.updated_at
+                    """,
+                    (
+                        horsepower,
+                        nema_rating,
+                        money(data.get("unit_price")),
+                        money(data.get("markup_percent")),
+                        money(data.get("filter_unit_price")),
+                        money(data.get("filter_markup_percent")),
+                        now,
+                        now,
+                    ),
+                )
+                log_activity(actor, "saved VFD package price", "Quoting", f"{horsepower} HP {nema_rating}", {"unit_price": money(data.get("unit_price")), "markup_percent": money(data.get("markup_percent"))})
+                return json_response(self, {"id": new_id})
+            if parsed.path == "/api/mcc-quotes":
+                actor = current_user(self)
+                if not can_edit_permission(actor, "mcc_quotes"):
+                    return json_response(self, {"error": "MCC quote edit access required."}, 403)
+                lines = data.get("lines") or []
+                if not lines:
+                    return json_response(self, {"error": "Select at least one MCC pricing item."}, 400)
+                now = datetime.now().isoformat(timespec="seconds")
+                with db() as con:
+                    prefix = f"MCC-{datetime.now().strftime('%Y%m%d')}"
+                    count = con.execute("SELECT COUNT(*) AS c FROM mcc_quotes WHERE quote_number LIKE ?", (f"{prefix}-%",)).fetchone()["c"]
+                    quote_number = f"{prefix}-{count + 1:03d}"
+                    subtotal = sum(money(line.get("line_total")) for line in lines)
+                    markup_percent = money(data.get("markup_percent"))
+                    total = subtotal + subtotal * (markup_percent / 100)
+                    cur = con.execute(
+                        """
+                        INSERT INTO mcc_quotes (
+                          quote_number, customer, project_name, building_name, salesperson, status, notes,
+                          subtotal, markup_percent, total, created_by_user_id, created_by_username, created_at, updated_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            quote_number,
+                            str(data.get("customer") or "").strip(),
+                            str(data.get("project_name") or "").strip(),
+                            str(data.get("building_name") or "").strip(),
+                            str(data.get("salesperson") or "").strip(),
+                            str(data.get("status") or "Draft").strip(),
+                            str(data.get("notes") or "").strip(),
+                            subtotal,
+                            markup_percent,
+                            total,
+                            actor["id"] if actor else None,
+                            actor["username"] if actor else "",
+                            now,
+                            now,
+                        ),
+                    )
+                    quote_id = cur.lastrowid
+                    for line in lines:
+                        qty = money(line.get("qty"))
+                        unit_price = money(line.get("unit_price"))
+                        line_markup_percent = money(line.get("markup_percent"))
+                        con.execute(
+                            """
+                            INSERT INTO mcc_quote_lines (
+                              quote_id, quote_item_id, category, item_name, description, unit_label,
+                              qty, unit_price, markup_percent, line_total, vendor_quote_file, notes
+                            )
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                quote_id,
+                                line.get("quote_item_id") or None,
+                                str(line.get("category") or ""),
+                                str(line.get("item_name") or ""),
+                                str(line.get("description") or ""),
+                                str(line.get("unit_label") or "Each"),
+                                qty,
+                                unit_price,
+                                line_markup_percent,
+                                qty * unit_price,
+                                str(line.get("vendor_quote_file") or ""),
+                                str(line.get("notes") or ""),
+                            ),
+                        )
+                log_activity(actor, "created MCC quote", "Quoting", quote_number, {"customer": data.get("customer"), "total": total, "line_count": len(lines)})
+                return json_response(self, {"id": quote_id, "quote_number": quote_number, "total": total})
             if parsed.path.startswith("/api/change-orders/") and parsed.path.endswith("/copy"):
                 change_order_id = parsed.path.split("/")[-2]
                 new_co_number = str(data.get("co_number") or "").strip()
@@ -11972,6 +13271,197 @@ class Handler(BaseHTTPRequestHandler):
                 rate = one("SELECT rate_set_id FROM internal_rates WHERE id = ?", (rate_id,))
                 updated = apply_internal_rate(data.get("category_type"), data.get("category"), money(data.get("raw_rate")), rate["rate_set_id"] if rate else None)
                 return json_response(self, {"ok": True, "updated_cost_records": updated})
+            if parsed.path.startswith("/api/mcc-quotes/"):
+                actor = current_user(self)
+                if not can_edit_permission(actor, "mcc_quotes"):
+                    return json_response(self, {"error": "MCC quote edit access required."}, 403)
+                quote_id = parsed.path.rsplit("/", 1)[-1]
+                lines = data.get("lines") or []
+                if not lines:
+                    return json_response(self, {"error": "Select at least one MCC pricing item."}, 400)
+                now = datetime.now().isoformat(timespec="seconds")
+                subtotal = sum(money(line.get("line_total")) for line in lines)
+                markup_percent = money(data.get("markup_percent"))
+                total = subtotal + subtotal * (markup_percent / 100)
+                with db() as con:
+                    quote = con.execute("SELECT * FROM mcc_quotes WHERE id = ?", (quote_id,)).fetchone()
+                    if not quote:
+                        return json_response(self, {"error": "MCC quote not found."}, 404)
+                    con.execute(
+                        """
+                        UPDATE mcc_quotes
+                        SET customer = ?, project_name = ?, building_name = ?, salesperson = ?, status = ?,
+                            notes = ?, subtotal = ?, markup_percent = ?, total = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            str(data.get("customer") or "").strip(),
+                            str(data.get("project_name") or "").strip(),
+                            str(data.get("building_name") or "").strip(),
+                            str(data.get("salesperson") or "").strip(),
+                            str(data.get("status") or "Draft").strip(),
+                            str(data.get("notes") or "").strip(),
+                            subtotal,
+                            markup_percent,
+                            total,
+                            now,
+                            quote_id,
+                        ),
+                    )
+                    con.execute("DELETE FROM mcc_quote_lines WHERE quote_id = ?", (quote_id,))
+                    for line in lines:
+                        qty = money(line.get("qty"))
+                        unit_price = money(line.get("unit_price"))
+                        line_markup_percent = money(line.get("markup_percent"))
+                        con.execute(
+                            """
+                            INSERT INTO mcc_quote_lines (
+                              quote_id, quote_item_id, category, item_name, description, unit_label,
+                              qty, unit_price, markup_percent, line_total, vendor_quote_file, notes
+                            )
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                quote_id,
+                                line.get("quote_item_id") or None,
+                                str(line.get("category") or ""),
+                                str(line.get("item_name") or ""),
+                                str(line.get("description") or ""),
+                                str(line.get("unit_label") or "Each"),
+                                qty,
+                                unit_price,
+                                line_markup_percent,
+                                qty * unit_price,
+                                str(line.get("vendor_quote_file") or ""),
+                                str(line.get("notes") or ""),
+                            ),
+                        )
+                log_activity(actor, "updated MCC quote", "Quoting", quote["quote_number"] if quote else quote_id, {"total": total, "line_count": len(lines)})
+                return json_response(self, {"ok": True, "total": total})
+            if parsed.path.startswith("/api/mcc-quote-items/"):
+                actor = current_user(self)
+                if not can_edit_permission(actor, "mcc_quote_setup"):
+                    return json_response(self, {"error": "MCC pricing setup edit access required."}, 403)
+                item_id = parsed.path.rsplit("/", 1)[-1]
+                category = str(data.get("category") or "").strip()
+                item_name = str(data.get("item_name") or "").strip()
+                if not category:
+                    return json_response(self, {"error": "Category is required."}, 400)
+                if not item_name:
+                    return json_response(self, {"error": "Item name is required."}, 400)
+                current = one("SELECT unit_price, markup_percent, pricing_updated_at FROM mcc_quote_items WHERE id = ?", (item_id,))
+                new_unit_price = money(data.get("unit_price"))
+                new_markup_percent = money(data.get("markup_percent"))
+                now = datetime.now().isoformat(timespec="seconds")
+                pricing_updated_at = now
+                if current:
+                    price_changed = abs(money(current["unit_price"]) - new_unit_price) > 0.0001 or abs(money(current["markup_percent"]) - new_markup_percent) > 0.0001
+                    pricing_updated_at = now if price_changed else current["pricing_updated_at"]
+                execute(
+                    """
+                    UPDATE mcc_quote_items
+                    SET category = ?, item_name = ?, description = ?, unit_label = ?,
+                        default_qty = ?, unit_price = ?, markup_percent = ?, sort_order = ?, active = ?, pricing_updated_at = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        category,
+                        item_name,
+                        str(data.get("description") or "").strip(),
+                        str(data.get("unit_label") or "Each").strip() or "Each",
+                        money(data.get("default_qty") or 1),
+                        new_unit_price,
+                        new_markup_percent,
+                        int(money(data.get("sort_order"))),
+                        1 if str(data.get("active") or "1") == "1" else 0,
+                        pricing_updated_at,
+                        now,
+                        item_id,
+                    ),
+                )
+                log_activity(actor, "updated MCC pricing item", "Quoting", f"{category} / {item_name}", {"item_id": item_id, "unit_price": new_unit_price, "markup_percent": new_markup_percent})
+                return json_response(self, {"ok": True})
+            if parsed.path.startswith("/api/mcc-vfd-prices/"):
+                actor = current_user(self)
+                if not can_edit_permission(actor, "mcc_quote_setup"):
+                    return json_response(self, {"error": "MCC pricing setup edit access required."}, 403)
+                price_id = parsed.path.rsplit("/", 1)[-1]
+                horsepower = str(data.get("horsepower") or "").strip()
+                nema_rating = str(data.get("nema_rating") or "NEMA 1").strip().upper().replace("NEMA", "NEMA ")
+                nema_rating = " ".join(nema_rating.split())
+                if not horsepower:
+                    return json_response(self, {"error": "Horsepower is required."}, 400)
+                if nema_rating not in ("NEMA 1", "NEMA 3R"):
+                    return json_response(self, {"error": "Choose NEMA 1 or NEMA 3R."}, 400)
+                new_unit_price = money(data.get("unit_price"))
+                new_markup_percent = money(data.get("markup_percent"))
+                new_filter_unit_price = money(data.get("filter_unit_price"))
+                new_filter_markup_percent = money(data.get("filter_markup_percent"))
+                now = datetime.now().isoformat(timespec="seconds")
+                with db() as con:
+                    current = con.execute("SELECT unit_price, markup_percent, filter_unit_price, filter_markup_percent, pricing_updated_at FROM mcc_vfd_prices WHERE id = ?", (price_id,)).fetchone()
+                    duplicate = con.execute(
+                        "SELECT id FROM mcc_vfd_prices WHERE horsepower = ? AND nema_rating = ? AND id != ?",
+                        (horsepower, nema_rating, price_id),
+                    ).fetchone()
+                    if duplicate:
+                        return json_response(self, {"error": "A VFD price already exists for that horsepower and NEMA rating."}, 400)
+                    pricing_updated_at = now
+                    if current:
+                        price_changed = (
+                            abs(money(current["unit_price"]) - new_unit_price) > 0.0001
+                            or abs(money(current["markup_percent"]) - new_markup_percent) > 0.0001
+                            or abs(money(current["filter_unit_price"]) - new_filter_unit_price) > 0.0001
+                            or abs(money(current["filter_markup_percent"]) - new_filter_markup_percent) > 0.0001
+                        )
+                        pricing_updated_at = now if price_changed else current["pricing_updated_at"]
+                    updated = con.execute(
+                        """
+                        UPDATE mcc_vfd_prices
+                        SET horsepower = ?, nema_rating = ?, unit_price = ?, markup_percent = ?,
+                            filter_unit_price = ?, filter_markup_percent = ?, active = ?, pricing_updated_at = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            horsepower,
+                            nema_rating,
+                            new_unit_price,
+                            new_markup_percent,
+                            new_filter_unit_price,
+                            new_filter_markup_percent,
+                            1 if str(data.get("active") or "1") == "1" else 0,
+                            pricing_updated_at,
+                            now,
+                            price_id,
+                        ),
+                    ).rowcount
+                if not updated:
+                    return json_response(self, {"error": "VFD package price not found."}, 404)
+                log_activity(actor, "updated VFD package price", "Quoting", f"{horsepower} HP {nema_rating}", {"price_id": price_id, "unit_price": new_unit_price, "markup_percent": new_markup_percent, "filter_unit_price": new_filter_unit_price, "filter_markup_percent": new_filter_markup_percent})
+                return json_response(self, {"ok": True})
+            if parsed.path == "/api/mcc-vfd-filter-price":
+                actor = current_user(self)
+                if not can_edit_permission(actor, "mcc_quote_setup"):
+                    return json_response(self, {"error": "MCC pricing setup edit access required."}, 403)
+                new_unit_price = money(data.get("unit_price"))
+                new_markup_percent = money(data.get("markup_percent"))
+                now = datetime.now().isoformat(timespec="seconds")
+                with db() as con:
+                    current = con.execute("SELECT unit_price, markup_percent, pricing_updated_at FROM mcc_vfd_filter_prices WHERE id = 1").fetchone()
+                    pricing_updated_at = now
+                    if current:
+                        price_changed = abs(money(current["unit_price"]) - new_unit_price) > 0.0001 or abs(money(current["markup_percent"]) - new_markup_percent) > 0.0001
+                        pricing_updated_at = now if price_changed else current["pricing_updated_at"]
+                    con.execute(
+                        """
+                        UPDATE mcc_vfd_filter_prices
+                        SET unit_price = ?, markup_percent = ?, pricing_updated_at = ?, updated_at = ?
+                        WHERE id = 1
+                        """,
+                        (new_unit_price, new_markup_percent, pricing_updated_at, now),
+                    )
+                log_activity(actor, "updated VFD filter adder", "Quoting", "VFD Filter Adder", {"unit_price": new_unit_price, "markup_percent": new_markup_percent})
+                return json_response(self, {"ok": True})
             if parsed.path.startswith("/api/cog-categories/"):
                 category_id = parsed.path.rsplit("/", 1)[-1]
                 code = str(data.get("code") or "").strip().upper()
@@ -12019,6 +13509,30 @@ class Handler(BaseHTTPRequestHandler):
                     updated = con.execute("UPDATE cog_categories SET active = 0 WHERE id = ?", (category_id,)).rowcount
                 if not updated:
                     return json_response(self, {"error": "COG category not found."}, 404)
+                return json_response(self, {"ok": True})
+            if parsed.path.startswith("/api/mcc-quote-items/"):
+                actor = current_user(self)
+                if not can_edit_permission(actor, "mcc_quote_setup"):
+                    return json_response(self, {"error": "MCC pricing setup edit access required."}, 403)
+                item_id = parsed.path.rsplit("/", 1)[-1]
+                with db() as con:
+                    item = con.execute("SELECT * FROM mcc_quote_items WHERE id = ?", (item_id,)).fetchone()
+                    deleted = con.execute("DELETE FROM mcc_quote_items WHERE id = ?", (item_id,)).rowcount
+                if not deleted:
+                    return json_response(self, {"error": "MCC pricing item not found."}, 404)
+                log_activity(actor, "deleted MCC pricing item", "Quoting", f"{item['category']} / {item['item_name']}" if item else item_id)
+                return json_response(self, {"ok": True})
+            if parsed.path.startswith("/api/mcc-vfd-prices/"):
+                actor = current_user(self)
+                if not can_edit_permission(actor, "mcc_quote_setup"):
+                    return json_response(self, {"error": "MCC pricing setup edit access required."}, 403)
+                price_id = parsed.path.rsplit("/", 1)[-1]
+                with db() as con:
+                    price = con.execute("SELECT * FROM mcc_vfd_prices WHERE id = ?", (price_id,)).fetchone()
+                    deleted = con.execute("DELETE FROM mcc_vfd_prices WHERE id = ?", (price_id,)).rowcount
+                if not deleted:
+                    return json_response(self, {"error": "VFD package price not found."}, 404)
+                log_activity(actor, "deleted VFD package price", "Quoting", f"{price['horsepower']} HP {price['nema_rating']}" if price else price_id)
                 return json_response(self, {"ok": True})
             if parsed.path.startswith("/api/purchase-orders/"):
                 if not require_admin(self):
