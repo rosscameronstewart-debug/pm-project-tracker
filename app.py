@@ -64,7 +64,7 @@ CO_MATERIAL_MARGIN = 0.35
 CO_MATERIAL_COST_FACTOR = 1 - CO_MATERIAL_MARGIN
 COG_CUSTOMER_OPTIONAL_NAMES = {"expenses", "truck & auto expense", "truck and auto expense"}
 ROLE_NAMES = ("Admin", "User", "Read Only", "TX/Read Only", "Field PO")
-MCC_FEATURE_ENABLED = False
+MCC_FEATURE_ENABLED = True
 HIDDEN_PERMISSION_KEYS = set() if MCC_FEATURE_ENABLED else {"mcc_quotes", "mcc_quote_setup"}
 ALL_PERMISSION_DEFINITIONS = [
     {"key": "projects", "label": "Project Dashboard", "group": "Projects"},
@@ -5155,6 +5155,83 @@ HTML = r"""
     #bidTable tr.bid-dirty td:first-child { box-shadow: inset 4px 0 0 var(--gold); }
     #bidTable tr.bid-dirty input, #bidTable tr.bid-dirty select { background: #fffdf3; border-color: #d6a700; }
     #bidTable tr.bid-dirty [data-save-bid] { background: var(--gold); color: white; border-color: var(--gold); }
+    #mccQuoteItemTable { min-width: 1280px; table-layout: fixed; }
+    #mccQuoteItemTable th, #mccQuoteItemTable td { vertical-align: middle; }
+    #mccQuoteItemTable th:nth-child(1), #mccQuoteItemTable td:nth-child(1) { width: 135px; }
+    #mccQuoteItemTable th:nth-child(2), #mccQuoteItemTable td:nth-child(2) { width: 135px; }
+    #mccQuoteItemTable th:nth-child(3), #mccQuoteItemTable td:nth-child(3) { width: 180px; }
+    #mccQuoteItemTable th:nth-child(4), #mccQuoteItemTable td:nth-child(4) { width: 150px; }
+    #mccQuoteItemTable th:nth-child(5), #mccQuoteItemTable td:nth-child(5) { width: 85px; }
+    #mccQuoteItemTable th:nth-child(6), #mccQuoteItemTable td:nth-child(6) { width: 105px; }
+    #mccQuoteItemTable th:nth-child(7), #mccQuoteItemTable td:nth-child(7) { width: 115px; }
+    #mccQuoteItemTable th:nth-child(8), #mccQuoteItemTable td:nth-child(8) { width: 105px; }
+    #mccQuoteItemTable th:nth-child(9), #mccQuoteItemTable td:nth-child(9) { width: 135px; }
+    #mccQuoteItemTable th:nth-child(10), #mccQuoteItemTable td:nth-child(10) { width: 75px; }
+    #mccQuoteItemTable th:nth-child(11), #mccQuoteItemTable td:nth-child(11) { width: 90px; }
+    #mccQuoteItemTable th:nth-child(12), #mccQuoteItemTable td:nth-child(12) { width: 110px; }
+    #mccQuoteItemTable input, #mccQuoteItemTable select { min-width: 0; padding: 7px 8px; }
+    #mccQuoteItemTable .btn { padding: 7px 9px; font-size: 13px; }
+    #officePoTable, #closedPoTable, #projectPoTable { min-width: 1560px; table-layout: fixed; }
+    #officePoTable th, #officePoTable td,
+    #closedPoTable th, #closedPoTable td,
+    #projectPoTable th, #projectPoTable td { vertical-align: top; }
+    #officePoTable th:nth-child(1), #officePoTable td:nth-child(1),
+    #closedPoTable th:nth-child(1), #closedPoTable td:nth-child(1),
+    #projectPoTable th:nth-child(1), #projectPoTable td:nth-child(1) { width: 115px; }
+    #officePoTable th:nth-child(2), #officePoTable td:nth-child(2),
+    #closedPoTable th:nth-child(2), #closedPoTable td:nth-child(2),
+    #projectPoTable th:nth-child(2), #projectPoTable td:nth-child(2) { width: 180px; }
+    #officePoTable th:nth-child(3), #officePoTable td:nth-child(3),
+    #closedPoTable th:nth-child(3), #closedPoTable td:nth-child(3),
+    #projectPoTable th:nth-child(3), #projectPoTable td:nth-child(3) { width: 130px; }
+    #officePoTable th:nth-child(4), #officePoTable td:nth-child(4),
+    #closedPoTable th:nth-child(4), #closedPoTable td:nth-child(4),
+    #projectPoTable th:nth-child(4), #projectPoTable td:nth-child(4) { width: 130px; }
+    #officePoTable th:nth-child(5), #officePoTable td:nth-child(5),
+    #closedPoTable th:nth-child(5), #closedPoTable td:nth-child(5),
+    #projectPoTable th:nth-child(5), #projectPoTable td:nth-child(5) { width: 115px; }
+    #officePoTable th:nth-child(6), #officePoTable td:nth-child(6),
+    #closedPoTable th:nth-child(6), #closedPoTable td:nth-child(6),
+    #projectPoTable th:nth-child(6), #projectPoTable td:nth-child(6) { width: 230px; }
+    #officePoTable th:nth-child(7), #officePoTable td:nth-child(7),
+    #closedPoTable th:nth-child(7), #closedPoTable td:nth-child(7),
+    #projectPoTable th:nth-child(7), #projectPoTable td:nth-child(7) { width: 140px; }
+    #officePoTable th:nth-child(8), #officePoTable td:nth-child(8),
+    #closedPoTable th:nth-child(8), #closedPoTable td:nth-child(8),
+    #projectPoTable th:nth-child(8), #projectPoTable td:nth-child(8) { width: 160px; }
+    #officePoTable th:nth-child(9), #officePoTable td:nth-child(9),
+    #closedPoTable th:nth-child(9), #closedPoTable td:nth-child(9),
+    #projectPoTable th:nth-child(9), #projectPoTable td:nth-child(9) { width: 230px; }
+    #officePoTable th:nth-child(10), #officePoTable td:nth-child(10),
+    #closedPoTable th:nth-child(10), #closedPoTable td:nth-child(10),
+    #projectPoTable th:nth-child(10), #projectPoTable td:nth-child(10) { width: 105px; }
+    #officePoTable input, #officePoTable select, #officePoTable textarea,
+    #closedPoTable input, #closedPoTable select, #closedPoTable textarea,
+    #projectPoTable input, #projectPoTable select, #projectPoTable textarea { min-width: 0; padding: 7px 8px; }
+    #officePoTable textarea, #closedPoTable textarea, #projectPoTable textarea { min-height: 62px; }
+    .po-invoice-upload { border: 1px dashed #bfd0e0; background: #f8fbff; border-radius: 8px; padding: 8px; }
+    #mccVfdPriceTable { min-width: 1320px; table-layout: fixed; }
+    #mccVfdPriceTable th, #mccVfdPriceTable td { vertical-align: middle; }
+    #mccVfdPriceTable th:nth-child(1), #mccVfdPriceTable td:nth-child(1) { width: 95px; }
+    #mccVfdPriceTable th:nth-child(2), #mccVfdPriceTable td:nth-child(2) { width: 90px; }
+    #mccVfdPriceTable th:nth-child(3), #mccVfdPriceTable td:nth-child(3),
+    #mccVfdPriceTable th:nth-child(9), #mccVfdPriceTable td:nth-child(9) { width: 150px; }
+    #mccVfdPriceTable th:nth-child(4), #mccVfdPriceTable td:nth-child(4),
+    #mccVfdPriceTable th:nth-child(5), #mccVfdPriceTable td:nth-child(5),
+    #mccVfdPriceTable th:nth-child(7), #mccVfdPriceTable td:nth-child(7),
+    #mccVfdPriceTable th:nth-child(8), #mccVfdPriceTable td:nth-child(8) { width: 112px; }
+    #mccVfdPriceTable th:nth-child(6), #mccVfdPriceTable td:nth-child(6),
+    #mccVfdPriceTable th:nth-child(10), #mccVfdPriceTable td:nth-child(10) { width: 120px; }
+    #mccVfdPriceTable th:nth-child(11), #mccVfdPriceTable td:nth-child(11) { width: 135px; }
+    #mccVfdPriceTable th:nth-child(12), #mccVfdPriceTable td:nth-child(12) { width: 95px; }
+    #mccVfdPriceTable th:nth-child(13), #mccVfdPriceTable td:nth-child(13) { width: 110px; }
+    #mccVfdPriceTable input, #mccVfdPriceTable select { min-width: 0; padding: 7px 8px; }
+    #mccVfdPriceTable .btn { padding: 7px 9px; font-size: 13px; }
+    .compact-upload { display: grid; gap: 6px; align-content: start; }
+    .compact-upload .upload-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+    .compact-upload input[type="file"] { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+    .compact-upload .file-picker { display: inline-flex; align-items: center; justify-content: center; border: 1px solid var(--line); border-radius: 6px; background: white; padding: 7px 9px; color: var(--ink); cursor: pointer; font-size: 13px; font-weight: 700; }
+    .compact-upload .file-name { display: block; min-height: 16px; color: var(--muted); font-size: 12px; line-height: 1.25; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     #subprojectEditTable tr.setup-dirty td,
     #changeOrderEditTable tr.setup-dirty td { background: #fff8e1; }
     #subprojectEditTable tr.setup-dirty td:first-child,
@@ -5425,7 +5502,13 @@ HTML = r"""
         <div class="nav-subgroup hidden" data-nav-group="po">
           <button data-tab="fieldPo" data-nav-area="po" data-nav-level="sub">Create PO</button>
           <button data-tab="officePo" data-nav-area="po" data-nav-level="sub">Office PO Review</button>
+          <button data-tab="closedPo" data-nav-area="po" data-nav-level="sub">Closed POs</button>
           <button data-tab="cogSetup" data-nav-area="po" data-nav-level="sub">COG's Setup</button>
+        </div>
+        <button data-tab="mccQuotes" data-nav-area="main" data-nav-level="main">Quoting</button>
+        <div class="nav-subgroup hidden" data-nav-group="quoting">
+          <button data-tab="mccQuotes" data-nav-area="quoting" data-nav-level="sub">MCC Quote Builder</button>
+          <button data-tab="mccQuoteSetup" data-nav-area="quoting" data-nav-level="sub">MCC Pricing Setup</button>
         </div>
         <button data-tab="texasOps" data-nav-area="main" data-nav-level="main">Texas Ops</button>
         <div class="nav-subgroup hidden" data-nav-group="texas">
@@ -5498,16 +5581,34 @@ HTML = r"""
         <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
           <div>
             <h2>Office PO Review</h2>
-            <p class="muted">Use status to track pickup tickets and close or void completed POs with a reason.</p>
+            <p class="muted">Active POs that still need pickup tickets, invoices, or closeout.</p>
           </div>
           <button class="btn" id="refreshOfficePos" type="button">Refresh</button>
         </div>
         <div class="grid cols-4">
-          <div><label>Status</label><select id="officePoStatusFilter"><option value="">All statuses</option><option>Pending Approval</option><option>Issued</option><option>Picked Up</option><option>Closed</option><option>Void</option></select></div>
+          <div><label>Status</label><select id="officePoStatusFilter"><option value="">Active statuses</option><option>Pending Approval</option><option>Issued</option><option>Picked Up</option></select></div>
           <div style="grid-column:span 3"><label>Search</label><input id="officePoSearch" placeholder="Search PO, job/order, vendor, requester, or description"></div>
         </div>
         <div class="muted" id="officePoCount" style="margin-top:8px"></div>
         <div class="table-wrap" style="margin-top:10px"><table id="officePoTable"></table></div>
+      </div>
+    </section>
+
+    <section id="closedPo" class="tab hidden">
+      <div class="panel">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
+          <div>
+            <h2>Closed POs</h2>
+            <p class="muted">Completed or voided POs are kept here for history and reference.</p>
+          </div>
+          <button class="btn" id="refreshClosedPos" type="button">Refresh</button>
+        </div>
+        <div class="grid cols-4">
+          <div><label>Status</label><select id="closedPoStatusFilter"><option value="">Closed and Void</option><option>Closed</option><option>Void</option></select></div>
+          <div style="grid-column:span 3"><label>Search</label><input id="closedPoSearch" placeholder="Search PO, job/order, vendor, requester, or description"></div>
+        </div>
+        <div class="muted" id="closedPoCount" style="margin-top:8px"></div>
+        <div class="table-wrap" style="margin-top:10px"><table id="closedPoTable"></table></div>
       </div>
     </section>
 
@@ -6277,6 +6378,7 @@ HTML = r"""
     let jobOrderSort = { field: 'job_number', direction: 'asc' };
     let fieldPoJobChoices = [];
     let officePoRows = [];
+    let closedPoRows = [];
     let projectPoRows = [];
     let rolePermissionsData = null;
     let fieldWiseAuditData = null;
@@ -6304,7 +6406,10 @@ HTML = r"""
       texasReminders: 'texas_reminders',
       fieldPo: 'po_requests',
       officePo: 'po_review',
+      closedPo: 'po_review',
       cogSetup: 'cog_setup',
+      mccQuotes: 'mcc_quotes',
+      mccQuoteSetup: 'mcc_quote_setup',
       activity: 'activity',
       admin: 'admin'
     };
@@ -6439,10 +6544,12 @@ HTML = r"""
 
     function navOptionsForTab(tabName) {
       const projectTabs = ['dashboard','newMasterProject','setup','import','review','invoices','billing','projectPo','archivedProjects'];
-      const poTabs = ['fieldPo','officePo','cogSetup'];
+      const poTabs = ['fieldPo','officePo','closedPo','cogSetup'];
+      const quotingTabs = ['mccQuotes','mccQuoteSetup'];
       const homeTabs = ['home','bids','jobOrderReport','admin','activity'];
       if (projectTabs.includes(tabName)) return 'project';
       if (poTabs.includes(tabName)) return 'po';
+      if (quotingTabs.includes(tabName)) return 'quoting';
       if (tabName === 'fieldwiseAudit') return 'audit';
       if (['texasOps','texasReminders'].includes(tabName)) return 'texas';
       if (homeTabs.includes(tabName)) return 'home';
@@ -6553,6 +6660,7 @@ HTML = r"""
       document.querySelector('nav button[data-tab="dashboard"]')?.classList.toggle('active', activeGroup === 'project');
       document.querySelector('nav button[data-tab="fieldwiseAudit"]')?.classList.toggle('active', activeGroup === 'audit');
       document.querySelector('nav button[data-tab="fieldPo"][data-nav-level="main"]')?.classList.toggle('active', activeGroup === 'po');
+      document.querySelector('nav button[data-tab="mccQuotes"][data-nav-level="main"]')?.classList.toggle('active', activeGroup === 'quoting');
       document.querySelector('nav button[data-tab="texasOps"]')?.classList.toggle('active', activeGroup === 'texas');
     }
 
@@ -6585,7 +6693,10 @@ HTML = r"""
       if (tabName === 'jobOrderReport') loadJobOrderReport();
       if (tabName === 'fieldPo') loadFieldPo();
       if (tabName === 'officePo') loadOfficePos();
+      if (tabName === 'closedPo') loadClosedPos();
       if (tabName === 'cogSetup') loadCogSetup();
+      if (tabName === 'mccQuotes') loadMccQuoteBuilder();
+      if (tabName === 'mccQuoteSetup') loadMccQuoteSetup();
     }
 
     document.querySelectorAll('[data-open-tab]').forEach(btn => btn.onclick = async () => {
@@ -7585,6 +7696,9 @@ HTML = r"""
       const search = String(document.getElementById(config.searchId)?.value || '').trim().toLowerCase();
       const status = String(document.getElementById(config.statusId)?.value || '').trim();
       const filtered = rows.filter(po => {
+        const poStatus = String(po.status || 'Pending Approval');
+        if (config.mode === 'active' && ['Closed', 'Void'].includes(poStatus)) return false;
+        if (config.mode === 'closed' && !['Closed', 'Void'].includes(poStatus)) return false;
         if (status && String(po.status || '') !== status) return false;
         if (!search) return true;
         return [
@@ -7611,10 +7725,14 @@ HTML = r"""
           const invoiceBlock = po.invoice_file
             ? `<div><a class="pdf-link" href="/uploads/${encodeURIComponent(po.invoice_file)}" target="_blank" rel="noopener">Vendor invoice</a></div>`
             : '<div class="muted">No vendor invoice</div>';
-          const invoiceUpload = `<form class="pickup-upload" data-office-po-invoice="${po.id}" style="margin-top:8px">
+          const invoiceUpload = po.status === 'Void' ? '' : `<form class="compact-upload po-invoice-upload" data-office-po-invoice="${po.id}" style="margin-top:8px">
               <label style="margin-top:0">Upload vendor invoice</label>
-              <input name="invoice_file" type="file" accept=".pdf,.png,.jpg,.jpeg,.webp" required>
-              <button class="btn" type="submit">Upload Invoice</button>
+              <div class="upload-row">
+                <label class="file-picker" for="officePoInvoiceFile${po.id}">Choose</label>
+                <input id="officePoInvoiceFile${po.id}" name="invoice_file" data-office-po-invoice-file="${po.id}" type="file" accept=".pdf,.png,.jpg,.jpeg,.webp" required>
+                <button class="btn" type="submit">Upload</button>
+              </div>
+              <span class="file-name" data-office-po-invoice-file-name="${po.id}"></span>
             </form>`;
           return `
           <tr>
@@ -7634,7 +7752,21 @@ HTML = r"""
       function collectOfficePoFields(id) {
         const fields = {};
         document.querySelectorAll(`#${config.tableId} [data-office-po-field="${id}"]`).forEach(el => fields[el.dataset.field] = el.value);
+        const invoiceInput = document.querySelector(`#${config.tableId} [data-office-po-invoice-file="${id}"]`);
+        if (fields.status === 'Closed' && !String(fields.close_reason || '').trim() && invoiceInput?.files?.length) {
+          fields.close_reason = 'Closed after vendor invoice was received.';
+          const closeReasonInput = document.querySelector(`#${config.tableId} [data-office-po-field="${id}"][data-field="close_reason"]`);
+          if (closeReasonInput) closeReasonInput.value = fields.close_reason;
+        }
         return fields;
+      }
+      async function uploadOfficePoInvoiceIfSelected(id) {
+        const invoiceInput = document.querySelector(`#${config.tableId} [data-office-po-invoice-file="${id}"]`);
+        if (!invoiceInput?.files?.length) return false;
+        const data = new FormData();
+        data.append('invoice_file', invoiceInput.files[0]);
+        await api(`/api/purchase-orders/${id}/invoice`, { method: 'POST', body: data });
+        return true;
       }
       document.querySelectorAll(`#${config.tableId} [data-save-office-po]`).forEach(btn => btn.onclick = async () => {
         const id = btn.dataset.saveOfficePo;
@@ -7643,7 +7775,12 @@ HTML = r"""
           method: 'PUT',
           body: JSON.stringify(fields)
         });
+        await uploadOfficePoInvoiceIfSelected(id);
         await config.reload();
+      });
+      document.querySelectorAll(`#${config.tableId} [data-office-po-invoice-file]`).forEach(input => input.onchange = () => {
+        const label = document.querySelector(`#${config.tableId} [data-office-po-invoice-file-name="${input.dataset.officePoInvoiceFile}"]`);
+        if (label) label.textContent = input.files?.[0]?.name || '';
       });
       document.querySelectorAll(`#${config.tableId} [data-office-po-invoice]`).forEach(form => form.onsubmit = async event => {
         event.preventDefault();
@@ -7656,8 +7793,7 @@ HTML = r"""
             method: 'PUT',
             body: JSON.stringify(fields)
           });
-          const data = new FormData(form);
-          await api(`/api/purchase-orders/${id}/invoice`, { method: 'POST', body: data });
+          await uploadOfficePoInvoiceIfSelected(id);
           await config.reload();
         } catch (err) {
           window.alert(err.message || 'Could not upload vendor invoice.');
@@ -7680,6 +7816,7 @@ HTML = r"""
         statusId: 'officePoStatusFilter',
         countId: 'officePoCount',
         tableId: 'officePoTable',
+        mode: 'active',
         reload: loadOfficePos
       });
     }
@@ -7688,6 +7825,23 @@ HTML = r"""
       if (!jobOrderReportRows.length) jobOrderReportRows = await api('/api/job-order-report');
       officePoRows = await api('/api/purchase-orders');
       renderOfficePos();
+    }
+
+    function renderClosedPos() {
+      renderPoReviewTable(closedPoRows, {
+        searchId: 'closedPoSearch',
+        statusId: 'closedPoStatusFilter',
+        countId: 'closedPoCount',
+        tableId: 'closedPoTable',
+        mode: 'closed',
+        reload: loadClosedPos
+      });
+    }
+
+    async function loadClosedPos() {
+      if (!jobOrderReportRows.length) jobOrderReportRows = await api('/api/job-order-report');
+      closedPoRows = await api('/api/purchase-orders');
+      renderClosedPos();
     }
 
     async function loadCogSetup() {
@@ -9926,9 +10080,15 @@ HTML = r"""
           <td><input data-mcc-item="${item.id}" data-field="item_name" value="${htmlEscape(item.item_name || '')}"></td>
           <td><input data-mcc-item="${item.id}" data-field="description" value="${htmlEscape(item.description || '')}"></td>
           <td>
-            <div>${item.vendor_quote_file ? pdfLink({ source_file: item.vendor_quote_file }) : '<span class="muted">No file</span>'}</div>
-            <input data-mcc-vendor-file="${item.id}" type="file" accept=".pdf,.png,.jpg,.jpeg,.webp">
-            <button class="btn" data-upload-mcc-vendor-quote="${item.id}" type="button">Upload</button>
+            <div class="compact-upload">
+              <div>${item.vendor_quote_file ? pdfLink({ source_file: item.vendor_quote_file }) : '<span class="muted">No file</span>'}</div>
+              <div class="upload-row">
+                <label class="file-picker" for="mccVendorFile${item.id}">Choose</label>
+                <input id="mccVendorFile${item.id}" data-mcc-vendor-file="${item.id}" type="file" accept=".pdf,.png,.jpg,.jpeg,.webp">
+                <button class="btn" data-upload-mcc-vendor-quote="${item.id}" type="button">Upload</button>
+              </div>
+              <span class="file-name" data-mcc-vendor-file-name="${item.id}"></span>
+            </div>
           </td>
           <td><input data-mcc-item="${item.id}" data-field="unit_label" value="${htmlEscape(item.unit_label || 'Each')}"></td>
           <td><input data-mcc-item="${item.id}" data-field="default_qty" type="number" step="0.01" value="${Number(item.default_qty || 1)}"></td>
@@ -9961,6 +10121,10 @@ HTML = r"""
           await loadMccQuoteBuilder();
         }
       });
+      tableEl.querySelectorAll('[data-mcc-vendor-file]').forEach(input => input.onchange = () => {
+        const label = tableEl.querySelector(`[data-mcc-vendor-file-name="${input.dataset.mccVendorFile}"]`);
+        if (label) label.textContent = input.files?.[0]?.name || '';
+      });
       tableEl.querySelectorAll('[data-upload-mcc-vendor-quote]').forEach(btn => btn.onclick = async () => {
         const id = btn.dataset.uploadMccVendorQuote;
         const input = tableEl.querySelector(`[data-mcc-vendor-file="${id}"]`);
@@ -9981,7 +10145,6 @@ HTML = r"""
       const tableEl = document.getElementById('mccVfdPriceTable');
       if (!tableEl) return;
       mccVfdPrices = await api('/api/mcc-vfd-prices?include_inactive=1');
-      await loadMccVfdFilterPricingSetup();
       if (!mccVfdPrices.length) {
         tableEl.innerHTML = '<tbody><tr><td>No VFD package pricing has been set up yet.</td></tr></tbody>';
         return;
@@ -9995,9 +10158,15 @@ HTML = r"""
             <td><input data-mcc-vfd-price="${row.id}" data-field="horsepower" value="${htmlEscape(row.horsepower || '')}"></td>
             <td><select data-mcc-vfd-price="${row.id}" data-field="nema_rating">${vfdNemaOptions.map(option => `<option value="${option}" ${normalizeVfdNema(row.nema_rating) === normalizeVfdNema(option) ? 'selected' : ''}>${option}</option>`).join('')}</select></td>
             <td>
-              <div>${row.vendor_quote_file ? pdfLink({ source_file: row.vendor_quote_file }) : '<span class="muted">No file</span>'}</div>
-              <input data-mcc-vfd-vendor-file="${row.id}" type="file" accept=".pdf,.png,.jpg,.jpeg,.webp">
-              <button class="btn" data-upload-mcc-vfd-vendor-quote="${row.id}" type="button">Upload</button>
+              <div class="compact-upload">
+                <div>${row.vendor_quote_file ? pdfLink({ source_file: row.vendor_quote_file }) : '<span class="muted">No file</span>'}</div>
+                <div class="upload-row">
+                  <label class="file-picker" for="mccVfdVendorFile${row.id}">Choose</label>
+                  <input id="mccVfdVendorFile${row.id}" data-mcc-vfd-vendor-file="${row.id}" type="file" accept=".pdf,.png,.jpg,.jpeg,.webp">
+                  <button class="btn" data-upload-mcc-vfd-vendor-quote="${row.id}" type="button">Upload</button>
+                </div>
+                <span class="file-name" data-mcc-vfd-vendor-file-name="${row.id}"></span>
+              </div>
             </td>
             <td><input data-mcc-vfd-price="${row.id}" data-field="unit_price" type="number" step="0.01" value="${Number(row.unit_price || 0).toFixed(2)}"></td>
             <td><input data-mcc-vfd-price="${row.id}" data-field="markup_percent" type="number" step="0.01" value="${Number(row.markup_percent || 0).toFixed(2)}"></td>
@@ -10005,9 +10174,15 @@ HTML = r"""
             <td><input data-mcc-vfd-price="${row.id}" data-field="filter_unit_price" type="number" step="0.01" value="${Number(row.filter_unit_price || 0).toFixed(2)}"></td>
             <td><input data-mcc-vfd-price="${row.id}" data-field="filter_markup_percent" type="number" step="0.01" value="${Number(row.filter_markup_percent || 0).toFixed(2)}"></td>
             <td>
-              <div>${row.filter_vendor_quote_file ? pdfLink({ source_file: row.filter_vendor_quote_file }) : '<span class="muted">No file</span>'}</div>
-              <input data-mcc-vfd-filter-vendor-file="${row.id}" type="file" accept=".pdf,.png,.jpg,.jpeg,.webp">
-              <button class="btn" data-upload-mcc-vfd-filter-vendor-quote="${row.id}" type="button">Upload</button>
+              <div class="compact-upload">
+                <div>${row.filter_vendor_quote_file ? pdfLink({ source_file: row.filter_vendor_quote_file }) : '<span class="muted">No file</span>'}</div>
+                <div class="upload-row">
+                  <label class="file-picker" for="mccVfdFilterVendorFile${row.id}">Choose</label>
+                  <input id="mccVfdFilterVendorFile${row.id}" data-mcc-vfd-filter-vendor-file="${row.id}" type="file" accept=".pdf,.png,.jpg,.jpeg,.webp">
+                  <button class="btn" data-upload-mcc-vfd-filter-vendor-quote="${row.id}" type="button">Upload</button>
+                </div>
+                <span class="file-name" data-mcc-vfd-filter-vendor-file-name="${row.id}"></span>
+              </div>
             </td>
             <td>${money(filterFinalPrice)}</td>
             <td>${htmlEscape((row.pricing_updated_at || '').replace('T', ' ')) || '<span class="muted">Not recorded</span>'}</td>
@@ -10025,6 +10200,14 @@ HTML = r"""
         await api(`/api/mcc-vfd-prices/${id}`, { method:'PUT', body: JSON.stringify(data) });
         markSaved();
         await loadMccVfdPricingSetup();
+      });
+      tableEl.querySelectorAll('[data-mcc-vfd-vendor-file]').forEach(input => input.onchange = () => {
+        const label = tableEl.querySelector(`[data-mcc-vfd-vendor-file-name="${input.dataset.mccVfdVendorFile}"]`);
+        if (label) label.textContent = input.files?.[0]?.name || '';
+      });
+      tableEl.querySelectorAll('[data-mcc-vfd-filter-vendor-file]').forEach(input => input.onchange = () => {
+        const label = tableEl.querySelector(`[data-mcc-vfd-filter-vendor-file-name="${input.dataset.mccVfdFilterVendorFile}"]`);
+        if (label) label.textContent = input.files?.[0]?.name || '';
       });
       tableEl.querySelectorAll('[data-upload-mcc-vfd-vendor-quote]').forEach(btn => btn.onclick = async () => {
         const id = btn.dataset.uploadMccVfdVendorQuote;
@@ -10470,6 +10653,9 @@ HTML = r"""
     document.getElementById('refreshOfficePos').onclick = () => loadOfficePos();
     document.getElementById('officePoSearch').oninput = () => renderOfficePos();
     document.getElementById('officePoStatusFilter').onchange = () => renderOfficePos();
+    document.getElementById('refreshClosedPos').onclick = () => loadClosedPos();
+    document.getElementById('closedPoSearch').oninput = () => renderClosedPos();
+    document.getElementById('closedPoStatusFilter').onchange = () => renderClosedPos();
     document.getElementById('refreshProjectPos').onclick = () => loadProjectPos();
     document.getElementById('projectPoSearch').oninput = () => renderProjectPos();
     document.getElementById('projectPoStatusFilter').onchange = () => renderProjectPos();
@@ -12855,6 +13041,8 @@ class Handler(BaseHTTPRequestHandler):
                     voided_by_username = current_po["voided_by_username"]
                     action_detail = None
                     if status == "Closed":
+                        if not close_reason and current_po["invoice_file"]:
+                            close_reason = "Closed after vendor invoice was received."
                         if not close_reason:
                             return json_response(self, {"error": "Close reason is required to close a PO."}, 400)
                         if current_po["status"] != "Closed" or not closed_at:
