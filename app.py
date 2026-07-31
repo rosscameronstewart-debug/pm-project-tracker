@@ -73,6 +73,7 @@ ALL_PERMISSION_DEFINITIONS = [
     {"key": "review_exceptions", "label": "Review Exceptions", "group": "Projects"},
     {"key": "vendor_invoices", "label": "Vendor Invoices", "group": "Projects"},
     {"key": "customer_billing", "label": "Customer Billing", "group": "Projects"},
+    {"key": "customer_dashboard", "label": "Customer Dashboard", "group": "Projects"},
     {"key": "nte_tracking", "label": "T&M NTE Tracking", "group": "Projects"},
     {"key": "fieldwise_audit", "label": "Field Wise Audit", "group": "Company"},
     {"key": "bids", "label": "Bid Tracking", "group": "Company"},
@@ -5282,6 +5283,101 @@ def nte_targets(project_id):
     )
 
 
+def customer_dashboard_summary(project_id):
+    project_id = int(project_id) if project_id else None
+    empty_summary = {"sales_total": 0, "labor_hours": 0, "ticket_count": 0, "last_ticket_date": ""}
+    if not project_id:
+        return {"project": None, "targets": [], "tickets": [], "summary": empty_summary}
+    project = one("SELECT id, project_code, name, customer, location, customer_po FROM projects WHERE id = ?", (project_id,))
+    subproject_targets = rows(
+        """
+        SELECT
+          'Subproject' AS target_type,
+          sp.id AS target_id,
+          sp.id AS subproject_id,
+          NULL AS change_order_id,
+          sp.job_number,
+          sp.code,
+          sp.name AS title,
+          sp.pricing_type,
+          COALESCE(SUM(CASE WHEN cr.source IN ('Field Wise', 'Field Wise PDF') THEN cr.sales_amount ELSE 0 END), 0) AS sales_total,
+          COALESCE(SUM(CASE WHEN cr.source IN ('Field Wise', 'Field Wise PDF') AND cr.cost_type = 'Labor' THEN cr.qty ELSE 0 END), 0) AS labor_hours,
+          COUNT(DISTINCT CASE WHEN cr.source IN ('Field Wise', 'Field Wise PDF') THEN cr.ticket_or_invoice END) AS ticket_count,
+          MAX(CASE WHEN cr.source IN ('Field Wise', 'Field Wise PDF') THEN cr.record_date ELSE NULL END) AS last_ticket_date
+        FROM subprojects sp
+        LEFT JOIN cost_records cr ON cr.subproject_id = sp.id AND cr.change_order_id IS NULL
+        WHERE sp.project_id = ?
+          AND COALESCE(sp.pricing_type, 'Fixed') = 'T&M NTE'
+        GROUP BY sp.id
+        ORDER BY sp.job_number, sp.code, sp.name
+        """,
+        (project_id,),
+    )
+    change_order_targets = rows(
+        """
+        SELECT
+          COALESCE(co.order_type, 'Change Order') AS target_type,
+          co.id AS target_id,
+          co.subproject_id,
+          co.id AS change_order_id,
+          co.job_number,
+          co.co_number AS code,
+          co.title,
+          co.pricing_type,
+          COALESCE(sp.job_number, '') AS parent_job_number,
+          COALESCE(sp.code, '') AS parent_code,
+          COALESCE(sp.name, '') AS parent_name,
+          COALESCE(SUM(CASE WHEN cr.source IN ('Field Wise', 'Field Wise PDF') THEN cr.sales_amount ELSE 0 END), 0) AS sales_total,
+          COALESCE(SUM(CASE WHEN cr.source IN ('Field Wise', 'Field Wise PDF') AND cr.cost_type = 'Labor' THEN cr.qty ELSE 0 END), 0) AS labor_hours,
+          COUNT(DISTINCT CASE WHEN cr.source IN ('Field Wise', 'Field Wise PDF') THEN cr.ticket_or_invoice END) AS ticket_count,
+          MAX(CASE WHEN cr.source IN ('Field Wise', 'Field Wise PDF') THEN cr.record_date ELSE NULL END) AS last_ticket_date
+        FROM change_orders co
+        LEFT JOIN subprojects sp ON sp.id = co.subproject_id
+        LEFT JOIN cost_records cr ON cr.change_order_id = co.id
+        WHERE co.project_id = ?
+          AND COALESCE(co.pricing_type, 'Fixed') = 'T&M NTE'
+        GROUP BY co.id
+        ORDER BY co.job_number, co.co_number, co.title
+        """,
+        (project_id,),
+    )
+    targets = subproject_targets + change_order_targets
+    tickets = rows(
+        """
+        SELECT
+          cr.ticket_or_invoice,
+          cr.record_date,
+          cr.status,
+          CASE WHEN cr.change_order_id IS NOT NULL THEN COALESCE(co.order_type, 'Change Order') ELSE 'Subproject' END AS target_type,
+          COALESCE(co.job_number, sp.job_number, '') AS job_number,
+          COALESCE(co.co_number, sp.code, '') AS code,
+          COALESCE(co.title, sp.name, '') AS title,
+          COALESCE(SUM(cr.sales_amount), 0) AS sales_total,
+          COALESCE(SUM(CASE WHEN cr.cost_type = 'Labor' THEN cr.qty ELSE 0 END), 0) AS labor_hours
+        FROM cost_records cr
+        LEFT JOIN subprojects sp ON sp.id = cr.subproject_id
+        LEFT JOIN change_orders co ON co.id = cr.change_order_id
+        WHERE cr.project_id = ?
+          AND cr.source IN ('Field Wise', 'Field Wise PDF')
+          AND (
+            (cr.change_order_id IS NULL AND COALESCE(sp.pricing_type, 'Fixed') = 'T&M NTE')
+            OR
+            (cr.change_order_id IS NOT NULL AND COALESCE(co.pricing_type, 'Fixed') = 'T&M NTE')
+          )
+        GROUP BY cr.ticket_or_invoice, cr.record_date, cr.status, cr.change_order_id, cr.subproject_id
+        ORDER BY cr.record_date DESC, cr.ticket_or_invoice DESC
+        """,
+        (project_id,),
+    )
+    summary = {
+        "sales_total": sum(money(t.get("sales_total")) for t in targets),
+        "labor_hours": sum(money(t.get("labor_hours")) for t in targets),
+        "ticket_count": sum(int(t.get("ticket_count") or 0) for t in targets),
+        "last_ticket_date": max([str(t.get("last_ticket_date") or "") for t in targets] or [""]),
+    }
+    return {"project": project, "targets": targets, "tickets": tickets, "summary": summary}
+
+
 def nte_summary(project_id, subproject_id=None, change_order_id=None, seed_defaults=False):
     project_id = int(project_id) if project_id else None
     subproject_id = int(subproject_id) if subproject_id else None
@@ -5940,6 +6036,7 @@ HTML = r"""
           <button data-tab="review" data-nav-area="project" data-nav-level="sub">Review Exceptions</button>
           <button data-tab="invoices" data-nav-area="project" data-nav-level="sub">Vendor Invoices</button>
           <button data-tab="billing" data-nav-area="project" data-nav-level="sub">Customer Billing</button>
+          <button data-tab="customerDashboard" data-nav-area="project" data-nav-level="sub">Customer Dashboard</button>
           <button data-tab="nteTracking" data-nav-area="project" data-nav-level="sub">T&M NTE</button>
           <button data-tab="projectPo" data-nav-area="project" data-nav-level="sub" class="po-feature-disabled">POs</button>
           <button data-tab="archivedProjects" data-nav-area="project" data-nav-level="sub">Archived Projects</button>
@@ -6553,6 +6650,27 @@ HTML = r"""
       </div>
     </section>
 
+    <section id="customerDashboard" class="tab hidden">
+      <div class="panel">
+        <div class="section-head">
+          <div>
+            <h2>Customer Dashboard</h2>
+            <p class="muted">Customer-facing T&M NTE view showing billable totals, labor hours, and ticket activity for the selected project.</p>
+          </div>
+          <button class="btn" id="refreshCustomerDashboard" type="button">Refresh</button>
+        </div>
+        <div id="customerDashboardSummary" class="grid cols-4" style="margin-top:12px"></div>
+      </div>
+      <div class="panel" style="margin-top:14px">
+        <h2>Job / Order Rollup</h2>
+        <div class="table-wrap"><table id="customerDashboardTargets"></table></div>
+      </div>
+      <div class="panel" style="margin-top:14px">
+        <h2>Ticket Detail</h2>
+        <div class="table-wrap"><table id="customerDashboardTickets"></table></div>
+      </div>
+    </section>
+
     <section id="projectPo" class="tab hidden">
       <div class="panel">
         <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
@@ -6902,6 +7020,7 @@ HTML = r"""
     let officePoRows = [];
     let closedPoRows = [];
     let projectPoRows = [];
+    let customerDashboardData = null;
     let nteTargets = [];
     let nteData = { buckets: [], additions: [] };
     let nteCosts = [];
@@ -6924,6 +7043,7 @@ HTML = r"""
       review: 'review_exceptions',
       invoices: 'vendor_invoices',
       billing: 'customer_billing',
+      customerDashboard: 'customer_dashboard',
       nteTracking: 'nte_tracking',
       projectPo: 'po_review',
       fieldwiseAudit: 'fieldwise_audit',
@@ -7071,7 +7191,7 @@ HTML = r"""
     });
 
     function navOptionsForTab(tabName) {
-      const projectTabs = ['dashboard','newMasterProject','setup','import','review','invoices','billing','nteTracking','projectPo','archivedProjects'];
+      const projectTabs = ['dashboard','newMasterProject','setup','import','review','invoices','billing','customerDashboard','nteTracking','projectPo','archivedProjects'];
       const poTabs = ['fieldPo','officePo','closedPo','cogSetup'];
       const quotingTabs = ['mccQuotes','mccQuoteSetup'];
       const homeTabs = ['home','bids','jobOrderReport','admin','activity'];
@@ -7210,6 +7330,7 @@ HTML = r"""
       if (tabName === 'fieldwiseAudit') loadFieldWiseAuditOmissions();
       if (tabName === 'invoices') { loadVendorInvoiceLines(); loadVendorAllocationHistory(); }
       if (tabName === 'billing') loadCustomerInvoices();
+      if (tabName === 'customerDashboard') loadCustomerDashboard();
       if (tabName === 'nteTracking') loadNteTracking();
       if (tabName === 'projectPo') loadProjectPos();
       if (tabName === 'newMasterProject') loadNewMasterProjectForm();
@@ -8451,6 +8572,7 @@ HTML = r"""
       loadVendorAllocationHistory();
       loadCustomerInvoices();
       refreshOpenDetails();
+      if (!document.getElementById('customerDashboard')?.classList.contains('hidden')) loadCustomerDashboard();
       if (!document.getElementById('nteTracking')?.classList.contains('hidden')) loadNteTracking();
     }
 
@@ -10503,6 +10625,48 @@ HTML = r"""
         </tr>`).join('')}</tbody>`;
     }
 
+    function renderCustomerDashboard() {
+      const data = customerDashboardData || { summary: {}, targets: [], tickets: [] };
+      const summary = data.summary || {};
+      const targets = data.targets || [];
+      const tickets = data.tickets || [];
+      document.getElementById('customerDashboardSummary').innerHTML = `
+        <div class="panel kpi"><div class="label">Billable Sales</div><div class="value">${money(summary.sales_total)}</div><div class="hint">Field Wise sales total</div></div>
+        <div class="panel kpi"><div class="label">Labor Hours</div><div class="value">${Number(summary.labor_hours || 0).toFixed(2)}</div><div class="hint">Labor hours on tickets</div></div>
+        <div class="panel kpi"><div class="label">Field Tickets</div><div class="value">${Number(summary.ticket_count || 0)}</div><div class="hint">Imported tickets</div></div>
+        <div class="panel kpi"><div class="label">Last Ticket Date</div><div class="value">${htmlEscape(summary.last_ticket_date || '-')}</div><div class="hint">Most recent imported ticket</div></div>`;
+      document.getElementById('customerDashboardTargets').innerHTML = targets.length ? `
+        <thead><tr><th>Job / Order</th><th>Type</th><th>Scope</th><th>Billable Sales</th><th>Labor Hours</th><th>Tickets</th><th>Last Ticket</th></tr></thead>
+        <tbody>${targets.map(t => `<tr>
+          <td><strong>${htmlEscape(t.job_number || '')}</strong><div class="muted">${htmlEscape(t.code || '')}</div></td>
+          <td>${htmlEscape(t.target_type || '')}</td>
+          <td>${htmlEscape(t.title || '')}${t.parent_job_number ? `<div class="muted">Parent ${htmlEscape(t.parent_job_number)} ${htmlEscape(t.parent_code || '')}</div>` : ''}</td>
+          <td>${money(t.sales_total)}</td>
+          <td>${Number(t.labor_hours || 0).toFixed(2)}</td>
+          <td>${Number(t.ticket_count || 0)}</td>
+          <td>${htmlEscape(t.last_ticket_date || '')}</td>
+        </tr>`).join('')}</tbody>` : '<tbody><tr><td>No T&M NTE jobs with Field Wise activity yet.</td></tr></tbody>';
+      document.getElementById('customerDashboardTickets').innerHTML = tickets.length ? `
+        <thead><tr><th>Date</th><th>Ticket</th><th>Job / Order</th><th>Scope</th><th>Status</th><th>Billable Sales</th><th>Labor Hours</th></tr></thead>
+        <tbody>${tickets.map(t => `<tr>
+          <td>${htmlEscape(t.record_date || '')}</td>
+          <td><strong>${htmlEscape(t.ticket_or_invoice || '')}</strong></td>
+          <td>${htmlEscape(t.job_number || '')}<div class="muted">${htmlEscape(t.code || '')}</div></td>
+          <td>${htmlEscape(t.title || '')}</td>
+          <td>${htmlEscape(t.status || '')}</td>
+          <td>${money(t.sales_total)}</td>
+          <td>${Number(t.labor_hours || 0).toFixed(2)}</td>
+        </tr>`).join('')}</tbody>` : '<tbody><tr><td>No ticket activity yet.</td></tr></tbody>';
+    }
+
+    async function loadCustomerDashboard() {
+      if (!state.projectId) return;
+      customerDashboardData = await api(`/api/customer-dashboard?project_id=${state.projectId}`);
+      renderCustomerDashboard();
+    }
+
+    document.getElementById('refreshCustomerDashboard').onclick = loadCustomerDashboard;
+
     async function loadNteTracking(reloadTargets=true) {
       if (!state.projectId) return;
       const resultEl = document.getElementById('nteTrackingResult');
@@ -12241,6 +12405,10 @@ class Handler(BaseHTTPRequestHandler):
                 if not can_view_permission(user, "nte_tracking"):
                     return json_response(self, {"error": "T&M NTE access required."}, 403)
                 return json_response(self, nte_targets(qs.get("project_id", [""])[0]))
+            if parsed.path == "/api/customer-dashboard":
+                if not can_view_permission(user, "customer_dashboard"):
+                    return json_response(self, {"error": "Customer Dashboard access required."}, 403)
+                return json_response(self, customer_dashboard_summary(qs.get("project_id", [""])[0]))
             if parsed.path == "/api/nte-summary":
                 if not can_view_permission(user, "nte_tracking"):
                     return json_response(self, {"error": "T&M NTE access required."}, 403)
