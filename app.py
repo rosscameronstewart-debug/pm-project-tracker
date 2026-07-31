@@ -543,6 +543,7 @@ def init_db():
               cost_type TEXT,
               description TEXT,
               original_budget REAL DEFAULT 0,
+              labor_hours_budget REAL DEFAULT 0,
               sort_order INTEGER DEFAULT 0,
               active INTEGER DEFAULT 1,
               created_at TEXT NOT NULL,
@@ -1125,6 +1126,9 @@ def init_db():
             con.execute("ALTER TABLE cost_records ADD COLUMN raw_cost_source TEXT")
         if "nte_subbucket_id" not in cost_cols:
             con.execute("ALTER TABLE cost_records ADD COLUMN nte_subbucket_id INTEGER REFERENCES nte_subbuckets(id) ON DELETE SET NULL")
+        nte_subbucket_cols = [r["name"] for r in con.execute("PRAGMA table_info(nte_subbuckets)").fetchall()]
+        if "labor_hours_budget" not in nte_subbucket_cols:
+            con.execute("ALTER TABLE nte_subbuckets ADD COLUMN labor_hours_budget REAL DEFAULT 0")
         con.execute(
             """
             UPDATE cost_records
@@ -5434,6 +5438,18 @@ def nte_summary(project_id, subproject_id=None, change_order_id=None, seed_defau
                 (project_id,),
             ).fetchall()
         }
+        labor_hours_actuals = {
+            r["nte_subbucket_id"]: money(r["actual_hours"])
+            for r in con.execute(
+                """
+                SELECT nte_subbucket_id, COALESCE(SUM(qty), 0) AS actual_hours
+                FROM cost_records
+                WHERE project_id = ? AND nte_subbucket_id IS NOT NULL AND cost_type = 'Labor'
+                GROUP BY nte_subbucket_id
+                """,
+                (project_id,),
+            ).fetchall()
+        }
     additions_by_sub = {}
     additions_by_bucket = {}
     for addition in additions:
@@ -5441,22 +5457,27 @@ def nte_summary(project_id, subproject_id=None, change_order_id=None, seed_defau
             additions_by_bucket[addition["bucket_id"]] = additions_by_bucket.get(addition["bucket_id"], 0) + money(addition["amount"])
             if addition.get("subbucket_id"):
                 additions_by_sub[addition["subbucket_id"]] = additions_by_sub.get(addition["subbucket_id"], 0) + money(addition["amount"])
-    by_bucket = {b["id"]: {**b, "subbuckets": [], "original_budget": 0, "approved_additions": 0, "current_budget": 0, "actual_cost": 0, "remaining": 0} for b in bucket_rows}
+    by_bucket = {b["id"]: {**b, "subbuckets": [], "original_budget": 0, "approved_additions": 0, "current_budget": 0, "actual_cost": 0, "remaining": 0, "labor_hours_budget": 0, "labor_hours_used": 0, "labor_hours_remaining": 0} for b in bucket_rows}
     for sub in sub_rows:
         approved = additions_by_sub.get(sub["id"], 0)
         actual = actuals.get(sub["id"], 0)
+        labor_hours_budget = money(sub.get("labor_hours_budget")) if sub.get("cost_type") == "Labor" else 0
+        labor_hours_used = labor_hours_actuals.get(sub["id"], 0) if sub.get("cost_type") == "Labor" else 0
         current = money(sub["original_budget"]) + approved
-        item = {**sub, "approved_additions": approved, "current_budget": current, "actual_cost": actual, "remaining": current - actual}
+        item = {**sub, "approved_additions": approved, "current_budget": current, "actual_cost": actual, "remaining": current - actual, "labor_hours_budget": labor_hours_budget, "labor_hours_used": labor_hours_used, "labor_hours_remaining": labor_hours_budget - labor_hours_used}
         bucket = by_bucket.get(sub["bucket_id"])
         if bucket:
             bucket["subbuckets"].append(item)
             bucket["original_budget"] += money(sub["original_budget"])
             bucket["approved_additions"] += approved
             bucket["actual_cost"] += actual
+            bucket["labor_hours_budget"] += labor_hours_budget
+            bucket["labor_hours_used"] += labor_hours_used
     for bucket in by_bucket.values():
         bucket["approved_additions"] = max(bucket["approved_additions"], additions_by_bucket.get(bucket["id"], bucket["approved_additions"]))
         bucket["current_budget"] = bucket["original_budget"] + bucket["approved_additions"]
         bucket["remaining"] = bucket["current_budget"] - bucket["actual_cost"]
+        bucket["labor_hours_remaining"] = bucket["labor_hours_budget"] - bucket["labor_hours_used"]
     return {"buckets": list(by_bucket.values()), "additions": additions}
 
 
@@ -6608,6 +6629,7 @@ HTML = r"""
             <div><label>Cost Type</label><select name="cost_type"><option>Labor</option><option>Material</option><option>Field Ticket Material</option><option>Equipment</option><option>Rental</option><option>Other</option></select></div>
           </div>
           <label>Original Budget</label><input name="original_budget" type="number" step="0.01" value="0">
+          <label>Labor Hours Budget</label><input name="labor_hours_budget" type="number" step="0.01" value="0">
           <label>Description</label><textarea name="description" placeholder="Scope included in this sub-bucket"></textarea>
           <label>Sort Order</label><input name="sort_order" type="number" step="1" value="10">
           <div class="actions"><button class="btn primary" type="submit">Add Sub-Bucket</button></div>
@@ -10473,7 +10495,7 @@ HTML = r"""
         return;
       }
       tableEl.innerHTML = `
-        <thead><tr><th>Bucket / Sub-Bucket</th><th>Type</th><th>Original</th><th>Additions</th><th>Current Budget</th><th>Actual</th><th>Remaining</th><th>Description</th><th></th></tr></thead>
+        <thead><tr><th>Bucket / Sub-Bucket</th><th>Type</th><th>Original</th><th>Additions</th><th>Current Budget</th><th>Actual</th><th>Remaining</th><th>Labor Hours</th><th>Description</th><th></th></tr></thead>
         <tbody>${buckets.map(bucket => `
           <tr class="invoice-summary">
             <td><input data-nte-bucket="${bucket.id}" data-field="name" value="${htmlEscape(bucket.name || '')}"></td>
@@ -10483,6 +10505,7 @@ HTML = r"""
             <td>${money(bucket.current_budget)}</td>
             <td>${money(bucket.actual_cost)}</td>
             <td class="${Number(bucket.remaining || 0) < 0 ? 'bad' : ''}">${money(bucket.remaining)}</td>
+            <td>${Number(bucket.labor_hours_budget || 0) ? `${Number(bucket.labor_hours_used || 0).toFixed(2)} / ${Number(bucket.labor_hours_budget || 0).toFixed(2)} hrs` : '<span class="muted">-</span>'}</td>
             <td><input data-nte-bucket="${bucket.id}" data-field="description" value="${htmlEscape(bucket.description || '')}"></td>
             <td>
               <button class="btn" data-save-nte-bucket="${bucket.id}" type="button">Save</button>
@@ -10498,6 +10521,7 @@ HTML = r"""
               <td>${money(sub.current_budget)}</td>
               <td>${money(sub.actual_cost)}</td>
               <td class="${Number(sub.remaining || 0) < 0 ? 'bad' : ''}">${money(sub.remaining)}</td>
+              <td>${sub.cost_type === 'Labor' ? `<input data-nte-sub="${sub.id}" data-field="labor_hours_budget" type="number" step="0.01" value="${Number(sub.labor_hours_budget || 0).toFixed(2)}"><div class="muted">${Number(sub.labor_hours_used || 0).toFixed(2)} used / ${Number(sub.labor_hours_remaining || 0).toFixed(2)} remaining</div>` : '<span class="muted">-</span>'}</td>
               <td><input data-nte-sub="${sub.id}" data-field="description" value="${htmlEscape(sub.description || '')}"></td>
               <td><button class="btn" data-save-nte-sub="${sub.id}" type="button">Save</button></td>
             </tr>
@@ -12771,8 +12795,8 @@ class Handler(BaseHTTPRequestHandler):
                 now = datetime.now().isoformat(timespec="seconds")
                 new_id = execute(
                     """
-                    INSERT INTO nte_subbuckets (bucket_id, name, cost_type, description, original_budget, sort_order, active, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+                    INSERT INTO nte_subbuckets (bucket_id, name, cost_type, description, original_budget, labor_hours_budget, sort_order, active, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
                     """,
                     (
                         data.get("bucket_id"),
@@ -12780,6 +12804,7 @@ class Handler(BaseHTTPRequestHandler):
                         data.get("cost_type") or "",
                         data.get("description") or "",
                         money(data.get("original_budget")),
+                        money(data.get("labor_hours_budget")) if data.get("cost_type") == "Labor" else 0,
                         int(money(data.get("sort_order"))),
                         now,
                         now,
@@ -14481,10 +14506,18 @@ class Handler(BaseHTTPRequestHandler):
                 execute(
                     """
                     UPDATE nte_subbuckets
-                    SET name = ?, cost_type = ?, description = ?, original_budget = ?, updated_at = ?
+                    SET name = ?, cost_type = ?, description = ?, original_budget = ?, labor_hours_budget = ?, updated_at = ?
                     WHERE id = ?
                     """,
-                    (data.get("name") or "", data.get("cost_type") or "", data.get("description") or "", money(data.get("original_budget")), now, subbucket_id),
+                    (
+                        data.get("name") or "",
+                        data.get("cost_type") or "",
+                        data.get("description") or "",
+                        money(data.get("original_budget")),
+                        money(data.get("labor_hours_budget")) if data.get("cost_type") == "Labor" else 0,
+                        now,
+                        subbucket_id,
+                    ),
                 )
                 return json_response(self, {"ok": True})
             if parsed.path.startswith("/api/nte-cost-records/"):
