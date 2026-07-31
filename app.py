@@ -73,6 +73,7 @@ ALL_PERMISSION_DEFINITIONS = [
     {"key": "review_exceptions", "label": "Review Exceptions", "group": "Projects"},
     {"key": "vendor_invoices", "label": "Vendor Invoices", "group": "Projects"},
     {"key": "customer_billing", "label": "Customer Billing", "group": "Projects"},
+    {"key": "nte_tracking", "label": "T&M NTE Tracking", "group": "Projects"},
     {"key": "fieldwise_audit", "label": "Field Wise Audit", "group": "Company"},
     {"key": "bids", "label": "Bid Tracking", "group": "Company"},
     {"key": "mcc_quotes", "label": "MCC Quote Builder", "group": "Quoting"},
@@ -506,8 +507,68 @@ def init_db():
               raw_rate REAL DEFAULT 0,
               raw_cost_source TEXT,
               vendor TEXT,
+              nte_subbucket_id INTEGER REFERENCES nte_subbuckets(id) ON DELETE SET NULL,
               notes TEXT,
               created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS nte_buckets (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+              subproject_id INTEGER REFERENCES subprojects(id) ON DELETE CASCADE,
+              change_order_id INTEGER REFERENCES change_orders(id) ON DELETE CASCADE,
+              name TEXT NOT NULL,
+              description TEXT,
+              sort_order INTEGER DEFAULT 0,
+              active INTEGER DEFAULT 1,
+              created_at TEXT NOT NULL,
+              updated_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS nte_subbuckets (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              bucket_id INTEGER NOT NULL REFERENCES nte_buckets(id) ON DELETE CASCADE,
+              name TEXT NOT NULL,
+              cost_type TEXT,
+              description TEXT,
+              original_budget REAL DEFAULT 0,
+              sort_order INTEGER DEFAULT 0,
+              active INTEGER DEFAULT 1,
+              created_at TEXT NOT NULL,
+              updated_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS nte_bucket_additions (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+              bucket_id INTEGER NOT NULL REFERENCES nte_buckets(id) ON DELETE CASCADE,
+              subbucket_id INTEGER REFERENCES nte_subbuckets(id) ON DELETE SET NULL,
+              amount REAL DEFAULT 0,
+              status TEXT DEFAULT 'Pending',
+              requested_date TEXT,
+              approved_date TEXT,
+              approver TEXT,
+              reason TEXT,
+              support_file TEXT,
+              notes TEXT,
+              created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+              created_by_username TEXT,
+              created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS nte_coding_rules (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+              bucket_id INTEGER REFERENCES nte_buckets(id) ON DELETE CASCADE,
+              subbucket_id INTEGER NOT NULL REFERENCES nte_subbuckets(id) ON DELETE CASCADE,
+              cost_type TEXT,
+              match_field TEXT DEFAULT 'description',
+              match_text TEXT NOT NULL,
+              auto_apply INTEGER DEFAULT 0,
+              active INTEGER DEFAULT 1,
+              approval_count INTEGER DEFAULT 0,
+              created_at TEXT NOT NULL,
+              updated_at TEXT
             );
 
             CREATE TABLE IF NOT EXISTS vendor_invoice_allocations (
@@ -1040,22 +1101,24 @@ def init_db():
             con.execute("ALTER TABLE cost_records ADD COLUMN raw_rate REAL DEFAULT 0")
         if "raw_cost_source" not in cost_cols:
             con.execute("ALTER TABLE cost_records ADD COLUMN raw_cost_source TEXT")
+        if "nte_subbucket_id" not in cost_cols:
+            con.execute("ALTER TABLE cost_records ADD COLUMN nte_subbucket_id INTEGER REFERENCES nte_subbuckets(id) ON DELETE SET NULL")
         con.execute(
             """
             UPDATE cost_records
             SET amount = CASE
-                  WHEN change_order_id IS NOT NULL OR COALESCE((SELECT pricing_type FROM subprojects WHERE id = cost_records.subproject_id), 'Fixed') = 'T&M'
+                  WHEN change_order_id IS NOT NULL OR COALESCE((SELECT pricing_type FROM subprojects WHERE id = cost_records.subproject_id), 'Fixed') IN ('T&M', 'T&M NTE')
                     THEN COALESCE(sales_amount, 0) * ?
                   ELSE 0
                 END,
                 raw_rate = CASE
-                  WHEN change_order_id IS NOT NULL OR COALESCE((SELECT pricing_type FROM subprojects WHERE id = cost_records.subproject_id), 'Fixed') = 'T&M'
+                  WHEN change_order_id IS NOT NULL OR COALESCE((SELECT pricing_type FROM subprojects WHERE id = cost_records.subproject_id), 'Fixed') IN ('T&M', 'T&M NTE')
                     THEN COALESCE(sales_rate, rate, 0) * ?
                   ELSE 0
                 END,
                 raw_cost_source = CASE
                   WHEN change_order_id IS NOT NULL THEN 'CO T&M material estimate at 35% margin'
-                  WHEN COALESCE((SELECT pricing_type FROM subprojects WHERE id = cost_records.subproject_id), 'Fixed') = 'T&M' THEN 'Subproject T&M material estimate at 35% margin'
+                  WHEN COALESCE((SELECT pricing_type FROM subprojects WHERE id = cost_records.subproject_id), 'Fixed') IN ('T&M', 'T&M NTE') THEN 'Subproject T&M material estimate at 35% margin'
                   ELSE 'Usage only - not budget cost'
                 END
             WHERE cost_type = 'Field Ticket Material'
@@ -2161,6 +2224,50 @@ def raw_rate_for(cost_type, item, project_id=None):
     return {"category": category, "raw_rate": 0.0, "source": "Missing project rate"}
 
 
+def panel_shop_labor_records_from_tables(tables, work_description):
+    records = []
+    seen = set()
+    for page_number, table in tables:
+        if not table:
+            continue
+        header = [str(c or "").strip().lower() for c in table[0]]
+        has_panel_labor_header = "name" in header and "date" in header
+        if not has_panel_labor_header:
+            continue
+        for row in table[1:]:
+            if not row or not row[0]:
+                continue
+            employee = str(row[0] or "").strip()
+            row_text = " ".join(str(c or "").strip() for c in row if str(c or "").strip())
+            if not employee or employee.lower() in ("subtotal", "total"):
+                continue
+            match = re.search(r"\b(Panel\s+Shop)\s+([0-9]+(?:\.[0-9]+)?)\b", row_text, flags=re.IGNORECASE)
+            if not match:
+                continue
+            hours = money(match.group(2))
+            if not hours:
+                continue
+            labor_area = re.sub(r"\s+", " ", match.group(1)).strip().title()
+            item = f"{employee} - {labor_area} - Reg"
+            key = (item, hours, page_number)
+            if key in seen:
+                continue
+            seen.add(key)
+            records.append(
+                {
+                    "cost_type": "Labor",
+                    "item": item,
+                    "description": work_description,
+                    "qty": hours,
+                    "rate": 0,
+                    "amount": 0,
+                    "source_page": page_number,
+                    "panel_shop_hours": True,
+                }
+            )
+    return records
+
+
 def apply_internal_rate(category_type, category, raw_rate, rate_set_id=None):
     if category_type not in ("Labor", "Equipment"):
         return 0
@@ -2392,9 +2499,9 @@ def project_summary(project_id):
         SELECT
           COALESCE(SUM(
             CASE
-              WHEN cr.change_order_id IS NOT NULL AND COALESCE(co.pricing_type, 'Fixed') = 'T&M' THEN
+              WHEN cr.change_order_id IS NOT NULL AND COALESCE(co.pricing_type, 'Fixed') IN ('T&M', 'T&M NTE') THEN
                 CASE WHEN cr.source IN ('Field Wise', 'Field Wise PDF') THEN cr.amount ELSE 0 END
-              WHEN cr.change_order_id IS NULL AND COALESCE(sp.pricing_type, 'Fixed') = 'T&M' THEN
+              WHEN cr.change_order_id IS NULL AND COALESCE(sp.pricing_type, 'Fixed') IN ('T&M', 'T&M NTE') THEN
                 CASE WHEN cr.source IN ('Field Wise', 'Field Wise PDF') THEN cr.amount ELSE 0 END
               ELSE cr.amount
             END
@@ -2414,14 +2521,14 @@ def project_summary(project_id):
         SELECT
           COALESCE(SUM(
             CASE WHEN status IN ('Approved', 'Billed') THEN
-              CASE WHEN pricing_type = 'T&M' THEN
+              CASE WHEN pricing_type IN ('T&M', 'T&M NTE') THEN
                 COALESCE((SELECT SUM(cr.sales_amount) FROM cost_records cr WHERE cr.change_order_id = change_orders.id AND cr.source IN ('Field Wise', 'Field Wise PDF')), 0)
               ELSE approved_value END
             ELSE 0 END
           ), 0) approved_co_value,
           COALESCE(SUM(
             CASE WHEN status NOT IN ('Approved', 'Billed') THEN
-              CASE WHEN pricing_type = 'T&M' THEN
+              CASE WHEN pricing_type IN ('T&M', 'T&M NTE') THEN
                 COALESCE((SELECT SUM(cr.sales_amount) FROM cost_records cr WHERE cr.change_order_id = change_orders.id AND cr.source IN ('Field Wise', 'Field Wise PDF')), 0)
               ELSE quoted_value END
             ELSE 0 END
@@ -2434,7 +2541,7 @@ def project_summary(project_id):
     subproject_contract = one(
         """
         SELECT COALESCE(SUM(
-          CASE WHEN COALESCE(sp.pricing_type, 'Fixed') = 'T&M' THEN COALESCE(fw.fieldwise_sales, 0)
+          CASE WHEN COALESCE(sp.pricing_type, 'Fixed') IN ('T&M', 'T&M NTE') THEN COALESCE(fw.fieldwise_sales, 0)
           ELSE sp.contract_value END
         ), 0) base_contract_value
         FROM subprojects sp
@@ -2469,14 +2576,14 @@ def project_summary(project_id):
           sp.budget_labor + sp.budget_material + COALESCE(sp.budget_equipment, 0) AS budget_total,
           COALESCE(SUM(
             CASE
-              WHEN cr.change_order_id IS NULL AND COALESCE(sp.pricing_type, 'Fixed') = 'T&M' AND cr.source IN ('Field Wise', 'Field Wise PDF') THEN cr.amount
-              WHEN cr.change_order_id IS NULL AND COALESCE(sp.pricing_type, 'Fixed') <> 'T&M' THEN cr.amount
+              WHEN cr.change_order_id IS NULL AND COALESCE(sp.pricing_type, 'Fixed') IN ('T&M', 'T&M NTE') AND cr.source IN ('Field Wise', 'Field Wise PDF') THEN cr.amount
+              WHEN cr.change_order_id IS NULL AND COALESCE(sp.pricing_type, 'Fixed') NOT IN ('T&M', 'T&M NTE') THEN cr.amount
               ELSE 0
             END
           ), 0) actual_cost,
           COALESCE(SUM(CASE WHEN cr.cost_type = 'Labor' AND cr.change_order_id IS NULL THEN cr.qty ELSE 0 END), 0) labor_hours_used,
           COALESCE(SUM(CASE WHEN cr.change_order_id IS NULL AND cr.source IN ('Field Wise', 'Field Wise PDF') THEN cr.sales_amount ELSE 0 END), 0) fieldwise_sales,
-          CASE WHEN COALESCE(sp.pricing_type, 'Fixed') = 'T&M' THEN
+          CASE WHEN COALESCE(sp.pricing_type, 'Fixed') IN ('T&M', 'T&M NTE') THEN
             COALESCE(SUM(CASE WHEN cr.change_order_id IS NULL AND cr.source IN ('Field Wise', 'Field Wise PDF') THEN cr.sales_amount ELSE 0 END), 0)
           ELSE sp.contract_value END sales_value,
           COUNT(CASE WHEN cr.change_order_id IS NULL THEN 1 END) record_count
@@ -2511,7 +2618,7 @@ def project_summary(project_id):
           COALESCE(SUM(cr.amount), 0) actual_cost,
           COALESCE(SUM(CASE WHEN cr.cost_type = 'Labor' THEN cr.qty ELSE 0 END), 0) labor_hours_used,
           COALESCE(SUM(CASE WHEN cr.source IN ('Field Wise', 'Field Wise PDF') THEN cr.sales_amount ELSE 0 END), 0) fieldwise_sales,
-          CASE WHEN COALESCE(co.pricing_type, 'Fixed') = 'T&M' THEN
+          CASE WHEN COALESCE(co.pricing_type, 'Fixed') IN ('T&M', 'T&M NTE') THEN
             COALESCE(SUM(CASE WHEN cr.source IN ('Field Wise', 'Field Wise PDF') THEN cr.sales_amount ELSE 0 END), 0)
           ELSE
             CASE WHEN co.status IN ('Approved', 'Billed') THEN co.approved_value ELSE co.quoted_value END
@@ -2673,7 +2780,7 @@ def subproject_detail(subproject_id, change_order_id=None):
             """
             SELECT
               co.*,
-              CASE WHEN COALESCE(co.pricing_type, 'Fixed') = 'T&M' THEN
+              CASE WHEN COALESCE(co.pricing_type, 'Fixed') IN ('T&M', 'T&M NTE') THEN
                 COALESCE((SELECT SUM(cr.sales_amount) FROM cost_records cr WHERE cr.change_order_id = co.id AND cr.source IN ('Field Wise', 'Field Wise PDF')), 0)
               ELSE
                 CASE WHEN co.status IN ('Approved', 'Billed') THEN co.approved_value ELSE co.quoted_value END
@@ -2690,8 +2797,8 @@ def subproject_detail(subproject_id, change_order_id=None):
             cost_scope_sql = "subproject_id = ? AND change_order_id = ?"
             cost_scope_params = [subproject_id, change_order_id]
     is_tm_scope = (
-        (selected_co and (selected_co.get("pricing_type") or "Fixed") == "T&M")
-        or (not selected_co and (subproject.get("pricing_type") or "Fixed") == "T&M")
+        (selected_co and is_tm_like_pricing(selected_co.get("pricing_type")))
+        or (not selected_co and is_tm_like_pricing(subproject.get("pricing_type")))
     )
     totals = one(
         f"""
@@ -2740,7 +2847,7 @@ def subproject_detail(subproject_id, change_order_id=None):
     )
     budget_total = money(subproject["budget_labor"]) + money(subproject["budget_material"]) + money(subproject.get("budget_equipment"))
     contract = money(selected_co["sales_value"]) if selected_co else (
-        money(totals["fieldwise_sales"]) if (subproject.get("pricing_type") or "Fixed") == "T&M" else money(subproject["contract_value"])
+        money(totals["fieldwise_sales"]) if is_tm_like_pricing(subproject.get("pricing_type")) else money(subproject["contract_value"])
     )
     raw_actual = money(totals["raw_actual"])
     profit = contract - raw_actual
@@ -4030,7 +4137,7 @@ def import_fieldwise_xlsx(path, project_id):
     matched_subproject_is_tm = False
     if matched_subproject_id:
         sp_rate_row = one("SELECT COALESCE(pricing_type, 'Fixed') pricing_type FROM subprojects WHERE id = ?", (matched_subproject_id,))
-        matched_subproject_is_tm = bool(sp_rate_row and sp_rate_row["pricing_type"] == "T&M")
+        matched_subproject_is_tm = bool(sp_rate_row and is_tm_like_pricing(sp_rate_row["pricing_type"]))
 
     ws = wb["Line Items"]
     headers = [str(c.value).strip() if c.value else "" for c in ws[1]]
@@ -4046,7 +4153,7 @@ def import_fieldwise_xlsx(path, project_id):
     with db() as con:
         if matched_subproject_id:
             sp_rate_row = con.execute("SELECT COALESCE(pricing_type, 'Fixed') pricing_type FROM subprojects WHERE id = ?", (matched_subproject_id,)).fetchone()
-            matched_subproject_is_tm = bool(sp_rate_row and sp_rate_row["pricing_type"] == "T&M")
+            matched_subproject_is_tm = bool(sp_rate_row and is_tm_like_pricing(sp_rate_row["pricing_type"]))
         for row in ws.iter_rows(min_row=2, values_only=True):
             if not any(row):
                 continue
@@ -4153,6 +4260,7 @@ def import_fieldwise_pdf(path, project_id):
 
     job_text = table_value("Job #") or first_regex([r"Job\s*#\s+(.+)"], text)
     order_number = first_regex([r"^([A-Za-z0-9\-]+)"], job_text, flags=0)
+    master_order_number = first_regex([r"Master\s+Job\s+Order\s+(?:for\s+this\s+project\s+is\s+)?#?\s*([A-Za-z0-9\-]+)"], text, flags=re.IGNORECASE)
     ticket_number = first_regex([r"Field\s*Ticket\s*#\s*([A-Za-z0-9\-]+)"], text)
     record_date = table_value("Ticket Date") or first_regex([r"Ticket\s*Date\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4})"], text)
     status = "Imported"
@@ -4164,14 +4272,18 @@ def import_fieldwise_pdf(path, project_id):
 
     matched_subproject = None
     matched_change_order = None
-    if order_number:
+    match_order_numbers = []
+    for candidate in (order_number, master_order_number):
+        if candidate and candidate not in match_order_numbers:
+            match_order_numbers.append(candidate)
+    for candidate_order_number in match_order_numbers:
         matched_change_order = one(
             "SELECT id, subproject_id FROM change_orders WHERE project_id = ? AND job_number = ? ORDER BY id LIMIT 1",
-            (project_id, order_number),
+            (project_id, candidate_order_number),
         )
         matched_subproject = one(
             "SELECT id FROM subprojects WHERE project_id = ? AND job_number = ?",
-            (project_id, order_number),
+            (project_id, candidate_order_number),
         )
         if not matched_subproject:
             matched_subproject = one(
@@ -4183,8 +4295,10 @@ def import_fieldwise_pdf(path, project_id):
                 ORDER BY length(code) DESC
                 LIMIT 1
                 """,
-                (project_id, order_number),
+                (project_id, candidate_order_number),
             )
+        if matched_change_order or matched_subproject:
+            break
     matched_subproject_id = matched_subproject["id"] if matched_subproject else None
     matched_change_order_id = matched_change_order["id"] if matched_change_order else None
     if matched_change_order and matched_change_order["subproject_id"]:
@@ -4192,7 +4306,7 @@ def import_fieldwise_pdf(path, project_id):
     matched_subproject_is_tm = False
     if matched_subproject_id:
         sp_rate_row = one("SELECT COALESCE(pricing_type, 'Fixed') pricing_type FROM subprojects WHERE id = ?", (matched_subproject_id,))
-        matched_subproject_is_tm = bool(sp_rate_row and sp_rate_row["pricing_type"] == "T&M")
+        matched_subproject_is_tm = bool(sp_rate_row and is_tm_like_pricing(sp_rate_row["pricing_type"]))
 
     source_file = Path(path).name
     records = []
@@ -4269,6 +4383,9 @@ def import_fieldwise_pdf(path, project_id):
             for row in table:
                 add_fieldwise_item_row(row, page_number)
 
+    for record in panel_shop_labor_records_from_tables(tables, work_description):
+        add_extracted_record(record)
+
     if not records:
         amount_text = first_regex([r"TOTAL\s*\$?\s*([0-9,]+\.[0-9]{2})"], text)
         records.append(
@@ -4286,6 +4403,20 @@ def import_fieldwise_pdf(path, project_id):
     count = 0
     skipped = 0
     seen_record_counts = {}
+    if records and any(record["cost_type"] != "Uncoded" for record in records):
+        execute(
+            """
+            DELETE FROM cost_records
+            WHERE project_id = ?
+              AND source = 'Field Wise PDF'
+              AND ticket_or_invoice = ?
+              AND cost_type = 'Uncoded'
+              AND item = 'PDF Field Ticket'
+              AND COALESCE(amount, 0) = 0
+              AND COALESCE(sales_amount, 0) = 0
+            """,
+            (project_id, ticket_number),
+        )
     for record in records:
         rate_info = raw_rate_for(record["cost_type"], record["item"], project_id)
         sales_rate = money(record["rate"])
@@ -4358,7 +4489,7 @@ def import_fieldwise_pdf(path, project_id):
                 sales_amount,
                 raw_rate,
                 rate_info["source"],
-                json.dumps({"job_text": job_text, "rate_category": rate_info["category"], "source_page": record.get("source_page"), "extracted_text": text[:12000]}, default=str),
+                json.dumps({"job_text": job_text, "master_order_number": master_order_number, "rate_category": rate_info["category"], "source_page": record.get("source_page"), "extracted_text": text[:12000]}, default=str),
                 datetime.now().isoformat(timespec="seconds"),
             ),
         )
@@ -4947,6 +5078,226 @@ def sync_po_invoice_cost_record(con, po, invoice_file, actor):
     return cur.lastrowid
 
 
+def is_tm_like_pricing(value):
+    return str(value or "Fixed") in ("T&M", "T&M NTE")
+
+
+def nte_match_text_for_record(record):
+    text = " ".join(str(record.get(k) or "") for k in ("item", "description")).strip()
+    words = re.findall(r"[A-Za-z0-9#&/.-]+", text)
+    useful = [w for w in words if len(w) > 2][:6]
+    return " ".join(useful) or str(record.get("ticket_or_invoice") or "").strip()
+
+
+def ensure_nte_defaults(con, project_id, subproject_id=None, change_order_id=None):
+    project_id = int(project_id)
+    subproject_id = int(subproject_id) if subproject_id else None
+    change_order_id = int(change_order_id) if change_order_id else None
+    existing = con.execute(
+        """
+        SELECT id
+        FROM nte_buckets
+        WHERE project_id = ?
+          AND COALESCE(subproject_id, 0) = COALESCE(?, 0)
+          AND COALESCE(change_order_id, 0) = COALESCE(?, 0)
+        LIMIT 1
+        """,
+        (project_id, subproject_id, change_order_id),
+    ).fetchone()
+    if existing:
+        return existing["id"]
+    now = datetime.now().isoformat(timespec="seconds")
+    if change_order_id:
+        target = con.execute(
+            """
+            SELECT co.co_number, co.job_number, co.title
+            FROM change_orders co
+            WHERE co.id = ? AND co.project_id = ?
+            """,
+            (change_order_id, project_id),
+        ).fetchone()
+        if not target:
+            return None
+        bucket_name = " - ".join(str(x) for x in (target["co_number"], target["title"] or target["job_number"]) if x) or "NTE Scope"
+        defaults = [("Labor", "Labor", 0), ("Material", "Material", 0), ("Equipment", "Equipment", 0)]
+    else:
+        target = con.execute("SELECT * FROM subprojects WHERE id = ? AND project_id = ?", (subproject_id, project_id)).fetchone()
+        if not target:
+            return None
+        bucket_name = " - ".join(str(x) for x in (target["code"], target["name"]) if x) or "NTE Scope"
+        defaults = [
+            ("Labor", "Labor", target["budget_labor"]),
+            ("Material", "Material", target["budget_material"]),
+            ("Equipment", "Equipment", target["budget_equipment"]),
+        ]
+    cur = con.execute(
+        """
+        INSERT INTO nte_buckets (project_id, subproject_id, change_order_id, name, description, sort_order, active, created_at, updated_at)
+        VALUES (?, ?, ?, ?, 'Seeded from job setup; edit these buckets as the NTE scope changes.', 10, 1, ?, ?)
+        """,
+        (project_id, subproject_id, change_order_id, bucket_name, now, now),
+    )
+    bucket_id = cur.lastrowid
+    for idx, (name, cost_type, budget) in enumerate(defaults, start=1):
+        con.execute(
+            """
+            INSERT INTO nte_subbuckets (bucket_id, name, cost_type, original_budget, sort_order, active, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+            """,
+            (bucket_id, name, cost_type, money(budget), idx * 10, now, now),
+        )
+    return bucket_id
+
+
+def nte_targets(project_id):
+    return rows(
+        """
+        SELECT
+          'sp:' || sp.id AS target_key,
+          'Subproject' AS target_type,
+          sp.id AS subproject_id,
+          NULL AS change_order_id,
+          sp.job_number,
+          sp.code,
+          sp.name,
+          sp.pricing_type,
+          p.customer,
+          p.name AS project_name
+        FROM subprojects sp
+        JOIN projects p ON p.id = sp.project_id
+        WHERE sp.project_id = ? AND COALESCE(sp.pricing_type, 'Fixed') = 'T&M NTE'
+        UNION ALL
+        SELECT
+          'co:' || co.id AS target_key,
+          COALESCE(co.order_type, 'Change Order') AS target_type,
+          co.subproject_id,
+          co.id AS change_order_id,
+          co.job_number,
+          co.co_number AS code,
+          co.title AS name,
+          co.pricing_type,
+          p.customer,
+          p.name AS project_name
+        FROM change_orders co
+        JOIN projects p ON p.id = co.project_id
+        WHERE co.project_id = ? AND COALESCE(co.pricing_type, 'Fixed') = 'T&M NTE'
+        ORDER BY target_type, job_number, code
+        """,
+        (project_id, project_id),
+    )
+
+
+def nte_summary(project_id, subproject_id=None, change_order_id=None, seed_defaults=False):
+    project_id = int(project_id) if project_id else None
+    subproject_id = int(subproject_id) if subproject_id else None
+    change_order_id = int(change_order_id) if change_order_id else None
+    with db() as con:
+        if seed_defaults:
+            ensure_nte_defaults(con, project_id, subproject_id, change_order_id)
+        bucket_rows = [dict(r) for r in con.execute(
+            """
+            SELECT *
+            FROM nte_buckets
+            WHERE project_id = ?
+              AND COALESCE(subproject_id, 0) = COALESCE(?, 0)
+              AND COALESCE(change_order_id, 0) = COALESCE(?, 0)
+              AND COALESCE(active, 1) = 1
+            ORDER BY sort_order, name
+            """,
+            (project_id, subproject_id or None, change_order_id or None),
+        ).fetchall()]
+        sub_rows = [dict(r) for r in con.execute(
+            """
+            SELECT sb.*
+            FROM nte_subbuckets sb
+            JOIN nte_buckets b ON b.id = sb.bucket_id
+            WHERE b.project_id = ?
+              AND COALESCE(b.subproject_id, 0) = COALESCE(?, 0)
+              AND COALESCE(b.change_order_id, 0) = COALESCE(?, 0)
+              AND COALESCE(sb.active, 1) = 1
+            ORDER BY sb.sort_order, sb.name
+            """,
+            (project_id, subproject_id or None, change_order_id or None),
+        ).fetchall()]
+        additions = [dict(r) for r in con.execute(
+            """
+            SELECT a.*
+            FROM nte_bucket_additions a
+            JOIN nte_buckets b ON b.id = a.bucket_id
+            WHERE a.project_id = ?
+              AND COALESCE(b.subproject_id, 0) = COALESCE(?, 0)
+              AND COALESCE(b.change_order_id, 0) = COALESCE(?, 0)
+            ORDER BY a.created_at DESC, a.id DESC
+            """,
+            (project_id, subproject_id or None, change_order_id or None),
+        ).fetchall()]
+        actuals = {
+            r["nte_subbucket_id"]: money(r["actual"])
+            for r in con.execute(
+                """
+                SELECT nte_subbucket_id, COALESCE(SUM(amount), 0) AS actual
+                FROM cost_records
+                WHERE project_id = ? AND nte_subbucket_id IS NOT NULL
+                GROUP BY nte_subbucket_id
+                """,
+                (project_id,),
+            ).fetchall()
+        }
+    additions_by_sub = {}
+    additions_by_bucket = {}
+    for addition in additions:
+        if addition.get("status") == "Approved":
+            additions_by_bucket[addition["bucket_id"]] = additions_by_bucket.get(addition["bucket_id"], 0) + money(addition["amount"])
+            if addition.get("subbucket_id"):
+                additions_by_sub[addition["subbucket_id"]] = additions_by_sub.get(addition["subbucket_id"], 0) + money(addition["amount"])
+    by_bucket = {b["id"]: {**b, "subbuckets": [], "original_budget": 0, "approved_additions": 0, "current_budget": 0, "actual_cost": 0, "remaining": 0} for b in bucket_rows}
+    for sub in sub_rows:
+        approved = additions_by_sub.get(sub["id"], 0)
+        actual = actuals.get(sub["id"], 0)
+        current = money(sub["original_budget"]) + approved
+        item = {**sub, "approved_additions": approved, "current_budget": current, "actual_cost": actual, "remaining": current - actual}
+        bucket = by_bucket.get(sub["bucket_id"])
+        if bucket:
+            bucket["subbuckets"].append(item)
+            bucket["original_budget"] += money(sub["original_budget"])
+            bucket["approved_additions"] += approved
+            bucket["actual_cost"] += actual
+    for bucket in by_bucket.values():
+        bucket["approved_additions"] = max(bucket["approved_additions"], additions_by_bucket.get(bucket["id"], bucket["approved_additions"]))
+        bucket["current_budget"] = bucket["original_budget"] + bucket["approved_additions"]
+        bucket["remaining"] = bucket["current_budget"] - bucket["actual_cost"]
+    return {"buckets": list(by_bucket.values()), "additions": additions}
+
+
+def nte_rule_suggestion(con, record):
+    haystacks = {
+        "item": str(record.get("item") or "").lower(),
+        "description": str(record.get("description") or "").lower(),
+        "item_description": " ".join(str(record.get(k) or "") for k in ("item", "description")).lower(),
+    }
+    rules = con.execute(
+        """
+        SELECT r.*, sb.name AS subbucket_name, b.name AS bucket_name
+        FROM nte_coding_rules r
+        JOIN nte_subbuckets sb ON sb.id = r.subbucket_id
+        JOIN nte_buckets b ON b.id = sb.bucket_id
+        WHERE r.project_id = ? AND COALESCE(r.active, 1) = 1
+        ORDER BY r.auto_apply DESC, r.approval_count DESC, LENGTH(r.match_text) DESC
+        """,
+        (record.get("project_id"),),
+    ).fetchall()
+    for rule in rules:
+        if rule["cost_type"] and record.get("cost_type") and rule["cost_type"] != record.get("cost_type"):
+            continue
+        match_text = str(rule["match_text"] or "").strip().lower()
+        if not match_text:
+            continue
+        field = rule["match_field"] if rule["match_field"] in haystacks else "item_description"
+        if match_text in haystacks[field]:
+            return dict(rule)
+    return None
+
+
 LOGIN_HTML = r"""
 <!doctype html>
 <html lang="en">
@@ -5494,6 +5845,7 @@ HTML = r"""
           <button data-tab="review" data-nav-area="project" data-nav-level="sub">Review Exceptions</button>
           <button data-tab="invoices" data-nav-area="project" data-nav-level="sub">Vendor Invoices</button>
           <button data-tab="billing" data-nav-area="project" data-nav-level="sub">Customer Billing</button>
+          <button data-tab="nteTracking" data-nav-area="project" data-nav-level="sub">T&M NTE</button>
           <button data-tab="projectPo" data-nav-area="project" data-nav-level="sub" class="po-feature-disabled">POs</button>
           <button data-tab="archivedProjects" data-nav-area="project" data-nav-level="sub">Archived Projects</button>
         </div>
@@ -5864,7 +6216,7 @@ HTML = r"""
           <label>Job / Order #</label><input name="job_number" placeholder="304">
           <label>Code</label><input name="code" placeholder="FC">
           <label>Name</label><input name="name" placeholder="Flow Computer">
-          <label>Pricing Method</label><select name="pricing_type"><option>Fixed</option><option>T&M</option></select>
+          <label>Pricing Method</label><select name="pricing_type"><option>Fixed</option><option>T&M</option><option>T&M NTE</option></select>
           <label>Contract Value</label><input name="contract_value" type="number" step="0.01" value="0">
           <label>Labor Hours Budget</label><input name="budget_labor_hours" type="number" step="0.01" value="0">
           <label>Budget Labor</label><input name="budget_labor" type="number" step="0.01" value="0">
@@ -5880,7 +6232,7 @@ HTML = r"""
           <div><label>Type</label><select name="order_type"><option>Change Order</option><option>Child Project</option></select></div>
           <div><label>CO Number</label><input name="co_number" placeholder="CO-001"></div>
           <div><label>Job / Order #</label><input name="job_number" placeholder="304-CO1"></div>
-          <div><label>Pricing Method</label><select name="pricing_type" id="coPricingType"><option>Fixed</option><option>T&M</option></select></div>
+          <div><label>Pricing Method</label><select name="pricing_type" id="coPricingType"><option>Fixed</option><option>T&M</option><option>T&M NTE</option></select></div>
         </div>
         <div class="grid cols-4">
           <div><label>Status</label><select name="status"><option>Pending</option><option>Approved</option><option>Rejected</option><option>Billed</option></select></div>
@@ -6028,6 +6380,81 @@ HTML = r"""
         <h2>Customer Invoice Tracking</h2>
         <div id="customerInvoiceSummary"></div>
         <div class="table-wrap" style="margin-top:12px"><table id="customerInvoiceTable"></table></div>
+      </div>
+    </section>
+
+    <section id="nteTracking" class="tab hidden">
+      <div class="panel">
+        <div class="section-head">
+          <div>
+            <h2>T&M NTE Tracking</h2>
+            <p class="muted">Track editable NTE buckets, sub-buckets, approved additions, and Field Wise cost coding for the selected project.</p>
+          </div>
+          <button class="btn" id="refreshNteTracking" type="button">Refresh</button>
+        </div>
+        <div class="grid cols-4">
+          <div style="grid-column:span 2"><label>NTE Job / Child Project</label><select id="nteTargetSelect"></select></div>
+          <div style="align-self:end"><button class="btn primary" id="seedNteDefaults" type="button">Create Default Buckets</button></div>
+          <div style="align-self:end"><button class="btn" id="applyNteRules" type="button">Apply Saved Coding Rules</button></div>
+        </div>
+        <p id="nteTrackingResult" class="muted"></p>
+        <div id="nteSummaryCards" class="grid cols-4" style="margin-top:12px"></div>
+      </div>
+      <div class="grid cols-2" style="margin-top:14px">
+        <form class="panel" id="nteBucketForm">
+          <h2>Add Bucket</h2>
+          <label>Bucket Name</label><input name="name" placeholder="FC, AC, SWD, Base Scope" required>
+          <label>Description</label><textarea name="description" placeholder="What this bucket covers"></textarea>
+          <label>Sort Order</label><input name="sort_order" type="number" step="1" value="10">
+          <div class="actions"><button class="btn primary" type="submit">Add Bucket</button></div>
+        </form>
+        <form class="panel" id="nteSubbucketForm">
+          <h2>Add Sub-Bucket</h2>
+          <label>Bucket</label><select name="bucket_id" id="nteSubbucketBucket"></select>
+          <div class="grid cols-2">
+            <div><label>Name</label><input name="name" placeholder="Labor, Material, Electrical Wiring" required></div>
+            <div><label>Cost Type</label><select name="cost_type"><option>Labor</option><option>Material</option><option>Field Ticket Material</option><option>Equipment</option><option>Rental</option><option>Other</option></select></div>
+          </div>
+          <label>Original Budget</label><input name="original_budget" type="number" step="0.01" value="0">
+          <label>Description</label><textarea name="description" placeholder="Scope included in this sub-bucket"></textarea>
+          <label>Sort Order</label><input name="sort_order" type="number" step="1" value="10">
+          <div class="actions"><button class="btn primary" type="submit">Add Sub-Bucket</button></div>
+        </form>
+      </div>
+      <div class="panel" style="margin-top:14px">
+        <h2>Bucket Rollup</h2>
+        <div class="table-wrap"><table id="nteBucketTable"></table></div>
+      </div>
+      <form class="panel" id="nteAdditionForm" style="margin-top:14px">
+        <h2>Documented Budget Addition</h2>
+        <p class="muted">Use this when the customer adds scope or approves more NTE budget. Attach the backup so the change is defensible later.</p>
+        <div class="grid cols-4">
+          <div><label>Bucket</label><select name="bucket_id" id="nteAdditionBucket"></select></div>
+          <div><label>Sub-Bucket</label><select name="subbucket_id" id="nteAdditionSubbucket"></select></div>
+          <div><label>Amount</label><input name="amount" type="number" step="0.01" value="0" required></div>
+          <div><label>Status</label><select name="status"><option>Pending</option><option>Approved</option><option>Rejected</option></select></div>
+          <div><label>Requested Date</label><input name="requested_date" type="date"></div>
+          <div><label>Approved Date</label><input name="approved_date" type="date"></div>
+          <div><label>Approver</label><input name="approver" placeholder="Customer contact"></div>
+          <div><label>Backup Document</label><input name="support_file" type="file" accept=".pdf,.png,.jpg,.jpeg,.webp,.xlsx,.xlsm"></div>
+        </div>
+        <label>Reason</label><input name="reason" placeholder="Why the bucket increased">
+        <label>Notes</label><textarea name="notes" placeholder="Internal notes"></textarea>
+        <div class="actions"><button class="btn primary" type="submit">Add Budget Addition</button></div>
+      </form>
+      <div class="panel" style="margin-top:14px">
+        <h2>Addition History</h2>
+        <div class="table-wrap"><table id="nteAdditionTable"></table></div>
+      </div>
+      <div class="panel" style="margin-top:14px">
+        <h2>Field Wise NTE Coding</h2>
+        <p class="muted">Assign imported Field Wise lines to sub-buckets. Use Remember to teach the app how similar lines should be coded next time.</p>
+        <div id="nteCostFilters" class="cost-filter" style="margin-bottom:10px"></div>
+        <div class="table-wrap"><table id="nteCostTable"></table></div>
+      </div>
+      <div class="panel" style="margin-top:14px">
+        <h2>Saved Coding Rules</h2>
+        <div class="table-wrap"><table id="nteRuleTable"></table></div>
       </div>
     </section>
 
@@ -6380,6 +6807,10 @@ HTML = r"""
     let officePoRows = [];
     let closedPoRows = [];
     let projectPoRows = [];
+    let nteTargets = [];
+    let nteData = { buckets: [], additions: [] };
+    let nteCosts = [];
+    let nteRules = [];
     let rolePermissionsData = null;
     let fieldWiseAuditData = null;
     let fieldWiseAuditOmissions = [];
@@ -6387,6 +6818,7 @@ HTML = r"""
     const initializedHierarchyNodes = new Set();
     const money = v => Number(v || 0).toLocaleString(undefined, { style: 'currency', currency: 'USD' });
     const pct = v => `${(Number(v || 0) * 100).toFixed(1)}%`;
+    const isTmPricing = v => ['T&M', 'T&M NTE'].includes(String(v || 'Fixed'));
     const htmlEscape = v => String(v ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
     const help = text => `<span class="help-marker" tabindex="0" aria-label="${htmlEscape(text)}">?<span class="help-popover">${htmlEscape(text)}</span></span>`;
     const TAB_PERMISSIONS = {
@@ -6397,6 +6829,7 @@ HTML = r"""
       review: 'review_exceptions',
       invoices: 'vendor_invoices',
       billing: 'customer_billing',
+      nteTracking: 'nte_tracking',
       projectPo: 'po_review',
       fieldwiseAudit: 'fieldwise_audit',
       bids: 'bids',
@@ -6543,7 +6976,7 @@ HTML = r"""
     });
 
     function navOptionsForTab(tabName) {
-      const projectTabs = ['dashboard','newMasterProject','setup','import','review','invoices','billing','projectPo','archivedProjects'];
+      const projectTabs = ['dashboard','newMasterProject','setup','import','review','invoices','billing','nteTracking','projectPo','archivedProjects'];
       const poTabs = ['fieldPo','officePo','closedPo','cogSetup'];
       const quotingTabs = ['mccQuotes','mccQuoteSetup'];
       const homeTabs = ['home','bids','jobOrderReport','admin','activity'];
@@ -6682,6 +7115,7 @@ HTML = r"""
       if (tabName === 'fieldwiseAudit') loadFieldWiseAuditOmissions();
       if (tabName === 'invoices') { loadVendorInvoiceLines(); loadVendorAllocationHistory(); }
       if (tabName === 'billing') loadCustomerInvoices();
+      if (tabName === 'nteTracking') loadNteTracking();
       if (tabName === 'projectPo') loadProjectPos();
       if (tabName === 'newMasterProject') loadNewMasterProjectForm();
       if (tabName === 'bids') loadBidDashboard();
@@ -7887,6 +8321,7 @@ HTML = r"""
       loadVendorAllocationHistory();
       loadCustomerInvoices();
       refreshOpenDetails();
+      if (!document.getElementById('nteTracking')?.classList.contains('hidden')) loadNteTracking();
     }
 
     function fillSelects() {
@@ -7955,8 +8390,8 @@ HTML = r"""
             <div class="muted">${s.project.description || ''}</div>
           </div>
           ${s.subprojects.map(x => {
-            const subprojectHelp = x.pricing_type === 'T&M'
-              ? 'T&M subproject actual uses Field Wise labor, equipment, and Field Wise material costs. Vendor invoices are shown for reference but are not counted in T&M raw cost.'
+            const subprojectHelp = isTmPricing(x.pricing_type)
+              ? 'T&M style subproject actual uses Field Wise labor, equipment, and Field Wise material costs. Vendor invoices are shown for reference but are not counted in raw cost.'
               : 'Fixed subproject actual includes assigned cost records, including vendor invoices. Click to open this subproject detail.'
             return `<div class="job-chip clickable help-card" data-banner-subproject="${x.id}" role="button" tabindex="0">${help(subprojectHelp)}<div class="job">${[x.job_number, x.code].filter(Boolean).join(' ')}</div><div class="label">${x.name}</div><div class="label">${money(x.actual_cost)} actual</div></div>`;
           }).join('')}
@@ -8924,7 +9359,7 @@ HTML = r"""
         const laborUsed = Number(x.labor_hours_used || 0);
         const laborBudget = Number(x.budget_labor_hours || 0);
         const laborPct = laborBudget ? laborUsed / laborBudget : 0;
-        const salesValue = x.pricing_type === 'T&M' ? x.sales_value : x.contract_value;
+        const salesValue = isTmPricing(x.pricing_type) ? x.sales_value : x.contract_value;
         const profit = Number(x.profit || 0);
         const margin = Number(x.margin || 0);
         const open = `<button class="btn" style="padding:4px 7px" data-open-subproject="${x.id}" type="button">Open</button>`;
@@ -9094,8 +9529,8 @@ HTML = r"""
       const budgetPct = Number(d.budget_used || 0);
       document.getElementById('subprojectDetail').innerHTML = `
         <div class="grid cols-4">
-          <div class="panel kpi help-card">${help(d.subproject.pricing_type === 'T&M' && !d.selected_change_order ? 'For T&M base work, sales value is the total Field Wise billable sales imported for this subproject.' : 'For fixed work, contract value is the entered subproject contract or selected change order value.')}<div class="label">${d.subproject.pricing_type === 'T&M' && !d.selected_change_order ? 'Field Wise Sales Value' : 'Contract Value'}</div><div class="value">${money(d.contract_value)}</div><div class="hint">${d.subproject.pricing_type || 'Fixed'} pricing</div></div>
-          <div class="panel kpi help-card">${help(d.subproject.pricing_type === 'T&M' && !d.selected_change_order ? 'For T&M profit, raw actual cost uses Field Wise labor, equipment, and Field Wise material costs. Vendor invoices are visible below but not counted here.' : 'Raw actual cost is the assigned cost-record total for this scope.')}<div class="label">Raw Actual Cost</div><div class="value">${money(d.raw_actual)}</div><div class="hint">Budget used ${pct(budgetPct)}</div></div>
+          <div class="panel kpi help-card">${help(isTmPricing(d.subproject.pricing_type) && !d.selected_change_order ? 'For T&M style base work, sales value is the total Field Wise billable sales imported for this subproject.' : 'For fixed work, contract value is the entered subproject contract or selected change order value.')}<div class="label">${isTmPricing(d.subproject.pricing_type) && !d.selected_change_order ? 'Field Wise Sales Value' : 'Contract Value'}</div><div class="value">${money(d.contract_value)}</div><div class="hint">${d.subproject.pricing_type || 'Fixed'} pricing</div></div>
+          <div class="panel kpi help-card">${help(isTmPricing(d.subproject.pricing_type) && !d.selected_change_order ? 'For T&M style profit, raw actual cost uses Field Wise labor, equipment, and Field Wise material costs. Vendor invoices are visible below but not counted here.' : 'Raw actual cost is the assigned cost-record total for this scope.')}<div class="label">Raw Actual Cost</div><div class="value">${money(d.raw_actual)}</div><div class="hint">Budget used ${pct(budgetPct)}</div></div>
           <div class="panel kpi help-card">${help('Profit equals the sales or contract value minus raw actual cost. Margin equals profit divided by sales or contract value.')}<div class="label">Profit</div><div class="value ${d.profit >= 0 ? 'good' : 'bad'}">${money(d.profit)}</div><div class="hint">Margin ${pct(d.margin)}</div></div>
           <div class="panel kpi help-card">${help('Labor hours are summed from Labor cost records for the selected scope and compared against the subproject labor-hour budget.')}<div class="label">Labor Hours</div><div class="value">${Number(d.labor_hours_used || 0).toFixed(2)}</div><div class="hint">of ${Number(d.labor_hours_budget || 0).toFixed(2)} budgeted</div></div>
         </div>
@@ -9219,7 +9654,7 @@ HTML = r"""
           <td><input data-sp="${s.id}" data-field="job_number" value="${s.job_number || ''}"></td>
           <td><input data-sp="${s.id}" data-field="code" value="${s.code || ''}"></td>
           <td><input data-sp="${s.id}" data-field="name" value="${s.name || ''}"></td>
-          <td><select data-sp="${s.id}" data-field="pricing_type"><option ${s.pricing_type === 'Fixed' ? 'selected' : ''}>Fixed</option><option ${s.pricing_type === 'T&M' ? 'selected' : ''}>T&M</option></select></td>
+          <td><select data-sp="${s.id}" data-field="pricing_type"><option ${s.pricing_type === 'Fixed' ? 'selected' : ''}>Fixed</option><option ${s.pricing_type === 'T&M' ? 'selected' : ''}>T&M</option><option ${s.pricing_type === 'T&M NTE' ? 'selected' : ''}>T&M NTE</option></select></td>
           <td><input data-sp="${s.id}" data-field="contract_value" type="number" step="0.01" value="${s.contract_value || 0}"></td>
           <td><input data-sp="${s.id}" data-field="budget_labor_hours" type="number" step="0.01" value="${s.budget_labor_hours || 0}"></td>
           <td><input data-sp="${s.id}" data-field="budget_labor" type="number" step="0.01" value="${s.budget_labor || 0}"></td>
@@ -9272,7 +9707,7 @@ HTML = r"""
           <td><select data-co-edit="${c.id}" data-field="order_type"><option ${c.order_type === 'Change Order' || !c.order_type ? 'selected' : ''}>Change Order</option><option ${c.order_type === 'Child Project' ? 'selected' : ''}>Child Project</option></select></td>
           <td><input data-co-edit="${c.id}" data-field="co_number" value="${htmlEscape(c.co_number || '')}"></td>
           <td><input data-co-edit="${c.id}" data-field="job_number" value="${htmlEscape(c.job_number || '')}"></td>
-          <td><select data-co-edit="${c.id}" data-field="pricing_type"><option ${c.pricing_type === 'Fixed' ? 'selected' : ''}>Fixed</option><option ${c.pricing_type === 'T&M' ? 'selected' : ''}>T&M</option></select></td>
+          <td><select data-co-edit="${c.id}" data-field="pricing_type"><option ${c.pricing_type === 'Fixed' ? 'selected' : ''}>Fixed</option><option ${c.pricing_type === 'T&M' ? 'selected' : ''}>T&M</option><option ${c.pricing_type === 'T&M NTE' ? 'selected' : ''}>T&M NTE</option></select></td>
           <td><select data-co-edit="${c.id}" data-field="status"><option ${c.status === 'Pending' ? 'selected' : ''}>Pending</option><option ${c.status === 'Approved' ? 'selected' : ''}>Approved</option><option ${c.status === 'Rejected' ? 'selected' : ''}>Rejected</option><option ${c.status === 'Billed' ? 'selected' : ''}>Billed</option></select></td>
           <td><input data-co-edit="${c.id}" data-field="title" value="${htmlEscape(c.title || '')}"></td>
           <td><input data-co-edit="${c.id}" data-field="quoted_value" type="number" step="0.01" value="${c.quoted_value || 0}"></td>
@@ -9720,6 +10155,312 @@ HTML = r"""
         };
       });
     }
+
+    function selectedNteTarget() {
+      const value = document.getElementById('nteTargetSelect')?.value || '';
+      return nteTargets.find(t => t.target_key === value) || null;
+    }
+
+    function nteTargetParams(target=selectedNteTarget()) {
+      if (!target) return '';
+      const params = new URLSearchParams({ project_id: state.projectId });
+      if (target.subproject_id) params.set('subproject_id', target.subproject_id);
+      if (target.change_order_id) params.set('change_order_id', target.change_order_id);
+      return params.toString();
+    }
+
+    function nteSubbucketOptions(selected='') {
+      const options = [];
+      (nteData.buckets || []).forEach(bucket => {
+        (bucket.subbuckets || []).forEach(sub => {
+          options.push(`<option value="${sub.id}" ${String(selected) === String(sub.id) ? 'selected' : ''}>${htmlEscape(bucket.name)} / ${htmlEscape(sub.name)}</option>`);
+        });
+      });
+      return '<option value="">Unassigned</option>' + options.join('');
+    }
+
+    function nteSubbucketOptionsForBucket(bucketId, selected='') {
+      const bucket = (nteData.buckets || []).find(b => String(b.id) === String(bucketId));
+      const subs = bucket?.subbuckets || [];
+      return '<option value="">Bucket level</option>' + subs.map(sub => `<option value="${sub.id}" ${String(selected) === String(sub.id) ? 'selected' : ''}>${htmlEscape(sub.name)}</option>`).join('');
+    }
+
+    function renderNteBucketSelectors() {
+      const bucketOptions = (nteData.buckets || []).map(b => `<option value="${b.id}">${htmlEscape(b.name)}</option>`).join('');
+      ['nteSubbucketBucket','nteAdditionBucket'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.innerHTML = bucketOptions || '<option value="">Create a bucket first</option>';
+      });
+      const additionBucket = document.getElementById('nteAdditionBucket');
+      const additionSub = document.getElementById('nteAdditionSubbucket');
+      if (additionBucket && additionSub) {
+        additionSub.innerHTML = nteSubbucketOptionsForBucket(additionBucket.value);
+        additionBucket.onchange = () => additionSub.innerHTML = nteSubbucketOptionsForBucket(additionBucket.value);
+      }
+    }
+
+    function renderNteSummary() {
+      const buckets = nteData.buckets || [];
+      const original = buckets.reduce((sum, b) => sum + Number(b.original_budget || 0), 0);
+      const additions = buckets.reduce((sum, b) => sum + Number(b.approved_additions || 0), 0);
+      const current = buckets.reduce((sum, b) => sum + Number(b.current_budget || 0), 0);
+      const actual = buckets.reduce((sum, b) => sum + Number(b.actual_cost || 0), 0);
+      const remaining = current - actual;
+      document.getElementById('nteSummaryCards').innerHTML = `
+        <div class="panel kpi"><div class="label">Original Budget</div><div class="value">${money(original)}</div><div class="hint">Sub-bucket starting budgets</div></div>
+        <div class="panel kpi"><div class="label">Approved Additions</div><div class="value">${money(additions)}</div><div class="hint">Approved documented increases</div></div>
+        <div class="panel kpi"><div class="label">Actual Cost</div><div class="value">${money(actual)}</div><div class="hint">Assigned cost records</div></div>
+        <div class="panel kpi"><div class="label">Remaining NTE</div><div class="value ${remaining < 0 ? 'bad' : 'good'}">${money(remaining)}</div><div class="hint">Current budget less actual cost</div></div>`;
+    }
+
+    function renderNteBuckets() {
+      const tableEl = document.getElementById('nteBucketTable');
+      const buckets = nteData.buckets || [];
+      if (!buckets.length) {
+        tableEl.innerHTML = '<tbody><tr><td>No NTE buckets yet. Use Create Default Buckets or add your own bucket.</td></tr></tbody>';
+        return;
+      }
+      tableEl.innerHTML = `
+        <thead><tr><th>Bucket / Sub-Bucket</th><th>Type</th><th>Original</th><th>Additions</th><th>Current Budget</th><th>Actual</th><th>Remaining</th><th>Description</th><th></th></tr></thead>
+        <tbody>${buckets.map(bucket => `
+          <tr class="invoice-summary">
+            <td><input data-nte-bucket="${bucket.id}" data-field="name" value="${htmlEscape(bucket.name || '')}"></td>
+            <td>Bucket</td>
+            <td>${money(bucket.original_budget)}</td>
+            <td>${money(bucket.approved_additions)}</td>
+            <td>${money(bucket.current_budget)}</td>
+            <td>${money(bucket.actual_cost)}</td>
+            <td class="${Number(bucket.remaining || 0) < 0 ? 'bad' : ''}">${money(bucket.remaining)}</td>
+            <td><input data-nte-bucket="${bucket.id}" data-field="description" value="${htmlEscape(bucket.description || '')}"></td>
+            <td>
+              <button class="btn" data-save-nte-bucket="${bucket.id}" type="button">Save</button>
+              <button class="btn danger" data-delete-nte-bucket="${bucket.id}" type="button">Delete</button>
+            </td>
+          </tr>
+          ${(bucket.subbuckets || []).map(sub => `
+            <tr>
+              <td style="padding-left:26px"><input data-nte-sub="${sub.id}" data-field="name" value="${htmlEscape(sub.name || '')}"></td>
+              <td><select data-nte-sub="${sub.id}" data-field="cost_type">${['Labor','Material','Field Ticket Material','Equipment','Rental','Other'].map(v => `<option ${sub.cost_type === v ? 'selected' : ''}>${v}</option>`).join('')}</select></td>
+              <td><input data-nte-sub="${sub.id}" data-field="original_budget" type="number" step="0.01" value="${Number(sub.original_budget || 0).toFixed(2)}"></td>
+              <td>${money(sub.approved_additions)}</td>
+              <td>${money(sub.current_budget)}</td>
+              <td>${money(sub.actual_cost)}</td>
+              <td class="${Number(sub.remaining || 0) < 0 ? 'bad' : ''}">${money(sub.remaining)}</td>
+              <td><input data-nte-sub="${sub.id}" data-field="description" value="${htmlEscape(sub.description || '')}"></td>
+              <td><button class="btn" data-save-nte-sub="${sub.id}" type="button">Save</button></td>
+            </tr>
+          `).join('')}
+        `).join('')}</tbody>`;
+      tableEl.querySelectorAll('[data-save-nte-bucket]').forEach(btn => btn.onclick = async () => {
+        const id = btn.dataset.saveNteBucket;
+        const fields = {};
+        tableEl.querySelectorAll(`[data-nte-bucket="${id}"]`).forEach(el => fields[el.dataset.field] = el.value);
+        await api(`/api/nte-buckets/${id}`, { method:'PUT', body: JSON.stringify(fields) });
+        markSaved();
+        await loadNteTracking(false);
+      });
+      tableEl.querySelectorAll('[data-delete-nte-bucket]').forEach(btn => btn.onclick = async () => {
+        const id = btn.dataset.deleteNteBucket;
+        const bucket = (nteData.buckets || []).find(b => String(b.id) === String(id));
+        if (!confirm(`Delete bucket "${bucket?.name || 'this bucket'}"? This also removes its empty sub-buckets.`)) return;
+        await api(`/api/nte-buckets/${id}`, { method:'DELETE' });
+        markSaved();
+        await loadNteTracking(false);
+      });
+      tableEl.querySelectorAll('[data-save-nte-sub]').forEach(btn => btn.onclick = async () => {
+        const id = btn.dataset.saveNteSub;
+        const fields = {};
+        tableEl.querySelectorAll(`[data-nte-sub="${id}"]`).forEach(el => fields[el.dataset.field] = el.value);
+        await api(`/api/nte-subbuckets/${id}`, { method:'PUT', body: JSON.stringify(fields) });
+        markSaved();
+        await loadNteTracking(false);
+      });
+    }
+
+    function renderNteAdditions() {
+      const tableEl = document.getElementById('nteAdditionTable');
+      const additions = nteData.additions || [];
+      if (!additions.length) {
+        tableEl.innerHTML = '<tbody><tr><td>No budget additions have been entered yet.</td></tr></tbody>';
+        return;
+      }
+      const bucketById = Object.fromEntries((nteData.buckets || []).map(b => [b.id, b]));
+      const subById = {};
+      (nteData.buckets || []).forEach(b => (b.subbuckets || []).forEach(s => subById[s.id] = s));
+      tableEl.innerHTML = `<thead><tr><th>Created</th><th>Bucket</th><th>Sub-Bucket</th><th>Status</th><th>Amount</th><th>Requested</th><th>Approved</th><th>Approver</th><th>Backup</th><th>Reason</th></tr></thead>
+        <tbody>${additions.map(a => `<tr>
+          <td>${htmlEscape((a.created_at || '').replace('T', ' '))}<div class="muted">${htmlEscape(a.created_by_username || '')}</div></td>
+          <td>${htmlEscape(bucketById[a.bucket_id]?.name || '')}</td>
+          <td>${htmlEscape(subById[a.subbucket_id]?.name || '')}</td>
+          <td>${htmlEscape(a.status || '')}</td>
+          <td>${money(a.amount)}</td>
+          <td>${htmlEscape(a.requested_date || '')}</td>
+          <td>${htmlEscape(a.approved_date || '')}</td>
+          <td>${htmlEscape(a.approver || '')}</td>
+          <td>${a.support_file ? pdfLink({ source_file: a.support_file }) : '<span class="muted">None</span>'}</td>
+          <td>${htmlEscape(a.reason || '')}</td>
+        </tr>`).join('')}</tbody>`;
+    }
+
+    function renderNteCosts() {
+      const tableEl = document.getElementById('nteCostTable');
+      const filterEl = document.getElementById('nteCostFilters');
+      if (!tableEl || !filterEl) return;
+      const costs = nteCosts || [];
+      filterEl.innerHTML = `<div class="cost-filter-bar">
+        <div><label>Search</label><input id="nteCostSearch" placeholder="Ticket, item, description, rate source"></div>
+        <div><label>Show</label><select id="nteCostStatusFilter"><option value="">All lines</option><option value="unassigned">Unassigned only</option><option value="assigned">Assigned only</option></select></div>
+      </div>`;
+      const draw = () => {
+        const query = String(document.getElementById('nteCostSearch')?.value || '').trim().toLowerCase();
+        const status = document.getElementById('nteCostStatusFilter')?.value || '';
+        const filtered = costs.filter(r => {
+          const haystack = [r.record_date, r.ticket_or_invoice, r.item, r.description, r.cost_type, r.raw_cost_source, r.source_file].join(' ').toLowerCase();
+          return (!query || haystack.includes(query)) &&
+            (!status || (status === 'assigned' ? r.nte_subbucket_id : !r.nte_subbucket_id));
+        });
+        tableEl.innerHTML = filtered.length ? `<thead><tr><th>Date</th><th>Ticket</th><th>PDF</th><th>Type</th><th>Item</th><th>Description</th><th>Amount</th><th>NTE Sub-Bucket</th><th>Rule</th><th></th></tr></thead>
+          <tbody>${filtered.map(r => {
+            const suggested = r.suggested_subbucket_id && !r.nte_subbucket_id ? `<div class="muted">Suggested: ${htmlEscape(r.suggested_label || '')}</div>` : '';
+            return `<tr>
+              <td>${htmlEscape(r.record_date || '')}</td>
+              <td>${htmlEscape(r.ticket_or_invoice || '')}</td>
+              <td>${pdfLink(r)}</td>
+              <td>${htmlEscape(r.cost_type || '')}</td>
+              <td>${htmlEscape(r.item || '')}</td>
+              <td>${htmlEscape(r.description || '')}${suggested}</td>
+              <td>${money(r.amount)}</td>
+              <td><select data-nte-cost="${r.id}" data-field="nte_subbucket_id">${nteSubbucketOptions(r.nte_subbucket_id || r.suggested_subbucket_id || '')}</select></td>
+              <td>
+                <label style="display:flex;align-items:center;gap:6px;margin:0"><input data-nte-cost="${r.id}" data-field="remember_rule" type="checkbox" style="width:auto"> Remember</label>
+                <input data-nte-cost="${r.id}" data-field="match_text" value="${htmlEscape(r.suggested_match_text || '')}" placeholder="Text to match">
+                <label style="display:flex;align-items:center;gap:6px;margin:4px 0 0"><input data-nte-cost="${r.id}" data-field="auto_apply" type="checkbox" style="width:auto"> Auto apply</label>
+              </td>
+              <td><button class="btn" data-save-nte-cost="${r.id}" type="button">Save</button></td>
+            </tr>`;
+          }).join('')}</tbody>` : '<tbody><tr><td>No Field Wise lines match this view.</td></tr></tbody>';
+        tableEl.querySelectorAll('[data-save-nte-cost]').forEach(btn => btn.onclick = async () => {
+          const id = btn.dataset.saveNteCost;
+          const fields = {};
+          tableEl.querySelectorAll(`[data-nte-cost="${id}"]`).forEach(el => {
+            fields[el.dataset.field] = el.type === 'checkbox' ? el.checked : el.value;
+          });
+          await api(`/api/nte-cost-records/${id}`, { method:'PUT', body: JSON.stringify(fields) });
+          markSaved();
+          await loadNteTracking(false);
+        });
+      };
+      filterEl.querySelectorAll('input, select').forEach(el => {
+        el.oninput = draw;
+        el.onchange = draw;
+      });
+      draw();
+    }
+
+    function renderNteRules() {
+      const tableEl = document.getElementById('nteRuleTable');
+      if (!nteRules.length) {
+        tableEl.innerHTML = '<tbody><tr><td>No saved coding rules yet.</td></tr></tbody>';
+        return;
+      }
+      tableEl.innerHTML = `<thead><tr><th>Match Text</th><th>Cost Type</th><th>Sub-Bucket</th><th>Auto Apply</th><th>Uses</th></tr></thead>
+        <tbody>${nteRules.map(r => `<tr>
+          <td>${htmlEscape(r.match_text || '')}</td>
+          <td>${htmlEscape(r.cost_type || 'Any')}</td>
+          <td>${htmlEscape([r.bucket_name, r.subbucket_name].filter(Boolean).join(' / '))}</td>
+          <td>${Number(r.auto_apply || 0) ? 'Yes' : 'No'}</td>
+          <td>${Number(r.approval_count || 0)}</td>
+        </tr>`).join('')}</tbody>`;
+    }
+
+    async function loadNteTracking(reloadTargets=true) {
+      if (!state.projectId) return;
+      const resultEl = document.getElementById('nteTrackingResult');
+      if (reloadTargets) nteTargets = await api(`/api/nte-targets?project_id=${state.projectId}`);
+      const select = document.getElementById('nteTargetSelect');
+      const current = select?.value || '';
+      if (select) {
+        select.innerHTML = nteTargets.length
+          ? nteTargets.map(t => `<option value="${t.target_key}">${htmlEscape([t.job_number, t.code, t.name].filter(Boolean).join(' - '))} (${htmlEscape(t.target_type)})</option>`).join('')
+          : '<option value="">No T&M NTE jobs yet</option>';
+        if (nteTargets.some(t => t.target_key === current)) select.value = current;
+        select.onchange = () => loadNteTracking(false);
+      }
+      const target = selectedNteTarget();
+      if (!target) {
+        if (resultEl) resultEl.textContent = 'Set a subproject or change order pricing method to T&M NTE in Setup to start tracking buckets.';
+        nteData = { buckets: [], additions: [] };
+        nteCosts = [];
+        nteRules = [];
+        renderNteSummary();
+        renderNteBucketSelectors();
+        renderNteBuckets();
+        renderNteAdditions();
+        renderNteCosts();
+        renderNteRules();
+        return;
+      }
+      if (resultEl) resultEl.textContent = '';
+      const params = nteTargetParams(target);
+      nteData = await api(`/api/nte-summary?${params}`);
+      nteCosts = await api(`/api/nte-cost-records?${params}`);
+      nteRules = await api(`/api/nte-coding-rules?project_id=${state.projectId}`);
+      renderNteSummary();
+      renderNteBucketSelectors();
+      renderNteBuckets();
+      renderNteAdditions();
+      renderNteCosts();
+      renderNteRules();
+    }
+
+    document.getElementById('refreshNteTracking').onclick = () => loadNteTracking();
+    document.getElementById('seedNteDefaults').onclick = async () => {
+      const params = nteTargetParams();
+      if (!params) return;
+      await api(`/api/nte-defaults?${params}`, { method:'POST', body: JSON.stringify({}) });
+      markSaved();
+      await loadNteTracking(false);
+    };
+    document.getElementById('applyNteRules').onclick = async () => {
+      const params = nteTargetParams();
+      if (!params) return;
+      const result = await api(`/api/nte-apply-rules?${params}`, { method:'POST', body: JSON.stringify({}) });
+      document.getElementById('nteTrackingResult').textContent = `Applied ${result.updated || 0} saved coding rule match(es).`;
+      markSaved();
+      await loadNteTracking(false);
+    };
+    document.getElementById('nteBucketForm').onsubmit = async event => {
+      event.preventDefault();
+      const target = selectedNteTarget();
+      if (!target) return;
+      const data = formDataObj(event.target);
+      data.project_id = state.projectId;
+      data.subproject_id = target.subproject_id || '';
+      data.change_order_id = target.change_order_id || '';
+      await api('/api/nte-buckets', { method:'POST', body: JSON.stringify(data) });
+      event.target.reset();
+      markSaved();
+      await loadNteTracking(false);
+    };
+    document.getElementById('nteSubbucketForm').onsubmit = async event => {
+      event.preventDefault();
+      const data = formDataObj(event.target);
+      await api('/api/nte-subbuckets', { method:'POST', body: JSON.stringify(data) });
+      event.target.reset();
+      markSaved();
+      await loadNteTracking(false);
+    };
+    document.getElementById('nteAdditionForm').onsubmit = async event => {
+      event.preventDefault();
+      const target = selectedNteTarget();
+      if (!target) return;
+      const formData = new FormData(event.target);
+      formData.set('project_id', state.projectId);
+      await api('/api/nte-additions', { method:'POST', body: formData });
+      event.target.reset();
+      markSaved();
+      await loadNteTracking(false);
+    };
 
     let mccQuoteItems = [];
     let mccSavedQuotes = [];
@@ -10736,9 +11477,9 @@ HTML = r"""
       const pricing = document.getElementById('coPricingType')?.value || 'Fixed';
       const approved = document.getElementById('coApprovedValue');
       if (!approved) return;
-      approved.disabled = pricing === 'T&M';
-      approved.placeholder = pricing === 'T&M' ? 'Calculated from Field Wise tickets' : '';
-      if (pricing === 'T&M') approved.value = '0';
+      approved.disabled = isTmPricing(pricing);
+      approved.placeholder = isTmPricing(pricing) ? 'Calculated from Field Wise tickets' : '';
+      if (isTmPricing(pricing)) approved.value = '0';
     }
     document.getElementById('coPricingType').onchange = updateCoPricingFields;
     document.getElementById('invoiceForm').onsubmit = async e => {
@@ -11366,6 +12107,68 @@ class Handler(BaseHTTPRequestHandler):
                 return json_response(self, rows("SELECT * FROM subprojects WHERE project_id = ? ORDER BY code", (qs.get("project_id", [""])[0],)))
             if parsed.path == "/api/change-orders":
                 return json_response(self, rows("SELECT * FROM change_orders WHERE project_id = ? ORDER BY co_number", (qs.get("project_id", [""])[0],)))
+            if parsed.path == "/api/nte-targets":
+                if not can_view_permission(user, "nte_tracking"):
+                    return json_response(self, {"error": "T&M NTE access required."}, 403)
+                return json_response(self, nte_targets(qs.get("project_id", [""])[0]))
+            if parsed.path == "/api/nte-summary":
+                if not can_view_permission(user, "nte_tracking"):
+                    return json_response(self, {"error": "T&M NTE access required."}, 403)
+                return json_response(
+                    self,
+                    nte_summary(
+                        qs.get("project_id", [""])[0],
+                        qs.get("subproject_id", [""])[0] or None,
+                        qs.get("change_order_id", [""])[0] or None,
+                        qs.get("seed", [""])[0] == "1",
+                    ),
+                )
+            if parsed.path == "/api/nte-cost-records":
+                if not can_view_permission(user, "nte_tracking"):
+                    return json_response(self, {"error": "T&M NTE access required."}, 403)
+                project_id = qs.get("project_id", [""])[0]
+                subproject_id = int(qs.get("subproject_id", [""])[0]) if qs.get("subproject_id", [""])[0] else None
+                change_order_id = int(qs.get("change_order_id", [""])[0]) if qs.get("change_order_id", [""])[0] else None
+                with db() as con:
+                    cost_rows = [dict(r) for r in con.execute(
+                        """
+                        SELECT cr.*
+                        FROM cost_records cr
+                        WHERE cr.project_id = ?
+                          AND (cr.source IN ('Field Wise', 'Field Wise PDF') OR cr.nte_subbucket_id IS NOT NULL)
+                          AND COALESCE(cr.subproject_id, 0) = COALESCE(?, 0)
+                          AND COALESCE(cr.change_order_id, 0) = COALESCE(?, 0)
+                        ORDER BY cr.record_date DESC, cr.ticket_or_invoice, cr.id
+                        """,
+                        (project_id, subproject_id, change_order_id),
+                    ).fetchall()]
+                    for record in cost_rows:
+                        suggestion = nte_rule_suggestion(con, record)
+                        record["suggested_match_text"] = nte_match_text_for_record(record)
+                        if suggestion:
+                            record["suggested_subbucket_id"] = suggestion["subbucket_id"]
+                            record["suggested_label"] = f"{suggestion['bucket_name']} / {suggestion['subbucket_name']}"
+                        else:
+                            record["suggested_subbucket_id"] = None
+                            record["suggested_label"] = ""
+                return json_response(self, cost_rows)
+            if parsed.path == "/api/nte-coding-rules":
+                if not can_view_permission(user, "nte_tracking"):
+                    return json_response(self, {"error": "T&M NTE access required."}, 403)
+                return json_response(
+                    self,
+                    rows(
+                        """
+                        SELECT r.*, sb.name AS subbucket_name, b.name AS bucket_name
+                        FROM nte_coding_rules r
+                        JOIN nte_subbuckets sb ON sb.id = r.subbucket_id
+                        JOIN nte_buckets b ON b.id = sb.bucket_id
+                        WHERE r.project_id = ?
+                        ORDER BY r.auto_apply DESC, r.approval_count DESC, r.match_text
+                        """,
+                        (qs.get("project_id", [""])[0],),
+                    ),
+                )
             if parsed.path == "/api/cog-categories":
                 return json_response(self, rows("SELECT * FROM cog_categories WHERE COALESCE(active, 1) = 1 ORDER BY name, code"))
             if parsed.path == "/api/customer-invoices":
@@ -11557,6 +12360,166 @@ class Handler(BaseHTTPRequestHandler):
                 with db() as con:
                     con.execute("DELETE FROM user_sessions WHERE user_id = ? AND session_token <> ?", (user["id"], token or ""))
                 return json_response(self, {"ok": True})
+            if parsed.path == "/api/nte-additions":
+                actor = current_user(self)
+                if not can_edit_permission(actor, "nte_tracking"):
+                    return json_response(self, {"error": "T&M NTE edit access required."}, 403)
+                form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": self.headers.get("Content-Type")})
+                project_id = form.getfirst("project_id")
+                bucket_id = form.getfirst("bucket_id")
+                subbucket_id = form.getfirst("subbucket_id") or None
+                amount = money(form.getfirst("amount"))
+                if not project_id or not bucket_id:
+                    return json_response(self, {"error": "Choose a bucket before saving the addition."}, 400)
+                if not amount:
+                    return json_response(self, {"error": "Addition amount is required."}, 400)
+                file_item = form["support_file"] if "support_file" in form else None
+                saved_name = ""
+                if file_item is not None and getattr(file_item, "filename", ""):
+                    safe_name = Path(file_item.filename).name
+                    suffix = Path(safe_name).suffix.lower()
+                    if suffix not in (".pdf", ".png", ".jpg", ".jpeg", ".webp", ".xlsx", ".xlsm"):
+                        return json_response(self, {"error": "Backup must be a PDF, image, or Excel file."}, 400)
+                    saved_name = f"{datetime.now().strftime('%Y%m%d%H%M%S')}-nte-support-{safe_name}"
+                    with open(UPLOAD_DIR / saved_name, "wb") as f:
+                        f.write(file_item.file.read())
+                now = datetime.now().isoformat(timespec="seconds")
+                with db() as con:
+                    bucket = con.execute("SELECT id, name FROM nte_buckets WHERE id = ? AND project_id = ?", (bucket_id, project_id)).fetchone()
+                    if not bucket:
+                        return json_response(self, {"error": "NTE bucket not found."}, 404)
+                    if subbucket_id:
+                        sub = con.execute("SELECT id FROM nte_subbuckets WHERE id = ? AND bucket_id = ?", (subbucket_id, bucket_id)).fetchone()
+                        if not sub:
+                            return json_response(self, {"error": "Selected sub-bucket does not belong to that bucket."}, 400)
+                    cur = con.execute(
+                        """
+                        INSERT INTO nte_bucket_additions (
+                          project_id, bucket_id, subbucket_id, amount, status, requested_date,
+                          approved_date, approver, reason, support_file, notes,
+                          created_by_user_id, created_by_username, created_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            project_id,
+                            bucket_id,
+                            subbucket_id,
+                            amount,
+                            form.getfirst("status") or "Pending",
+                            form.getfirst("requested_date") or "",
+                            form.getfirst("approved_date") or "",
+                            form.getfirst("approver") or "",
+                            form.getfirst("reason") or "",
+                            saved_name,
+                            form.getfirst("notes") or "",
+                            actor["id"] if actor else None,
+                            actor["username"] if actor else "",
+                            now,
+                        ),
+                    )
+                log_activity(actor, "added NTE budget addition", "T&M NTE", bucket["name"], {"amount": amount, "status": form.getfirst("status") or "Pending", "support_file": saved_name})
+                return json_response(self, {"id": cur.lastrowid, "support_file": saved_name})
+            if parsed.path == "/api/nte-defaults":
+                actor = current_user(self)
+                if not can_edit_permission(actor, "nte_tracking"):
+                    return json_response(self, {"error": "T&M NTE edit access required."}, 403)
+                qs = parse_qs(parsed.query)
+                with db() as con:
+                    bucket_id = ensure_nte_defaults(
+                        con,
+                        qs.get("project_id", [""])[0],
+                        qs.get("subproject_id", [""])[0] or None,
+                        qs.get("change_order_id", [""])[0] or None,
+                    )
+                return json_response(self, {"id": bucket_id})
+            if parsed.path == "/api/nte-buckets":
+                actor = current_user(self)
+                if not can_edit_permission(actor, "nte_tracking"):
+                    return json_response(self, {"error": "T&M NTE edit access required."}, 403)
+                data = parse_json(self)
+                name = str(data.get("name") or "").strip()
+                if not name:
+                    return json_response(self, {"error": "Bucket name is required."}, 400)
+                now = datetime.now().isoformat(timespec="seconds")
+                new_id = execute(
+                    """
+                    INSERT INTO nte_buckets (project_id, subproject_id, change_order_id, name, description, sort_order, active, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+                    """,
+                    (
+                        data.get("project_id"),
+                        data.get("subproject_id") or None,
+                        data.get("change_order_id") or None,
+                        name,
+                        data.get("description") or "",
+                        int(money(data.get("sort_order"))),
+                        now,
+                        now,
+                    ),
+                )
+                log_activity(actor, "added NTE bucket", "T&M NTE", name, {"project_id": data.get("project_id")})
+                return json_response(self, {"id": new_id})
+            if parsed.path == "/api/nte-subbuckets":
+                actor = current_user(self)
+                if not can_edit_permission(actor, "nte_tracking"):
+                    return json_response(self, {"error": "T&M NTE edit access required."}, 403)
+                data = parse_json(self)
+                name = str(data.get("name") or "").strip()
+                if not data.get("bucket_id"):
+                    return json_response(self, {"error": "Choose a bucket first."}, 400)
+                if not name:
+                    return json_response(self, {"error": "Sub-bucket name is required."}, 400)
+                now = datetime.now().isoformat(timespec="seconds")
+                new_id = execute(
+                    """
+                    INSERT INTO nte_subbuckets (bucket_id, name, cost_type, description, original_budget, sort_order, active, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+                    """,
+                    (
+                        data.get("bucket_id"),
+                        name,
+                        data.get("cost_type") or "",
+                        data.get("description") or "",
+                        money(data.get("original_budget")),
+                        int(money(data.get("sort_order"))),
+                        now,
+                        now,
+                    ),
+                )
+                log_activity(actor, "added NTE sub-bucket", "T&M NTE", name, {"bucket_id": data.get("bucket_id")})
+                return json_response(self, {"id": new_id})
+            if parsed.path == "/api/nte-apply-rules":
+                actor = current_user(self)
+                if not can_edit_permission(actor, "nte_tracking"):
+                    return json_response(self, {"error": "T&M NTE edit access required."}, 403)
+                qs = parse_qs(parsed.query)
+                project_id = qs.get("project_id", [""])[0]
+                subproject_id = int(qs.get("subproject_id", [""])[0]) if qs.get("subproject_id", [""])[0] else None
+                change_order_id = int(qs.get("change_order_id", [""])[0]) if qs.get("change_order_id", [""])[0] else None
+                updated = 0
+                with db() as con:
+                    cost_rows = [dict(r) for r in con.execute(
+                        """
+                        SELECT *
+                        FROM cost_records
+                        WHERE project_id = ?
+                          AND nte_subbucket_id IS NULL
+                          AND source IN ('Field Wise', 'Field Wise PDF')
+                          AND COALESCE(subproject_id, 0) = COALESCE(?, 0)
+                          AND COALESCE(change_order_id, 0) = COALESCE(?, 0)
+                        """,
+                        (project_id, subproject_id, change_order_id),
+                    ).fetchall()]
+                    for record in cost_rows:
+                        suggestion = nte_rule_suggestion(con, record)
+                        if suggestion and int(suggestion["auto_apply"] or 0):
+                            con.execute("UPDATE cost_records SET nte_subbucket_id = ? WHERE id = ?", (suggestion["subbucket_id"], record["id"]))
+                            con.execute("UPDATE nte_coding_rules SET approval_count = approval_count + 1, updated_at = ? WHERE id = ?", (datetime.now().isoformat(timespec="seconds"), suggestion["id"]))
+                            updated += 1
+                if updated:
+                    log_activity(actor, "applied NTE coding rules", "T&M NTE", f"{updated} cost records", {"project_id": project_id})
+                return json_response(self, {"updated": updated})
             if parsed.path.startswith("/api/mcc-quote-items/") and parsed.path.endswith("/vendor-quote"):
                 actor = current_user(self)
                 if not can_edit_permission(actor, "mcc_quote_setup"):
@@ -12799,13 +13762,13 @@ class Handler(BaseHTTPRequestHandler):
                             change_order_id = ?,
                             amount = CASE
                               WHEN cost_type = 'Field Ticket Material' THEN
-                                CASE WHEN ? IS NOT NULL OR COALESCE((SELECT pricing_type FROM subprojects WHERE id = ?), 'Fixed') = 'T&M'
+                                CASE WHEN ? IS NOT NULL OR COALESCE((SELECT pricing_type FROM subprojects WHERE id = ?), 'Fixed') IN ('T&M', 'T&M NTE')
                                   THEN COALESCE(sales_amount, 0) * ? ELSE 0 END
                               ELSE amount
                             END,
                             raw_rate = CASE
                               WHEN cost_type = 'Field Ticket Material' THEN
-                                CASE WHEN ? IS NOT NULL OR COALESCE((SELECT pricing_type FROM subprojects WHERE id = ?), 'Fixed') = 'T&M'
+                                CASE WHEN ? IS NOT NULL OR COALESCE((SELECT pricing_type FROM subprojects WHERE id = ?), 'Fixed') IN ('T&M', 'T&M NTE')
                                   THEN COALESCE(sales_rate, rate, 0) * ? ELSE 0 END
                               ELSE raw_rate
                             END,
@@ -12813,7 +13776,7 @@ class Handler(BaseHTTPRequestHandler):
                               WHEN cost_type = 'Field Ticket Material' THEN
                                 CASE
                                   WHEN ? IS NOT NULL THEN 'CO T&M material estimate at 35% margin'
-                                  WHEN COALESCE((SELECT pricing_type FROM subprojects WHERE id = ?), 'Fixed') = 'T&M' THEN 'Subproject T&M material estimate at 35% margin'
+                                  WHEN COALESCE((SELECT pricing_type FROM subprojects WHERE id = ?), 'Fixed') IN ('T&M', 'T&M NTE') THEN 'Subproject T&M material estimate at 35% margin'
                                   ELSE 'Usage only - not budget cost'
                                 END
                               ELSE raw_cost_source
@@ -13130,6 +14093,100 @@ class Handler(BaseHTTPRequestHandler):
                     log_activity(actor, action_detail[0], "Purchase Order", current_po["po_number"], action_detail[1])
                 log_activity(actor, "updated PO", "Purchase Order", current_po["po_number"], {"status": status, "vendor": vendor, "estimated_amount": money(data.get("estimated_amount"))})
                 return json_response(self, {"ok": True})
+            if parsed.path.startswith("/api/nte-buckets/"):
+                actor = current_user(self)
+                if not can_edit_permission(actor, "nte_tracking"):
+                    return json_response(self, {"error": "T&M NTE edit access required."}, 403)
+                bucket_id = parsed.path.rsplit("/", 1)[-1]
+                now = datetime.now().isoformat(timespec="seconds")
+                updated = execute(
+                    """
+                    UPDATE nte_buckets
+                    SET name = ?, description = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (data.get("name") or "", data.get("description") or "", now, bucket_id),
+                )
+                return json_response(self, {"ok": True, "updated": updated})
+            if parsed.path.startswith("/api/nte-subbuckets/"):
+                actor = current_user(self)
+                if not can_edit_permission(actor, "nte_tracking"):
+                    return json_response(self, {"error": "T&M NTE edit access required."}, 403)
+                subbucket_id = parsed.path.rsplit("/", 1)[-1]
+                now = datetime.now().isoformat(timespec="seconds")
+                execute(
+                    """
+                    UPDATE nte_subbuckets
+                    SET name = ?, cost_type = ?, description = ?, original_budget = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (data.get("name") or "", data.get("cost_type") or "", data.get("description") or "", money(data.get("original_budget")), now, subbucket_id),
+                )
+                return json_response(self, {"ok": True})
+            if parsed.path.startswith("/api/nte-cost-records/"):
+                actor = current_user(self)
+                if not can_edit_permission(actor, "nte_tracking"):
+                    return json_response(self, {"error": "T&M NTE edit access required."}, 403)
+                record_id = parsed.path.rsplit("/", 1)[-1]
+                subbucket_id = data.get("nte_subbucket_id") or None
+                now = datetime.now().isoformat(timespec="seconds")
+                with db() as con:
+                    record = con.execute("SELECT * FROM cost_records WHERE id = ?", (record_id,)).fetchone()
+                    if not record:
+                        return json_response(self, {"error": "Cost record not found."}, 404)
+                    if subbucket_id:
+                        sub = con.execute(
+                            """
+                            SELECT sb.id, sb.bucket_id, sb.name AS subbucket_name, b.project_id, b.name AS bucket_name
+                            FROM nte_subbuckets sb
+                            JOIN nte_buckets b ON b.id = sb.bucket_id
+                            WHERE sb.id = ? AND b.project_id = ?
+                            """,
+                            (subbucket_id, record["project_id"]),
+                        ).fetchone()
+                        if not sub:
+                            return json_response(self, {"error": "Selected NTE sub-bucket does not belong to this project."}, 400)
+                    else:
+                        sub = None
+                    con.execute("UPDATE cost_records SET nte_subbucket_id = ? WHERE id = ?", (subbucket_id, record_id))
+                    if subbucket_id and data.get("remember_rule"):
+                        match_text = str(data.get("match_text") or nte_match_text_for_record(dict(record))).strip()
+                        if match_text:
+                            existing = con.execute(
+                                """
+                                SELECT id
+                                FROM nte_coding_rules
+                                WHERE project_id = ? AND subbucket_id = ? AND lower(match_text) = lower(?)
+                                """,
+                                (record["project_id"], subbucket_id, match_text),
+                            ).fetchone()
+                            if existing:
+                                con.execute(
+                                    "UPDATE nte_coding_rules SET auto_apply = ?, approval_count = approval_count + 1, active = 1, updated_at = ? WHERE id = ?",
+                                    (1 if data.get("auto_apply") else 0, now, existing["id"]),
+                                )
+                            else:
+                                con.execute(
+                                    """
+                                    INSERT INTO nte_coding_rules (
+                                      project_id, bucket_id, subbucket_id, cost_type, match_field,
+                                      match_text, auto_apply, active, approval_count, created_at, updated_at
+                                    )
+                                    VALUES (?, ?, ?, ?, 'item_description', ?, ?, 1, 1, ?, ?)
+                                    """,
+                                    (
+                                        record["project_id"],
+                                        sub["bucket_id"],
+                                        subbucket_id,
+                                        record["cost_type"] or "",
+                                        match_text,
+                                        1 if data.get("auto_apply") else 0,
+                                        now,
+                                        now,
+                                    ),
+                                )
+                log_activity(actor, "coded Field Wise line to NTE", "T&M NTE", str(record["ticket_or_invoice"] or record_id), {"subbucket_id": subbucket_id, "remember_rule": bool(data.get("remember_rule"))})
+                return json_response(self, {"ok": True})
             if parsed.path.startswith("/api/cost-records/"):
                 record_id = parsed.path.rsplit("/", 1)[-1]
                 cost_type = data.get("cost_type") or None
@@ -13143,18 +14200,18 @@ class Handler(BaseHTTPRequestHandler):
                             change_order_id = ?,
                             cost_type = ?,
                             amount = CASE
-                              WHEN ? IS NOT NULL OR COALESCE((SELECT pricing_type FROM subprojects WHERE id = ?), 'Fixed') = 'T&M'
+                              WHEN ? IS NOT NULL OR COALESCE((SELECT pricing_type FROM subprojects WHERE id = ?), 'Fixed') IN ('T&M', 'T&M NTE')
                                 THEN COALESCE(sales_amount, 0) * ?
                               ELSE 0
                             END,
                             raw_rate = CASE
-                              WHEN ? IS NOT NULL OR COALESCE((SELECT pricing_type FROM subprojects WHERE id = ?), 'Fixed') = 'T&M'
+                              WHEN ? IS NOT NULL OR COALESCE((SELECT pricing_type FROM subprojects WHERE id = ?), 'Fixed') IN ('T&M', 'T&M NTE')
                                 THEN COALESCE(sales_rate, rate, 0) * ?
                               ELSE 0
                             END,
                             raw_cost_source = CASE
                               WHEN ? IS NOT NULL THEN 'CO T&M material estimate at 35% margin'
-                              WHEN COALESCE((SELECT pricing_type FROM subprojects WHERE id = ?), 'Fixed') = 'T&M' THEN 'Subproject T&M material estimate at 35% margin'
+                              WHEN COALESCE((SELECT pricing_type FROM subprojects WHERE id = ?), 'Fixed') IN ('T&M', 'T&M NTE') THEN 'Subproject T&M material estimate at 35% margin'
                               ELSE 'Usage only - not budget cost'
                             END
                         WHERE id = ?
@@ -13266,18 +14323,18 @@ class Handler(BaseHTTPRequestHandler):
                         """
                         UPDATE cost_records
                         SET amount = CASE
-                              WHEN change_order_id IS NOT NULL OR COALESCE((SELECT pricing_type FROM subprojects WHERE id = cost_records.subproject_id), 'Fixed') = 'T&M'
+                              WHEN change_order_id IS NOT NULL OR COALESCE((SELECT pricing_type FROM subprojects WHERE id = cost_records.subproject_id), 'Fixed') IN ('T&M', 'T&M NTE')
                                 THEN COALESCE(sales_amount, 0) * ?
                               ELSE 0
                             END,
                             raw_rate = CASE
-                              WHEN change_order_id IS NOT NULL OR COALESCE((SELECT pricing_type FROM subprojects WHERE id = cost_records.subproject_id), 'Fixed') = 'T&M'
+                              WHEN change_order_id IS NOT NULL OR COALESCE((SELECT pricing_type FROM subprojects WHERE id = cost_records.subproject_id), 'Fixed') IN ('T&M', 'T&M NTE')
                                 THEN COALESCE(sales_rate, rate, 0) * ?
                               ELSE 0
                             END,
                             raw_cost_source = CASE
                               WHEN change_order_id IS NOT NULL THEN 'CO T&M material estimate at 35% margin'
-                              WHEN COALESCE((SELECT pricing_type FROM subprojects WHERE id = cost_records.subproject_id), 'Fixed') = 'T&M' THEN 'Subproject T&M material estimate at 35% margin'
+                              WHEN COALESCE((SELECT pricing_type FROM subprojects WHERE id = cost_records.subproject_id), 'Fixed') IN ('T&M', 'T&M NTE') THEN 'Subproject T&M material estimate at 35% margin'
                               ELSE 'Usage only - not budget cost'
                             END
                         WHERE subproject_id = ?
@@ -13733,6 +14790,31 @@ class Handler(BaseHTTPRequestHandler):
                     return json_response(self, {"error": "PO not found."}, 404)
                 log_activity(current_user(self), "deleted PO", "Purchase Order", po["po_number"] if po else po_id, {"vendor": po["vendor"] if po else "", "amount": po["estimated_amount"] if po else 0})
                 return json_response(self, {"ok": True})
+            if parsed.path.startswith("/api/nte-buckets/"):
+                actor = current_user(self)
+                if not can_edit_permission(actor, "nte_tracking"):
+                    return json_response(self, {"error": "T&M NTE edit access required."}, 403)
+                bucket_id = parsed.path.rsplit("/", 1)[-1]
+                with db() as con:
+                    bucket = con.execute("SELECT * FROM nte_buckets WHERE id = ?", (bucket_id,)).fetchone()
+                    if not bucket:
+                        return json_response(self, {"error": "NTE bucket not found."}, 404)
+                    addition_count = con.execute("SELECT COUNT(*) AS c FROM nte_bucket_additions WHERE bucket_id = ?", (bucket_id,)).fetchone()["c"]
+                    cost_count = con.execute(
+                        """
+                        SELECT COUNT(*) AS c
+                        FROM cost_records
+                        WHERE nte_subbucket_id IN (SELECT id FROM nte_subbuckets WHERE bucket_id = ?)
+                        """,
+                        (bucket_id,),
+                    ).fetchone()["c"]
+                    if addition_count or cost_count:
+                        return json_response(self, {"error": "This bucket has budget additions or assigned costs. Move or remove those first, then delete the bucket."}, 400)
+                    con.execute("DELETE FROM nte_coding_rules WHERE bucket_id = ? OR subbucket_id IN (SELECT id FROM nte_subbuckets WHERE bucket_id = ?)", (bucket_id, bucket_id))
+                    con.execute("DELETE FROM nte_subbuckets WHERE bucket_id = ?", (bucket_id,))
+                    con.execute("DELETE FROM nte_buckets WHERE id = ?", (bucket_id,))
+                log_activity(actor, "deleted NTE bucket", "T&M NTE", bucket["name"], {"project_id": bucket["project_id"]})
+                return json_response(self, {"ok": True})
             if parsed.path.startswith("/api/subprojects/"):
                 subproject_id = parsed.path.rsplit("/", 1)[-1]
                 with db() as con:
@@ -13782,19 +14864,19 @@ class Handler(BaseHTTPRequestHandler):
                         SET change_order_id = NULL,
                             amount = CASE
                               WHEN cost_type = 'Field Ticket Material'
-                                THEN CASE WHEN COALESCE((SELECT pricing_type FROM subprojects WHERE id = cost_records.subproject_id), 'Fixed') = 'T&M'
+                                THEN CASE WHEN COALESCE((SELECT pricing_type FROM subprojects WHERE id = cost_records.subproject_id), 'Fixed') IN ('T&M', 'T&M NTE')
                                   THEN COALESCE(sales_amount, 0) * ? ELSE 0 END
                               ELSE amount
                             END,
                             raw_rate = CASE
                               WHEN cost_type = 'Field Ticket Material'
-                                THEN CASE WHEN COALESCE((SELECT pricing_type FROM subprojects WHERE id = cost_records.subproject_id), 'Fixed') = 'T&M'
+                                THEN CASE WHEN COALESCE((SELECT pricing_type FROM subprojects WHERE id = cost_records.subproject_id), 'Fixed') IN ('T&M', 'T&M NTE')
                                   THEN COALESCE(sales_rate, rate, 0) * ? ELSE 0 END
                               ELSE raw_rate
                             END,
                             raw_cost_source = CASE
                               WHEN cost_type = 'Field Ticket Material'
-                                THEN CASE WHEN COALESCE((SELECT pricing_type FROM subprojects WHERE id = cost_records.subproject_id), 'Fixed') = 'T&M'
+                                THEN CASE WHEN COALESCE((SELECT pricing_type FROM subprojects WHERE id = cost_records.subproject_id), 'Fixed') IN ('T&M', 'T&M NTE')
                                   THEN 'Subproject T&M material estimate at 35% margin' ELSE 'Usage only - not budget cost' END
                               ELSE raw_cost_source
                             END
