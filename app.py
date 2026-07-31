@@ -374,7 +374,17 @@ def purchase_order_html(po):
         safe_name = quote(po["pickup_file"])
         pickup = f'<p><strong>Pickup Ticket:</strong> <a href="/uploads/{safe_name}" target="_blank" rel="noopener">{html_escape(po["pickup_file"])}</a></p>'
     invoice = ""
-    if "invoice_file" in po.keys() and po["invoice_file"]:
+    invoice_rows = rows("SELECT * FROM purchase_order_invoices WHERE po_id = ? ORDER BY uploaded_at DESC, id DESC", (po["id"],))
+    if invoice_rows:
+        invoice_links = []
+        for invoice_row in invoice_rows:
+            safe_name = quote(invoice_row["invoice_file"])
+            invoice_links.append(
+                f'<li><a href="/uploads/{safe_name}" target="_blank" rel="noopener">{html_escape(invoice_row["invoice_file"])}</a> '
+                f'<span class="meta">${money(invoice_row["invoice_amount"]):,.2f} / {html_escape((invoice_row["uploaded_at"] or "").replace("T", " "))}</span></li>'
+            )
+        invoice = f'<p><strong>Vendor Invoices:</strong></p><ul>{"".join(invoice_links)}</ul>'
+    elif "invoice_file" in po.keys() and po["invoice_file"]:
         safe_name = quote(po["invoice_file"])
         invoice = f'<p><strong>Vendor Invoice:</strong> <a href="/uploads/{safe_name}" target="_blank" rel="noopener">{html_escape(po["invoice_file"])}</a></p>'
     return f"""<!doctype html>
@@ -975,6 +985,17 @@ def init_db():
               updated_at TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS purchase_order_invoices (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              po_id INTEGER NOT NULL REFERENCES purchase_orders(id) ON DELETE CASCADE,
+              invoice_file TEXT NOT NULL,
+              invoice_amount REAL DEFAULT 0,
+              cost_record_id INTEGER REFERENCES cost_records(id) ON DELETE SET NULL,
+              uploaded_at TEXT NOT NULL,
+              uploaded_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+              uploaded_by_username TEXT
+            );
+
             CREATE TABLE IF NOT EXISTS cog_categories (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               code TEXT NOT NULL,
@@ -1208,6 +1229,30 @@ def init_db():
               ELSE status
             END
             WHERE status IN ('Open', 'Pending Review', 'Received')
+            """
+        )
+        con.execute(
+            """
+            INSERT INTO purchase_order_invoices (
+              po_id, invoice_file, invoice_amount, cost_record_id,
+              uploaded_at, uploaded_by_user_id, uploaded_by_username
+            )
+            SELECT
+              po.id,
+              po.invoice_file,
+              COALESCE(po.estimated_amount, 0),
+              po.invoice_cost_record_id,
+              COALESCE(po.invoice_uploaded_at, po.updated_at, po.created_at),
+              po.invoice_uploaded_by_user_id,
+              po.invoice_uploaded_by_username
+            FROM purchase_orders po
+            WHERE COALESCE(po.invoice_file, '') <> ''
+              AND NOT EXISTS (
+                SELECT 1
+                FROM purchase_order_invoices poi
+                WHERE poi.po_id = po.id
+                  AND poi.invoice_file = po.invoice_file
+              )
             """
         )
         cog_schema = con.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'cog_categories'").fetchone()
@@ -4988,11 +5033,38 @@ def import_vendor_invoice_pdf(path, project_id):
     return {"count": count, "skipped": skipped, "order_number": order_number, "matched_subproject_id": matched_subproject_id, "vendor": vendor, "invoice_number": invoice_number, "duplicate": False}
 
 
-def sync_po_invoice_cost_record(con, po, invoice_file, actor):
+def extract_vendor_invoice_total(path):
+    if Path(path).suffix.lower() != ".pdf" or pdfplumber is None:
+        return 0.0
+    try:
+        text = extract_pdf_text(path)
+    except Exception:
+        return 0.0
+    if not text:
+        return 0.0
+    patterns = [
+        r"Amount Due\s+\$?([0-9,]+\.[0-9]{2})",
+        r"TOTAL\s+DUE\s*[-=]*>?\s*\$?([0-9,]+\.[0-9]{2})",
+        r"TOTALDUE\s*\n?\s*\$?([0-9,]+\.[0-9]{2})",
+        r"INVOICETOTAL\s*\n\s*\$?([0-9,]+\.[0-9]{2})",
+        r"Net Invoice Amount\s+\$\s*([0-9,]+\.[0-9]{2})",
+        r"BALANCE\s+DUE\s+\$?([0-9,]+\.[0-9]{2})",
+        r"(?:Total|Amount Due)\s*:?\s*\$?\s*([0-9,]+\.[0-9]{2})",
+        r"Total\s*\n?\s*\$?([0-9,]+\.[0-9]{2})",
+    ]
+    amount = parse_money_text(first_regex(patterns, text, flags=re.IGNORECASE))
+    if amount:
+        return amount
+    money_values = [parse_money_text(value) for value in re.findall(r"\b[0-9,]+\.[0-9]{2}\b", text)]
+    money_values = [value for value in money_values if value > 0]
+    return money_values[-1] if money_values else 0.0
+
+
+def sync_po_invoice_cost_record(con, po, invoice_file, actor, invoice_amount=None, cost_record_id=None):
     if not po["project_id"]:
         return None
     now = datetime.now().isoformat(timespec="seconds")
-    amount = money(po["estimated_amount"])
+    amount = money(invoice_amount if invoice_amount is not None else po["estimated_amount"])
     notes = json.dumps(
         {
             "po_id": po["id"],
@@ -5001,11 +5073,11 @@ def sync_po_invoice_cost_record(con, po, invoice_file, actor):
             "uploaded_at": now,
             "job_number": po["job_number"],
             "job_label": po["job_label"],
+            "invoice_amount": amount,
         },
         default=str,
     )
     description = f"PO invoice {po['po_number']}: {po['description'] or ''}".strip()
-    cost_record_id = po["invoice_cost_record_id"] if "invoice_cost_record_id" in po.keys() else None
     if cost_record_id:
         existing = con.execute("SELECT id FROM cost_records WHERE id = ?", (cost_record_id,)).fetchone()
         if not existing:
@@ -5076,6 +5148,29 @@ def sync_po_invoice_cost_record(con, po, invoice_file, actor):
         ),
     )
     return cur.lastrowid
+
+
+def purchase_orders_with_invoices(sql, params=()):
+    po_rows = rows(sql, params)
+    if not po_rows:
+        return po_rows
+    po_ids = [po["id"] for po in po_rows]
+    placeholders = ",".join("?" for _ in po_ids)
+    invoice_rows = rows(
+        f"""
+        SELECT *
+        FROM purchase_order_invoices
+        WHERE po_id IN ({placeholders})
+        ORDER BY uploaded_at DESC, id DESC
+        """,
+        po_ids,
+    )
+    invoices_by_po = {}
+    for invoice in invoice_rows:
+        invoices_by_po.setdefault(invoice["po_id"], []).append(invoice)
+    for po in po_rows:
+        po["invoices"] = invoices_by_po.get(po["id"], [])
+    return po_rows
 
 
 def is_tm_like_pricing(value):
@@ -8150,15 +8245,22 @@ HTML = r"""
       document.getElementById(config.tableId).innerHTML = filtered.length
         ? `<thead><tr><th>PO</th><th>Job / Order / COG</th><th>Customer</th><th>Vendor</th><th>Amount</th><th>Created By</th><th>Status</th><th>Close / Void Reason</th><th>Details</th><th></th></tr></thead><tbody>${filtered.map(po => {
           const statusOptions = ['Pending Approval','Issued','Picked Up','Closed','Void'].map(statusOption => `<option ${po.status === statusOption ? 'selected' : ''}>${statusOption}</option>`).join('');
+          const invoiceRows = Array.isArray(po.invoices) ? po.invoices : [];
+          const invoiceTotal = invoiceRows.reduce((sum, inv) => sum + Number(inv.invoice_amount || 0), 0);
+          const amountCell = invoiceRows.length
+            ? `<div><strong>${money(invoiceTotal)}</strong><div class="muted">Vendor invoice total</div></div>`
+            : `<input data-office-po-field="${po.id}" data-field="estimated_amount" type="number" min="0" step="0.01" value="${Number(po.estimated_amount || 0)}">`;
           const eventLines = [
             po.pickup_uploaded_at ? `Pickup uploaded ${String(po.pickup_uploaded_at).slice(0, 16).replace('T', ' ')}${po.pickup_uploaded_by_username ? ' by ' + po.pickup_uploaded_by_username : ''}` : '',
             po.invoice_uploaded_at ? `Vendor invoice uploaded ${String(po.invoice_uploaded_at).slice(0, 16).replace('T', ' ')}${po.invoice_uploaded_by_username ? ' by ' + po.invoice_uploaded_by_username : ''}` : '',
             po.closed_at ? `Closed ${String(po.closed_at).slice(0, 16).replace('T', ' ')}${po.closed_by_username ? ' by ' + po.closed_by_username : ''}` : '',
             po.voided_at ? `Voided ${String(po.voided_at).slice(0, 16).replace('T', ' ')}${po.voided_by_username ? ' by ' + po.voided_by_username : ''}` : ''
           ].filter(Boolean).map(line => `<div class="muted">${htmlEscape(line)}</div>`).join('');
-          const invoiceBlock = po.invoice_file
-            ? `<div><a class="pdf-link" href="/uploads/${encodeURIComponent(po.invoice_file)}" target="_blank" rel="noopener">Vendor invoice</a></div>`
-            : '<div class="muted">No vendor invoice</div>';
+          const invoiceBlock = invoiceRows.length
+            ? `<div class="po-invoice-list">${invoiceRows.map(inv => `<div class="po-invoice-line"><a class="pdf-link" href="/uploads/${encodeURIComponent(inv.invoice_file)}" target="_blank" rel="noopener">Vendor invoice</a> <span class="muted">${htmlEscape(String(inv.uploaded_at || '').slice(0, 16).replace('T', ' '))}</span><div class="inline-controls"><input data-office-po-invoice-edit="${inv.id}" type="number" min="0" step="0.01" value="${Number(inv.invoice_amount || 0)}" placeholder="Amount"><button class="btn" data-save-office-po-invoice="${inv.id}" type="button">Save Amount</button><button class="btn danger" data-delete-office-po-invoice="${inv.id}" type="button">Remove</button></div>${Number(inv.invoice_amount || 0) <= 0 ? '<div class="bad">Amount required</div>' : ''}</div>`).join('')}</div>`
+            : po.invoice_file
+              ? `<div><a class="pdf-link" href="/uploads/${encodeURIComponent(po.invoice_file)}" target="_blank" rel="noopener">Vendor invoice</a></div>`
+              : '<div class="muted">No vendor invoice</div>';
           const invoiceUpload = po.status === 'Void' ? '' : `<form class="compact-upload po-invoice-upload" data-office-po-invoice="${po.id}" style="margin-top:8px">
               <label style="margin-top:0">Upload vendor invoice</label>
               <div class="upload-row">
@@ -8174,7 +8276,7 @@ HTML = r"""
             <td><select data-office-po-field="${po.id}" data-field="job_key">${officePoJobOptions(po)}</select></td>
             <td><input data-office-po-field="${po.id}" data-field="customer_name" value="${htmlEscape(po.customer_name || '')}" placeholder="${po.cog_category_id ? 'Required' : 'Optional'}"></td>
             <td><input data-office-po-field="${po.id}" data-field="vendor" value="${htmlEscape(po.vendor || '')}"></td>
-            <td><input data-office-po-field="${po.id}" data-field="estimated_amount" type="number" min="0" step="0.01" value="${Number(po.estimated_amount || 0)}"></td>
+            <td>${amountCell}</td>
             <td>${htmlEscape(po.requested_by_username || '')}</td>
             <td><select data-office-po-field="${po.id}" data-field="status">${statusOptions}</select>${eventLines}</td>
             <td><textarea data-office-po-field="${po.id}" data-field="close_reason" placeholder="Required when closing">${htmlEscape(po.close_reason || '')}</textarea><textarea data-office-po-field="${po.id}" data-field="void_reason" placeholder="Required when voiding" style="margin-top:6px">${htmlEscape(po.void_reason || '')}</textarea></td>
@@ -8199,7 +8301,20 @@ HTML = r"""
         if (!invoiceInput?.files?.length) return false;
         const data = new FormData();
         data.append('invoice_file', invoiceInput.files[0]);
-        await api(`/api/purchase-orders/${id}/invoice`, { method: 'POST', body: data });
+        const result = await api(`/api/purchase-orders/${id}/invoice`, { method: 'POST', body: data });
+        if (Number(result.invoice_amount || 0) > 0) {
+          window.alert(`Invoice uploaded. I found an invoice total of ${money(result.invoice_amount)}. Please verify it in the invoice list.`);
+        } else {
+          const entered = window.prompt('Invoice uploaded, but I could not read the total automatically. Enter the vendor invoice amount now:');
+          if (entered !== null && String(entered).trim()) {
+            await api(`/api/purchase-order-invoices/${result.invoice_id}`, {
+              method: 'PUT',
+              body: JSON.stringify({ invoice_amount: entered })
+            });
+          } else {
+            window.alert('Invoice uploaded, but it still needs an amount before it will count as project cost.');
+          }
+        }
         return true;
       }
       document.querySelectorAll(`#${config.tableId} [data-save-office-po]`).forEach(btn => btn.onclick = async () => {
@@ -8233,6 +8348,21 @@ HTML = r"""
           window.alert(err.message || 'Could not upload vendor invoice.');
           if (button) button.textContent = 'Upload Invoice';
         }
+      });
+      document.querySelectorAll(`#${config.tableId} [data-save-office-po-invoice]`).forEach(btn => btn.onclick = async () => {
+        const id = btn.dataset.saveOfficePoInvoice;
+        const amountInput = document.querySelector(`#${config.tableId} [data-office-po-invoice-edit="${id}"]`);
+        await api(`/api/purchase-order-invoices/${id}`, {
+          method: 'PUT',
+          body: JSON.stringify({ invoice_amount: amountInput?.value || 0 })
+        });
+        await config.reload();
+      });
+      document.querySelectorAll(`#${config.tableId} [data-delete-office-po-invoice]`).forEach(btn => btn.onclick = async () => {
+        const id = btn.dataset.deleteOfficePoInvoice;
+        if (!window.confirm('Remove this vendor invoice from the PO? This will also remove its PO invoice cost record.')) return;
+        await api(`/api/purchase-order-invoices/${id}`, { method: 'DELETE' });
+        await config.reload();
       });
       document.querySelectorAll(`#${config.tableId} [data-delete-office-po]`).forEach(btn => btn.onclick = async () => {
         const id = btn.dataset.deleteOfficePo;
@@ -12027,15 +12157,15 @@ class Handler(BaseHTTPRequestHandler):
                 if is_field_po_only(user):
                     return json_response(
                         self,
-                        rows("SELECT * FROM purchase_orders WHERE requested_by_user_id = ? ORDER BY created_at DESC, id DESC", (user["id"],)),
+                        purchase_orders_with_invoices("SELECT * FROM purchase_orders WHERE requested_by_user_id = ? ORDER BY created_at DESC, id DESC", (user["id"],)),
                     )
                 project_filter = qs.get("project_id", [""])[0]
                 if project_filter:
                     return json_response(
                         self,
-                        rows("SELECT * FROM purchase_orders WHERE project_id = ? ORDER BY created_at DESC, id DESC", (project_filter,)),
+                        purchase_orders_with_invoices("SELECT * FROM purchase_orders WHERE project_id = ? ORDER BY created_at DESC, id DESC", (project_filter,)),
                     )
-                return json_response(self, rows("SELECT * FROM purchase_orders ORDER BY created_at DESC, id DESC"))
+                return json_response(self, purchase_orders_with_invoices("SELECT * FROM purchase_orders ORDER BY created_at DESC, id DESC"))
             if parsed.path == "/api/home-alerts":
                 return json_response(self, home_alerts())
             if parsed.path == "/api/bid-summary":
@@ -12768,6 +12898,7 @@ class Handler(BaseHTTPRequestHandler):
                 path = UPLOAD_DIR / saved_name
                 with open(path, "wb") as f:
                     f.write(file_item.file.read())
+                invoice_amount = extract_vendor_invoice_total(path)
                 now = datetime.now().isoformat(timespec="seconds")
                 with db() as con:
                     po = con.execute("SELECT * FROM purchase_orders WHERE id = ?", (po_id,)).fetchone()
@@ -12783,7 +12914,17 @@ class Handler(BaseHTTPRequestHandler):
                         except OSError:
                             pass
                         return json_response(self, {"error": "Cannot upload an invoice to a void PO."}, 400)
-                    cost_record_id = sync_po_invoice_cost_record(con, po, saved_name, actor)
+                    cost_record_id = sync_po_invoice_cost_record(con, po, saved_name, actor, invoice_amount) if invoice_amount > 0 else None
+                    invoice_cur = con.execute(
+                        """
+                        INSERT INTO purchase_order_invoices (
+                          po_id, invoice_file, invoice_amount, cost_record_id,
+                          uploaded_at, uploaded_by_user_id, uploaded_by_username
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (po_id, saved_name, invoice_amount, cost_record_id, now, actor["id"], actor["username"]),
+                    )
                     con.execute(
                         """
                         UPDATE purchase_orders
@@ -12802,9 +12943,9 @@ class Handler(BaseHTTPRequestHandler):
                         "uploaded vendor invoice to PO",
                         "Purchase Order",
                         po["po_number"],
-                        {"invoice_file": saved_name, "uploaded_at": now, "cost_record_id": cost_record_id},
+                        {"invoice_file": saved_name, "invoice_amount": invoice_amount, "uploaded_at": now, "cost_record_id": cost_record_id},
                     )
-                return json_response(self, {"ok": True, "invoice_file": saved_name, "cost_record_id": cost_record_id})
+                return json_response(self, {"ok": True, "invoice_id": invoice_cur.lastrowid, "invoice_file": saved_name, "invoice_amount": invoice_amount, "needs_amount": invoice_amount <= 0, "cost_record_id": cost_record_id})
             if parsed.path == "/api/role-permissions":
                 if not require_admin(self):
                     return json_response(self, {"error": "Admin required"}, 403)
@@ -13819,6 +13960,61 @@ class Handler(BaseHTTPRequestHandler):
                         ),
                     ).rowcount
                 return json_response(self, {"updated": updated})
+            if parsed.path.startswith("/api/purchase-order-invoices/"):
+                actor = current_user(self)
+                if not can_edit_permission(actor, "po_review"):
+                    return json_response(self, {"error": "Office PO access required."}, 403)
+                invoice_id = parsed.path.rsplit("/", 1)[-1]
+                invoice_amount = money(data.get("invoice_amount"))
+                if invoice_amount < 0:
+                    return json_response(self, {"error": "Invoice amount cannot be negative."}, 400)
+                with db() as con:
+                    invoice = con.execute("SELECT * FROM purchase_order_invoices WHERE id = ?", (invoice_id,)).fetchone()
+                    if not invoice:
+                        return json_response(self, {"error": "PO invoice not found."}, 404)
+                    po = con.execute("SELECT * FROM purchase_orders WHERE id = ?", (invoice["po_id"],)).fetchone()
+                    if not po:
+                        return json_response(self, {"error": "PO not found."}, 404)
+                    cost_record_id = invoice["cost_record_id"]
+                    if invoice_amount > 0:
+                        cost_record_id = sync_po_invoice_cost_record(
+                            con,
+                            po,
+                            invoice["invoice_file"],
+                            actor,
+                            invoice_amount,
+                            cost_record_id,
+                        )
+                    elif cost_record_id:
+                        con.execute("DELETE FROM cost_records WHERE id = ? AND raw_cost_source = 'PO invoice upload'", (cost_record_id,))
+                        cost_record_id = None
+                    con.execute(
+                        "UPDATE purchase_order_invoices SET invoice_amount = ?, cost_record_id = ? WHERE id = ?",
+                        (invoice_amount, cost_record_id, invoice_id),
+                    )
+                    con.execute(
+                        """
+                        UPDATE purchase_orders
+                        SET invoice_file = ?,
+                            invoice_uploaded_at = ?,
+                            invoice_uploaded_by_user_id = ?,
+                            invoice_uploaded_by_username = ?,
+                            invoice_cost_record_id = ?,
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            invoice["invoice_file"],
+                            invoice["uploaded_at"],
+                            invoice["uploaded_by_user_id"],
+                            invoice["uploaded_by_username"],
+                            cost_record_id,
+                            datetime.now().isoformat(timespec="seconds"),
+                            po["id"],
+                        ),
+                    )
+                log_activity(actor, "updated PO vendor invoice amount", "Purchase Order", po["po_number"], {"invoice_file": invoice["invoice_file"], "invoice_amount": invoice_amount, "cost_record_id": cost_record_id})
+                return json_response(self, {"ok": True, "invoice_amount": invoice_amount, "cost_record_id": cost_record_id})
             if parsed.path == "/api/vendor-invoice/allocate":
                 actor = current_user(self)
                 project_id = data.get("project_id")
@@ -14785,10 +14981,84 @@ class Handler(BaseHTTPRequestHandler):
                 po_id = parsed.path.rsplit("/", 1)[-1]
                 with db() as con:
                     po = con.execute("SELECT * FROM purchase_orders WHERE id = ?", (po_id,)).fetchone()
+                    cost_ids = [
+                        r["cost_record_id"]
+                        for r in con.execute(
+                            "SELECT cost_record_id FROM purchase_order_invoices WHERE po_id = ? AND cost_record_id IS NOT NULL",
+                            (po_id,),
+                        ).fetchall()
+                    ]
+                    if po and po["invoice_cost_record_id"]:
+                        cost_ids.append(po["invoice_cost_record_id"])
+                    for cost_id in sorted(set(cost_ids)):
+                        con.execute("DELETE FROM cost_records WHERE id = ? AND raw_cost_source = 'PO invoice upload'", (cost_id,))
                     deleted = con.execute("DELETE FROM purchase_orders WHERE id = ?", (po_id,)).rowcount
                 if not deleted:
                     return json_response(self, {"error": "PO not found."}, 404)
                 log_activity(current_user(self), "deleted PO", "Purchase Order", po["po_number"] if po else po_id, {"vendor": po["vendor"] if po else "", "amount": po["estimated_amount"] if po else 0})
+                return json_response(self, {"ok": True})
+            if parsed.path.startswith("/api/purchase-order-invoices/"):
+                actor = current_user(self)
+                if not can_edit_permission(actor, "po_review"):
+                    return json_response(self, {"error": "Office PO access required."}, 403)
+                invoice_id = parsed.path.rsplit("/", 1)[-1]
+                with db() as con:
+                    invoice = con.execute("SELECT * FROM purchase_order_invoices WHERE id = ?", (invoice_id,)).fetchone()
+                    if not invoice:
+                        return json_response(self, {"error": "PO invoice not found."}, 404)
+                    po = con.execute("SELECT * FROM purchase_orders WHERE id = ?", (invoice["po_id"],)).fetchone()
+                    if invoice["cost_record_id"]:
+                        con.execute("DELETE FROM cost_records WHERE id = ? AND raw_cost_source = 'PO invoice upload'", (invoice["cost_record_id"],))
+                    deleted = con.execute("DELETE FROM purchase_order_invoices WHERE id = ?", (invoice_id,)).rowcount
+                    latest = con.execute(
+                        """
+                        SELECT *
+                        FROM purchase_order_invoices
+                        WHERE po_id = ?
+                        ORDER BY uploaded_at DESC, id DESC
+                        LIMIT 1
+                        """,
+                        (invoice["po_id"],),
+                    ).fetchone()
+                    if latest:
+                        con.execute(
+                            """
+                            UPDATE purchase_orders
+                            SET invoice_file = ?,
+                                invoice_uploaded_at = ?,
+                                invoice_uploaded_by_user_id = ?,
+                                invoice_uploaded_by_username = ?,
+                                invoice_cost_record_id = ?,
+                                updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (
+                                latest["invoice_file"],
+                                latest["uploaded_at"],
+                                latest["uploaded_by_user_id"],
+                                latest["uploaded_by_username"],
+                                latest["cost_record_id"],
+                                datetime.now().isoformat(timespec="seconds"),
+                                invoice["po_id"],
+                            ),
+                        )
+                    else:
+                        con.execute(
+                            """
+                            UPDATE purchase_orders
+                            SET invoice_file = NULL,
+                                invoice_uploaded_at = NULL,
+                                invoice_uploaded_by_user_id = NULL,
+                                invoice_uploaded_by_username = NULL,
+                                invoice_cost_record_id = NULL,
+                                updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (datetime.now().isoformat(timespec="seconds"), invoice["po_id"]),
+                        )
+                if not deleted:
+                    return json_response(self, {"error": "PO invoice not found."}, 404)
+                log_activity(actor, "removed PO vendor invoice", "Purchase Order", po["po_number"] if po else invoice["po_id"], {"invoice_file": invoice["invoice_file"], "invoice_amount": invoice["invoice_amount"]})
                 return json_response(self, {"ok": True})
             if parsed.path.startswith("/api/nte-buckets/"):
                 actor = current_user(self)
