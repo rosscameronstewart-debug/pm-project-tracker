@@ -8720,7 +8720,7 @@ HTML = r"""
     }
 
     async function loadFieldPoJobs() {
-      if (!jobOrderReportRows.length) jobOrderReportRows = await api('/api/job-order-report');
+      jobOrderReportRows = await api('/api/job-order-report');
       const rowsWithKeys = jobOrderReportRows.filter(row => row.job_key);
       fieldPoJobChoices = rowsWithKeys.map(row => {
         const isCog = row.item_type === 'COG';
@@ -9013,7 +9013,7 @@ HTML = r"""
     }
 
     async function loadOfficePos() {
-      if (!jobOrderReportRows.length) jobOrderReportRows = await api('/api/job-order-report');
+      jobOrderReportRows = await api('/api/job-order-report');
       officePoRows = await api('/api/purchase-orders');
       renderOfficePos();
     }
@@ -9030,7 +9030,7 @@ HTML = r"""
     }
 
     async function loadClosedPos() {
-      if (!jobOrderReportRows.length) jobOrderReportRows = await api('/api/job-order-report');
+      jobOrderReportRows = await api('/api/job-order-report');
       closedPoRows = await api('/api/purchase-orders');
       renderClosedPos();
     }
@@ -9041,7 +9041,7 @@ HTML = r"""
     }
 
     async function loadProjectPos() {
-      if (!jobOrderReportRows.length) jobOrderReportRows = await api('/api/job-order-report');
+      jobOrderReportRows = await api('/api/job-order-report');
       projectPoRows = await api(`/api/purchase-orders?project_id=${state.projectId}`);
       renderProjectPos();
     }
@@ -12344,12 +12344,14 @@ HTML = r"""
       e.preventDefault();
       await api('/api/subprojects', { method:'POST', body: JSON.stringify({ ...formDataObj(e.target), project_id: state.projectId }) });
       e.target.reset(); markSaved(); await refresh();
+      jobOrderReportRows = await api('/api/job-order-report');
     };
     document.getElementById('coForm').onsubmit = async e => {
       e.preventDefault();
       try {
         await api('/api/change-orders', { method:'POST', body: JSON.stringify({ ...formDataObj(e.target), project_id: state.projectId }) });
         e.target.reset(); markSaved(); await refresh();
+        jobOrderReportRows = await api('/api/job-order-report');
         updateCoPricingFields();
       } catch (err) {
         window.alert(err.message || 'Could not add this change order / child project.');
