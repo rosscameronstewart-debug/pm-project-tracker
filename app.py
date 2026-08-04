@@ -442,7 +442,6 @@ def nte_weekly_report_html(project_id):
     data = nte_summary(project_id, all_targets=True)
     buckets = data.get("buckets", [])
     additions = data.get("additions", [])
-    additions = data.get("additions", [])
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
     total_budget = sum(money(b.get("current_budget")) for b in buckets)
     total_used = sum(money(b.get("actual_cost")) for b in buckets)
@@ -450,6 +449,8 @@ def nte_weekly_report_html(project_id):
     total_labor_budget = sum(money(b.get("labor_hours_budget")) for b in buckets)
     total_labor_used = sum(money(b.get("labor_hours_used")) for b in buckets)
     total_unproductive = sum(money(b.get("unproductive_labor_hours")) for b in buckets)
+    completion_values = [money((b.get("completion") or {}).get("completion_percent")) for b in buckets]
+    avg_completion = (sum(completion_values) / len(completion_values)) if completion_values else 0
 
     def dollars(value):
         return f"${money(value):,.2f}"
@@ -466,6 +467,7 @@ def nte_weekly_report_html(project_id):
 
     bucket_sections = []
     for bucket in buckets:
+        bucket_completion = bucket.get("completion") or {}
         sub_rows = []
         for sub in bucket.get("subbuckets", []):
             labor_text = ""
@@ -498,8 +500,12 @@ def nte_weekly_report_html(project_id):
                   <div class="label">Used / Budget</div>
                   <div class="value">{dollars(bucket.get("actual_cost"))} / {dollars(bucket.get("current_budget"))}</div>
                   {usage_bar(bucket.get("actual_cost"), bucket.get("current_budget"))}
+                  <div class="label" style="margin-top:10px">Field Completion</div>
+                  <div class="value">{money(bucket_completion.get("completion_percent")):.1f}%</div>
+                  <div class="muted">{html_escape(bucket_completion.get("report_date") or "No date recorded")}</div>
                 </div>
               </div>
+              {f'<p><strong>Field completion note:</strong> {html_escape(bucket_completion.get("notes"))}</p>' if bucket_completion.get("notes") else ''}
               <table>
                 <thead><tr><th>Sub-Bucket</th><th>Current Budget</th><th>Used</th><th>Remaining</th><th>Usage</th></tr></thead>
                 <tbody>{''.join(sub_rows) or '<tr><td colspan="5">No sub-buckets entered.</td></tr>'}</tbody>
@@ -520,6 +526,11 @@ def nte_weekly_report_html(project_id):
               <td><strong>{html_escape(addition.get("bucket_name"))}</strong><div class="muted">{html_escape(addition.get("subbucket_name") or "Bucket level")}</div></td>
               <td>{html_escape(addition.get("status") or "")}</td>
               <td>{dollars(addition.get("amount"))}</td>
+              <td>
+                <div>Labor: {dollars(addition.get("labor_amount"))}</div>
+                <div>Material: {dollars(addition.get("material_amount"))}</div>
+                <div>Equipment: {dollars(addition.get("equipment_amount"))}</div>
+              </td>
               <td>{html_escape(addition.get("requested_date") or "")}<div class="muted">Approved {html_escape(addition.get("approved_date") or "")}</div></td>
               <td>{html_escape(addition.get("approver") or "")}</td>
               <td>{html_escape(addition.get("reason") or "")}<div class="muted">{html_escape(addition.get("notes") or "")}</div>{backup}</td>
@@ -539,8 +550,8 @@ def nte_weekly_report_html(project_id):
           </div>
         </div>
         <table>
-          <thead><tr><th>Created</th><th>Bucket / Sub-Bucket</th><th>Status</th><th>Amount</th><th>Dates</th><th>Approver</th><th>Reason / Backup</th></tr></thead>
-          <tbody>{''.join(addition_rows) or '<tr><td colspan="7">No budget additions have been entered for this report.</td></tr>'}</tbody>
+          <thead><tr><th>Created</th><th>Bucket / Sub-Bucket</th><th>Status</th><th>Amount</th><th>Split</th><th>Dates</th><th>Approver</th><th>Reason / Backup</th></tr></thead>
+          <tbody>{''.join(addition_rows) or '<tr><td colspan="8">No budget additions have been entered for this report.</td></tr>'}</tbody>
         </table>
       </section>
     """
@@ -564,7 +575,7 @@ def nte_weekly_report_html(project_id):
     h2 {{ margin:0; font-size:20px; }}
     p {{ color:var(--muted); line-height:1.45; }}
     .meta {{ color:var(--muted); margin-top:5px; }}
-    .summary {{ display:grid; grid-template-columns:repeat(4, 1fr); gap:12px; margin:22px 0; }}
+    .summary {{ display:grid; grid-template-columns:repeat(5, 1fr); gap:12px; margin:22px 0; }}
     .kpi {{ border:1px solid var(--line); border-radius:8px; padding:14px; background:var(--soft); }}
     .label {{ color:var(--muted); font-size:12px; font-weight:800; text-transform:uppercase; }}
     .value {{ font-size:22px; font-weight:850; margin-top:5px; }}
@@ -580,7 +591,7 @@ def nte_weekly_report_html(project_id):
     .bar span {{ display:block; height:100%; background:linear-gradient(90deg, var(--blue), var(--green)); border-radius:999px; }}
     .bar-label {{ color:var(--muted); font-size:12px; font-weight:700; margin-top:4px; }}
     @media print {{ body {{ background:white; }} main {{ padding:0; max-width:none; }} .actions {{ display:none; }} .report {{ border:0; border-radius:0; }} }}
-    @media (max-width:820px) {{ .header, .bucket-head {{ grid-template-columns:1fr; }} .summary {{ grid-template-columns:1fr 1fr; }} }}
+    @media (max-width:920px) {{ .header, .bucket-head {{ grid-template-columns:1fr; }} .summary {{ grid-template-columns:1fr 1fr; }} }}
   </style>
 </head>
 <body>
@@ -598,6 +609,7 @@ def nte_weekly_report_html(project_id):
         <div class="kpi"><div class="label">Current Budget</div><div class="value">{dollars(total_budget)}</div></div>
         <div class="kpi"><div class="label">Used</div><div class="value">{dollars(total_used)}</div></div>
         <div class="kpi"><div class="label">Remaining</div><div class="value {'bad' if total_remaining < 0 else 'good'}">{dollars(total_remaining)}</div></div>
+        <div class="kpi"><div class="label">Avg Field Completion</div><div class="value">{avg_completion:.1f}%</div><div class="muted">Average of main buckets</div></div>
         <div class="kpi"><div class="label">Labor Hours</div><div class="value">{total_labor_used:,.2f} / {total_labor_budget:,.2f}</div><div class="muted">{total_unproductive:,.2f} unproductive hrs flagged</div></div>
       </div>
       {''.join(bucket_sections) or '<p>No T&M NTE buckets are set up for this project yet.</p>'}
@@ -646,6 +658,8 @@ def nte_weekly_report_pdf_bytes(project_id):
     total_labor_budget = sum(money(b.get("labor_hours_budget")) for b in buckets)
     total_labor_used = sum(money(b.get("labor_hours_used")) for b in buckets)
     total_unproductive = sum(money(b.get("unproductive_labor_hours")) for b in buckets)
+    completion_values = [money((b.get("completion") or {}).get("completion_percent")) for b in buckets]
+    avg_completion = (sum(completion_values) / len(completion_values)) if completion_values else 0
 
     story.append(Paragraph("T&amp;M NTE Weekly Usage Report", styles["Title"]))
     story.append(Paragraph(f"{html_escape(project['project_code'])} / {html_escape(project['name'])} / {html_escape(project['customer'])}", styles["Muted"]))
@@ -653,11 +667,11 @@ def nte_weekly_report_pdf_bytes(project_id):
     story.append(Spacer(1, 0.14 * inch))
     summary_table = Table(
         [
-            ["Current Budget", "Used", "Remaining", "Labor Hours"],
-            [dollars(total_budget), dollars(total_used), dollars(total_remaining), f"{total_labor_used:,.2f} / {total_labor_budget:,.2f}"],
-            ["", "", "", f"{total_unproductive:,.2f} unproductive hrs flagged"],
+            ["Current Budget", "Used", "Remaining", "Avg Field Completion", "Labor Hours"],
+            [dollars(total_budget), dollars(total_used), dollars(total_remaining), f"{avg_completion:.1f}%", f"{total_labor_used:,.2f} / {total_labor_budget:,.2f}"],
+            ["", "", "", "Average of main buckets", f"{total_unproductive:,.2f} unproductive hrs flagged"],
         ],
-        colWidths=[1.75 * inch, 1.35 * inch, 1.35 * inch, 2.0 * inch],
+        colWidths=[1.28 * inch, 1.15 * inch, 1.15 * inch, 1.25 * inch, 1.55 * inch],
     )
     summary_table.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#eaf0f5")),
@@ -675,10 +689,14 @@ def nte_weekly_report_pdf_bytes(project_id):
     if not buckets:
         story.append(Paragraph("No T&amp;M NTE buckets are set up for this project yet.", styles["Normal"]))
     for bucket in buckets:
+        bucket_completion = bucket.get("completion") or {}
         story.append(Paragraph(html_escape(bucket.get("name")), styles["Heading2"]))
         if bucket.get("description"):
             story.append(Paragraph(html_escape(bucket.get("description")), styles["Muted"]))
         story.append(Paragraph(f"Used / Budget: <b>{dollars(bucket.get('actual_cost'))} / {dollars(bucket.get('current_budget'))}</b> ({pct_text(bucket.get('actual_cost'), bucket.get('current_budget'))})", styles["Small"]))
+        story.append(Paragraph(f"Field Completion: <b>{money(bucket_completion.get('completion_percent')):.1f}%</b> {html_escape(bucket_completion.get('report_date') or '')}", styles["Small"]))
+        if bucket_completion.get("notes"):
+            story.append(Paragraph(f"<b>Field completion note:</b> {html_escape(bucket_completion.get('notes'))}", styles["Small"]))
         rows = [["Sub-Bucket", "Type", "Current Budget", "Used", "Remaining", "Usage / Labor Hours"]]
         for sub in bucket.get("subbuckets", []):
             labor = ""
@@ -709,11 +727,16 @@ def nte_weekly_report_pdf_bytes(project_id):
 
     story.append(Paragraph("Budget Additions", styles["Heading2"]))
     story.append(Paragraph("Documented customer-approved or pending increases to the NTE budget.", styles["Muted"]))
-    addition_rows = [["Bucket / Sub-Bucket", "Status", "Amount", "Dates", "Approver", "Reason / Backup"]]
+    addition_rows = [["Bucket / Sub-Bucket", "Status", "Amount", "Split", "Dates", "Approver", "Reason / Backup"]]
     for addition in additions:
         target = html_escape(addition.get("bucket_name") or "")
         if addition.get("subbucket_name"):
             target += f"<br/><font color='#5c6d80'>{html_escape(addition.get('subbucket_name'))}</font>"
+        split = (
+            f"Labor: {dollars(addition.get('labor_amount'))}<br/>"
+            f"Material: {dollars(addition.get('material_amount'))}<br/>"
+            f"Equipment: {dollars(addition.get('equipment_amount'))}"
+        )
         dates = html_escape(addition.get("requested_date") or "")
         if addition.get("approved_date"):
             dates += f"<br/>Approved {html_escape(addition.get('approved_date'))}"
@@ -726,13 +749,14 @@ def nte_weekly_report_pdf_bytes(project_id):
             Paragraph(target, styles["Small"]),
             Paragraph(html_escape(addition.get("status") or ""), styles["Small"]),
             dollars(addition.get("amount")),
+            Paragraph(split, styles["Small"]),
             Paragraph(dates, styles["Small"]),
             Paragraph(html_escape(addition.get("approver") or ""), styles["Small"]),
             Paragraph(reason or "-", styles["Small"]),
         ])
     if len(addition_rows) == 1:
-        addition_rows.append([Paragraph("No budget additions have been entered for this report.", styles["Small"]), "", "", "", "", ""])
-    addition_table = Table(addition_rows, colWidths=[1.35 * inch, 0.75 * inch, 0.8 * inch, 1.0 * inch, 0.9 * inch, 2.0 * inch], repeatRows=1)
+        addition_rows.append([Paragraph("No budget additions have been entered for this report.", styles["Small"]), "", "", "", "", "", ""])
+    addition_table = Table(addition_rows, colWidths=[1.1 * inch, 0.65 * inch, 0.75 * inch, 1.05 * inch, 0.85 * inch, 0.75 * inch, 1.35 * inch], repeatRows=1)
     addition_table.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#eaf0f5")),
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#31445a")),
@@ -871,12 +895,27 @@ def init_db():
               bucket_id INTEGER NOT NULL REFERENCES nte_buckets(id) ON DELETE CASCADE,
               subbucket_id INTEGER REFERENCES nte_subbuckets(id) ON DELETE SET NULL,
               amount REAL DEFAULT 0,
+              labor_amount REAL DEFAULT 0,
+              material_amount REAL DEFAULT 0,
+              equipment_amount REAL DEFAULT 0,
               status TEXT DEFAULT 'Pending',
               requested_date TEXT,
               approved_date TEXT,
               approver TEXT,
               reason TEXT,
               support_file TEXT,
+              notes TEXT,
+              created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+              created_by_username TEXT,
+              created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS nte_completion_updates (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+              bucket_id INTEGER REFERENCES nte_buckets(id) ON DELETE CASCADE,
+              completion_percent REAL DEFAULT 0,
+              report_date TEXT,
               notes TEXT,
               created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
               created_by_username TEXT,
@@ -1448,6 +1487,16 @@ def init_db():
         nte_subbucket_cols = [r["name"] for r in con.execute("PRAGMA table_info(nte_subbuckets)").fetchall()]
         if "labor_hours_budget" not in nte_subbucket_cols:
             con.execute("ALTER TABLE nte_subbuckets ADD COLUMN labor_hours_budget REAL DEFAULT 0")
+        nte_addition_cols = [r["name"] for r in con.execute("PRAGMA table_info(nte_bucket_additions)").fetchall()]
+        if "labor_amount" not in nte_addition_cols:
+            con.execute("ALTER TABLE nte_bucket_additions ADD COLUMN labor_amount REAL DEFAULT 0")
+        if "material_amount" not in nte_addition_cols:
+            con.execute("ALTER TABLE nte_bucket_additions ADD COLUMN material_amount REAL DEFAULT 0")
+        if "equipment_amount" not in nte_addition_cols:
+            con.execute("ALTER TABLE nte_bucket_additions ADD COLUMN equipment_amount REAL DEFAULT 0")
+        nte_completion_cols = [r["name"] for r in con.execute("PRAGMA table_info(nte_completion_updates)").fetchall()]
+        if "bucket_id" not in nte_completion_cols:
+            con.execute("ALTER TABLE nte_completion_updates ADD COLUMN bucket_id INTEGER REFERENCES nte_buckets(id) ON DELETE CASCADE")
         con.execute(
             """
             UPDATE cost_records
@@ -5706,6 +5755,28 @@ def customer_dashboard_summary(project_id):
     return {"project": project, "targets": targets, "tickets": tickets, "summary": summary}
 
 
+def nte_completion_by_bucket(project_id):
+    completions = {}
+    for row in rows(
+        """
+        SELECT c.*
+        FROM nte_completion_updates c
+        JOIN (
+          SELECT bucket_id, MAX(COALESCE(report_date, '') || '|' || created_at || '|' || printf('%010d', id)) AS latest_key
+          FROM nte_completion_updates
+          WHERE project_id = ?
+            AND bucket_id IS NOT NULL
+          GROUP BY bucket_id
+        ) latest ON latest.bucket_id = c.bucket_id
+          AND latest.latest_key = COALESCE(c.report_date, '') || '|' || c.created_at || '|' || printf('%010d', c.id)
+        WHERE c.project_id = ?
+        """,
+        (project_id, project_id),
+    ):
+        completions[row["bucket_id"]] = dict(row)
+    return completions
+
+
 def nte_summary(project_id, subproject_id=None, change_order_id=None, seed_defaults=False, all_targets=False):
     project_id = int(project_id) if project_id else None
     subproject_id = int(subproject_id) if subproject_id else None
@@ -5791,14 +5862,38 @@ def nte_summary(project_id, subproject_id=None, change_order_id=None, seed_defau
         }
     additions_by_sub = {}
     additions_by_bucket = {}
+    pending_bucket_allocations = {}
     for addition in additions:
         if addition.get("status") == "Approved":
             additions_by_bucket[addition["bucket_id"]] = additions_by_bucket.get(addition["bucket_id"], 0) + money(addition["amount"])
             if addition.get("subbucket_id"):
                 additions_by_sub[addition["subbucket_id"]] = additions_by_sub.get(addition["subbucket_id"], 0) + money(addition["amount"])
+            else:
+                pending_bucket_allocations.setdefault(addition["bucket_id"], {"Labor": 0, "Material": 0, "Equipment": 0})
+                pending_bucket_allocations[addition["bucket_id"]]["Labor"] += money(addition.get("labor_amount"))
+                pending_bucket_allocations[addition["bucket_id"]]["Material"] += money(addition.get("material_amount"))
+                pending_bucket_allocations[addition["bucket_id"]]["Equipment"] += money(addition.get("equipment_amount"))
+    allocation_targets = {}
+    for sub in sub_rows:
+        target_map = allocation_targets.setdefault(sub["bucket_id"], {})
+        cost_type = str(sub.get("cost_type") or "")
+        if cost_type == "Labor" and "Labor" not in target_map:
+            target_map["Labor"] = sub["id"]
+        elif cost_type in ("Material", "Field Ticket Material") and "Material" not in target_map:
+            target_map["Material"] = sub["id"]
+        elif cost_type == "Equipment" and "Equipment" not in target_map:
+            target_map["Equipment"] = sub["id"]
     by_bucket = {b["id"]: {**b, "subbuckets": [], "original_budget": 0, "approved_additions": 0, "current_budget": 0, "actual_cost": 0, "remaining": 0, "labor_hours_budget": 0, "labor_hours_used": 0, "labor_hours_remaining": 0, "unproductive_labor_hours": 0} for b in bucket_rows}
     for sub in sub_rows:
         approved = additions_by_sub.get(sub["id"], 0)
+        bucket_allocations = pending_bucket_allocations.get(sub["bucket_id"], {})
+        target_map = allocation_targets.get(sub["bucket_id"], {})
+        if target_map.get("Labor") == sub["id"]:
+            approved += bucket_allocations.get("Labor", 0)
+        if target_map.get("Material") == sub["id"]:
+            approved += bucket_allocations.get("Material", 0)
+        if target_map.get("Equipment") == sub["id"]:
+            approved += bucket_allocations.get("Equipment", 0)
         actual = actuals.get(sub["id"], 0)
         labor_hours_budget = money(sub.get("labor_hours_budget")) if sub.get("cost_type") == "Labor" else 0
         labor_hours_used = labor_hours_actuals.get(sub["id"], 0) if sub.get("cost_type") == "Labor" else 0
@@ -5814,11 +5909,13 @@ def nte_summary(project_id, subproject_id=None, change_order_id=None, seed_defau
             bucket["labor_hours_budget"] += labor_hours_budget
             bucket["labor_hours_used"] += labor_hours_used
             bucket["unproductive_labor_hours"] += unproductive_hours
+    completions = nte_completion_by_bucket(project_id)
     for bucket in by_bucket.values():
         bucket["approved_additions"] = max(bucket["approved_additions"], additions_by_bucket.get(bucket["id"], bucket["approved_additions"]))
         bucket["current_budget"] = bucket["original_budget"] + bucket["approved_additions"]
         bucket["remaining"] = bucket["current_budget"] - bucket["actual_cost"]
         bucket["labor_hours_remaining"] = bucket["labor_hours_budget"] - bucket["labor_hours_used"]
+        bucket["completion"] = completions.get(bucket["id"], {"completion_percent": 0, "report_date": "", "notes": "", "created_by_username": "", "created_at": ""})
     return {"buckets": list(by_bucket.values()), "additions": additions}
 
 
@@ -7001,6 +7098,7 @@ HTML = r"""
           <div style="align-self:end"><button class="btn primary" id="seedNteDefaults" type="button">Sync Job Buckets</button></div>
           <div style="align-self:end"><button class="btn" id="applyNteRules" type="button">Auto-Code Lines</button></div>
         </div>
+        <p class="muted" style="margin-top:12px">Field completion is entered on each main bucket in the Bucket Rollup below.</p>
         <p id="nteTrackingResult" class="muted"></p>
         <div id="nteSummaryCards" class="grid cols-4" style="margin-top:12px"></div>
       </div>
@@ -7016,8 +7114,10 @@ HTML = r"""
         <p class="muted">Use this when the customer adds scope or approves more NTE budget. Attach the backup so the change is defensible later.</p>
         <div class="grid cols-4">
           <div><label>Bucket</label><select name="bucket_id" id="nteAdditionBucket"></select></div>
-          <div><label>Sub-Bucket</label><select name="subbucket_id" id="nteAdditionSubbucket"></select></div>
-          <div><label>Amount</label><input name="amount" type="number" step="0.01" value="0" required></div>
+          <div><label>Labor Addition</label><input name="labor_amount" type="number" step="0.01" value="0"></div>
+          <div><label>Material Addition</label><input name="material_amount" type="number" step="0.01" value="0"></div>
+          <div><label>Equipment Addition</label><input name="equipment_amount" type="number" step="0.01" value="0"></div>
+          <div><label>Total Addition</label><input name="amount" id="nteAdditionAmount" type="number" step="0.01" value="0" readonly></div>
           <div><label>Status</label><select name="status"><option>Pending</option><option>Approved</option><option>Rejected</option></select></div>
           <div><label>Requested Date</label><input name="requested_date" type="date"></div>
           <div><label>Approved Date</label><input name="approved_date" type="date"></div>
@@ -10969,8 +11069,11 @@ HTML = r"""
       const remaining = current - actual;
       const unproductiveHours = buckets.reduce((sum, b) => sum + Number(b.unproductive_labor_hours || 0), 0);
       const needsCoding = (nteCosts || []).filter(r => !r.nte_subbucket_id).length;
+      const completionValues = buckets.map(b => Number(b.completion?.completion_percent || 0));
+      const avgCompletion = completionValues.length ? completionValues.reduce((sum, value) => sum + value, 0) / completionValues.length : 0;
       document.getElementById('nteSummaryCards').innerHTML = `
         <div class="panel kpi clickable" id="nteNeedsCodingKpi" role="button" tabindex="0"><div class="label">Needs Coding</div><div class="value ${needsCoding ? 'warn' : 'good'}">${needsCoding}</div><div class="hint">Unassigned Field Wise NTE lines</div></div>
+        <div class="panel kpi"><div class="label">Avg Field Completion</div><div class="value">${avgCompletion.toFixed(1)}%</div><div class="hint">Average of main buckets</div></div>
         <div class="panel kpi"><div class="label">Original Budget</div><div class="value">${money(original)}</div><div class="hint">Sub-bucket starting budgets</div></div>
         <div class="panel kpi"><div class="label">Approved Additions</div><div class="value">${money(additions)}</div><div class="hint">Approved documented increases</div></div>
         <div class="panel kpi"><div class="label">Actual Cost</div><div class="value">${money(actual)}</div><div class="hint">Assigned cost records</div></div>
@@ -10997,7 +11100,7 @@ HTML = r"""
         return;
       }
       tableEl.innerHTML = `
-        <thead><tr><th>Bucket / Sub-Bucket</th><th>Type</th><th>Original</th><th>Additions</th><th>Current Budget</th><th>Actual</th><th>Remaining</th><th>Labor Hours</th><th>Unproductive</th><th>Description</th><th></th></tr></thead>
+        <thead><tr><th>Bucket / Sub-Bucket</th><th>Type</th><th>Original</th><th>Additions</th><th>Current Budget</th><th>Actual</th><th>Remaining</th><th>Labor Hours</th><th>Unproductive</th><th>Field Completion</th><th>Description</th><th></th></tr></thead>
         <tbody>${buckets.map(bucket => `
           <tr class="invoice-summary">
             <td><input data-nte-bucket="${bucket.id}" data-field="name" value="${htmlEscape(bucket.name || '')}"></td>
@@ -11009,6 +11112,12 @@ HTML = r"""
             <td class="${Number(bucket.remaining || 0) < 0 ? 'bad' : ''}">${money(bucket.remaining)}</td>
             <td>${Number(bucket.labor_hours_budget || 0) ? `${Number(bucket.labor_hours_used || 0).toFixed(2)} / ${Number(bucket.labor_hours_budget || 0).toFixed(2)} hrs` : '<span class="muted">-</span>'}</td>
             <td>${Number(bucket.unproductive_labor_hours || 0) ? `${Number(bucket.unproductive_labor_hours || 0).toFixed(2)} hrs` : '<span class="muted">-</span>'}</td>
+            <td>
+              <input data-nte-completion="${bucket.id}" data-field="completion_percent" type="number" min="0" max="100" step="0.1" value="${Number(bucket.completion?.completion_percent || 0).toFixed(1)}" title="Field completion percent">
+              <input data-nte-completion="${bucket.id}" data-field="report_date" type="date" value="${htmlEscape(bucket.completion?.report_date || new Date().toISOString().slice(0, 10))}" title="Report week">
+              <input data-nte-completion="${bucket.id}" data-field="notes" value="${htmlEscape(bucket.completion?.notes || '')}" placeholder="Foreman note">
+              <button class="btn" data-save-nte-completion="${bucket.id}" type="button">Save %</button>
+            </td>
             <td><input data-nte-bucket="${bucket.id}" data-field="description" value="${htmlEscape(bucket.description || '')}"></td>
             <td>
               <button class="btn" data-save-nte-bucket="${bucket.id}" type="button">Save</button>
@@ -11026,6 +11135,7 @@ HTML = r"""
               <td class="${Number(sub.remaining || 0) < 0 ? 'bad' : ''}">${money(sub.remaining)}</td>
               <td>${sub.cost_type === 'Labor' ? `<input data-nte-sub="${sub.id}" data-field="labor_hours_budget" type="number" step="0.01" value="${Number(sub.labor_hours_budget || 0).toFixed(2)}"><div class="muted">${Number(sub.labor_hours_used || 0).toFixed(2)} used / ${Number(sub.labor_hours_remaining || 0).toFixed(2)} remaining</div>` : '<span class="muted">-</span>'}</td>
               <td>${sub.cost_type === 'Labor' && Number(sub.unproductive_labor_hours || 0) ? `${Number(sub.unproductive_labor_hours || 0).toFixed(2)} hrs` : '<span class="muted">-</span>'}</td>
+              <td><span class="muted">Bucket level</span></td>
               <td><input data-nte-sub="${sub.id}" data-field="description" value="${htmlEscape(sub.description || '')}"></td>
               <td><button class="btn" data-save-nte-sub="${sub.id}" type="button">Save</button></td>
             </tr>
@@ -11045,6 +11155,15 @@ HTML = r"""
         if (!confirm(`Delete bucket "${bucket?.name || 'this bucket'}"? This also removes its empty sub-buckets.`)) return;
         await api(`/api/nte-buckets/${id}`, { method:'DELETE' });
         markSaved();
+        await loadNteTracking(false);
+      });
+      tableEl.querySelectorAll('[data-save-nte-completion]').forEach(btn => btn.onclick = async () => {
+        const bucketId = btn.dataset.saveNteCompletion;
+        const fields = { project_id: state.projectId, bucket_id: bucketId };
+        tableEl.querySelectorAll(`[data-nte-completion="${bucketId}"]`).forEach(el => fields[el.dataset.field] = el.value);
+        await api('/api/nte-completion', { method:'POST', body: JSON.stringify(fields) });
+        markSaved();
+        document.getElementById('nteTrackingResult').textContent = `Field completion saved for bucket at ${Number(fields.completion_percent || 0).toFixed(1)}%.`;
         await loadNteTracking(false);
       });
       tableEl.querySelectorAll('[data-save-nte-sub]').forEach(btn => btn.onclick = async () => {
@@ -11067,19 +11186,29 @@ HTML = r"""
       const bucketById = Object.fromEntries((nteData.buckets || []).map(b => [b.id, b]));
       const subById = {};
       (nteData.buckets || []).forEach(b => (b.subbuckets || []).forEach(s => subById[s.id] = s));
-      tableEl.innerHTML = `<thead><tr><th>Created</th><th>Bucket</th><th>Sub-Bucket</th><th>Status</th><th>Amount</th><th>Requested</th><th>Approved</th><th>Approver</th><th>Backup</th><th>Reason</th></tr></thead>
+      tableEl.innerHTML = `<thead><tr><th>Created</th><th>Bucket</th><th>Status</th><th>Total</th><th>Labor</th><th>Material</th><th>Equipment</th><th>Requested</th><th>Approved</th><th>Approver</th><th>Backup</th><th>Reason</th></tr></thead>
         <tbody>${additions.map(a => `<tr>
           <td>${htmlEscape((a.created_at || '').replace('T', ' '))}<div class="muted">${htmlEscape(a.created_by_username || '')}</div></td>
           <td>${htmlEscape(bucketById[a.bucket_id]?.name || '')}</td>
-          <td>${htmlEscape(subById[a.subbucket_id]?.name || '')}</td>
           <td>${htmlEscape(a.status || '')}</td>
           <td>${money(a.amount)}</td>
+          <td>${money(a.labor_amount)}</td>
+          <td>${money(a.material_amount)}</td>
+          <td>${money(a.equipment_amount)}</td>
           <td>${htmlEscape(a.requested_date || '')}</td>
           <td>${htmlEscape(a.approved_date || '')}</td>
           <td>${htmlEscape(a.approver || '')}</td>
           <td>${a.support_file ? pdfLink({ source_file: a.support_file }) : '<span class="muted">None</span>'}</td>
           <td>${htmlEscape(a.reason || '')}</td>
         </tr>`).join('')}</tbody>`;
+    }
+
+    function updateNteAdditionTotal() {
+      const form = document.getElementById('nteAdditionForm');
+      if (!form) return;
+      const total = ['labor_amount', 'material_amount', 'equipment_amount']
+        .reduce((sum, name) => sum + Number(form.elements[name]?.value || 0), 0);
+      if (form.elements.amount) form.elements.amount.value = total.toFixed(2);
     }
 
     function nteCostRowHtml(r) {
@@ -11334,12 +11463,18 @@ HTML = r"""
       markSaved();
       await loadNteTracking(false);
     };
+    document.querySelectorAll('#nteAdditionForm input[name="labor_amount"], #nteAdditionForm input[name="material_amount"], #nteAdditionForm input[name="equipment_amount"]').forEach(el => {
+      el.oninput = updateNteAdditionTotal;
+      el.onchange = updateNteAdditionTotal;
+    });
     document.getElementById('nteAdditionForm').onsubmit = async event => {
       event.preventDefault();
+      updateNteAdditionTotal();
       const formData = new FormData(event.target);
       formData.set('project_id', state.projectId);
       await api('/api/nte-additions', { method:'POST', body: formData });
       event.target.reset();
+      updateNteAdditionTotal();
       markSaved();
       await loadNteTracking(false);
     };
@@ -13296,6 +13431,47 @@ class Handler(BaseHTTPRequestHandler):
                 with db() as con:
                     con.execute("DELETE FROM user_sessions WHERE user_id = ? AND session_token <> ?", (user["id"], token or ""))
                 return json_response(self, {"ok": True})
+            if parsed.path == "/api/nte-completion":
+                actor = current_user(self)
+                if not can_edit_permission(actor, "nte_tracking"):
+                    return json_response(self, {"error": "T&M NTE edit access required."}, 403)
+                data = parse_json(self)
+                project_id = data.get("project_id")
+                bucket_id = data.get("bucket_id")
+                completion_percent = money(data.get("completion_percent"))
+                if not project_id:
+                    return json_response(self, {"error": "Project is required."}, 400)
+                if not bucket_id:
+                    return json_response(self, {"error": "Choose a bucket before saving field completion."}, 400)
+                if completion_percent < 0 or completion_percent > 100:
+                    return json_response(self, {"error": "Completion must be between 0 and 100 percent."}, 400)
+                now = datetime.now().isoformat(timespec="seconds")
+                with db() as con:
+                    bucket = con.execute("SELECT id, name FROM nte_buckets WHERE id = ? AND project_id = ?", (bucket_id, project_id)).fetchone()
+                    if not bucket:
+                        return json_response(self, {"error": "NTE bucket not found."}, 404)
+                    cur = con.execute(
+                        """
+                        INSERT INTO nte_completion_updates (
+                          project_id, bucket_id, completion_percent, report_date, notes,
+                          created_by_user_id, created_by_username, created_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            project_id,
+                            bucket_id,
+                            completion_percent,
+                            data.get("report_date") or datetime.now().date().isoformat(),
+                            data.get("notes") or "",
+                            actor["id"] if actor else None,
+                            actor["username"] if actor else "",
+                            now,
+                        ),
+                    )
+                    new_id = cur.lastrowid
+                log_activity(actor, "updated NTE field completion", "T&M NTE", bucket["name"], {"project_id": project_id, "bucket_id": bucket_id, "completion_percent": completion_percent, "report_date": data.get("report_date") or ""})
+                return json_response(self, {"id": new_id})
             if parsed.path == "/api/nte-additions":
                 actor = current_user(self)
                 if not can_edit_permission(actor, "nte_tracking"):
@@ -13304,11 +13480,15 @@ class Handler(BaseHTTPRequestHandler):
                 project_id = form.getfirst("project_id")
                 bucket_id = form.getfirst("bucket_id")
                 subbucket_id = form.getfirst("subbucket_id") or None
-                amount = money(form.getfirst("amount"))
+                labor_amount = money(form.getfirst("labor_amount"))
+                material_amount = money(form.getfirst("material_amount"))
+                equipment_amount = money(form.getfirst("equipment_amount"))
+                allocated_amount = labor_amount + material_amount + equipment_amount
+                amount = allocated_amount if allocated_amount else money(form.getfirst("amount"))
                 if not project_id or not bucket_id:
                     return json_response(self, {"error": "Choose a bucket before saving the addition."}, 400)
                 if not amount:
-                    return json_response(self, {"error": "Addition amount is required."}, 400)
+                    return json_response(self, {"error": "Enter at least one Labor, Material, or Equipment addition amount."}, 400)
                 file_item = form["support_file"] if "support_file" in form else None
                 saved_name = ""
                 if file_item is not None and getattr(file_item, "filename", ""):
@@ -13331,17 +13511,20 @@ class Handler(BaseHTTPRequestHandler):
                     cur = con.execute(
                         """
                         INSERT INTO nte_bucket_additions (
-                          project_id, bucket_id, subbucket_id, amount, status, requested_date,
+                          project_id, bucket_id, subbucket_id, amount, labor_amount, material_amount, equipment_amount, status, requested_date,
                           approved_date, approver, reason, support_file, notes,
                           created_by_user_id, created_by_username, created_at
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             project_id,
                             bucket_id,
                             subbucket_id,
                             amount,
+                            labor_amount,
+                            material_amount,
+                            equipment_amount,
                             form.getfirst("status") or "Pending",
                             form.getfirst("requested_date") or "",
                             form.getfirst("approved_date") or "",
@@ -13354,7 +13537,7 @@ class Handler(BaseHTTPRequestHandler):
                             now,
                         ),
                     )
-                log_activity(actor, "added NTE budget addition", "T&M NTE", bucket["name"], {"amount": amount, "status": form.getfirst("status") or "Pending", "support_file": saved_name})
+                log_activity(actor, "added NTE budget addition", "T&M NTE", bucket["name"], {"amount": amount, "labor_amount": labor_amount, "material_amount": material_amount, "equipment_amount": equipment_amount, "status": form.getfirst("status") or "Pending", "support_file": saved_name})
                 return json_response(self, {"id": cur.lastrowid, "support_file": saved_name})
             if parsed.path == "/api/nte-defaults":
                 actor = current_user(self)
