@@ -571,6 +571,8 @@ def nte_weekly_report_html(project_id):
     .primary {{ background:var(--blue); color:white; border-color:var(--blue); }}
     .report {{ background:white; border:1px solid var(--line); border-radius:8px; padding:26px; }}
     .header {{ display:flex; justify-content:space-between; gap:18px; border-bottom:4px solid var(--blue); padding-bottom:18px; }}
+    .brand-title {{ display:flex; align-items:center; gap:16px; }}
+    .report-logo {{ width:150px; max-height:58px; object-fit:contain; flex:0 0 auto; }}
     h1 {{ margin:0; font-size:30px; }}
     h2 {{ margin:0; font-size:20px; }}
     p {{ color:var(--muted); line-height:1.45; }}
@@ -590,8 +592,8 @@ def nte_weekly_report_html(project_id):
     .bar {{ height:12px; background:#e1e8ef; border-radius:999px; overflow:hidden; min-width:120px; }}
     .bar span {{ display:block; height:100%; background:linear-gradient(90deg, var(--blue), var(--green)); border-radius:999px; }}
     .bar-label {{ color:var(--muted); font-size:12px; font-weight:700; margin-top:4px; }}
-    @media print {{ body {{ background:white; }} main {{ padding:0; max-width:none; }} .actions {{ display:none; }} .report {{ border:0; border-radius:0; }} }}
-    @media (max-width:920px) {{ .header, .bucket-head {{ grid-template-columns:1fr; }} .summary {{ grid-template-columns:1fr 1fr; }} }}
+    @media print {{ body {{ background:white; }} main {{ padding:0; max-width:none; }} .actions {{ display:none; }} .report {{ border:0; border-radius:0; }} .report-logo {{ width:130px; }} }}
+    @media (max-width:920px) {{ .header, .bucket-head {{ grid-template-columns:1fr; }} .brand-title {{ align-items:flex-start; }} .report-logo {{ width:120px; }} .summary {{ grid-template-columns:1fr 1fr; }} }}
   </style>
 </head>
 <body>
@@ -599,9 +601,12 @@ def nte_weekly_report_html(project_id):
     <div class="actions"><a class="btn primary" href="/nte-weekly-report.pdf?project_id={project_id}">Download PDF</a><button onclick="window.print()">Print / Save PDF</button><a class="btn" href="/?tab=nteTracking&project_id={project_id}">Back to T&M NTE</a></div>
     <div class="report">
       <div class="header">
-        <div>
-          <h1>T&M NTE Weekly Usage Report</h1>
-          <div class="meta">{html_escape(project["project_code"])} / {html_escape(project["name"])} / {html_escape(project["customer"])}</div>
+        <div class="brand-title">
+          <img class="report-logo" src="/brand/twin-peaks-logo.png" alt="Twin Peaks Electrical">
+          <div>
+            <h1>T&M NTE Weekly Usage Report</h1>
+            <div class="meta">{html_escape(project["project_code"])} / {html_escape(project["name"])} / {html_escape(project["customer"])}</div>
+          </div>
         </div>
         <div class="meta">Generated {html_escape(generated_at)}<br>Prepared from current tracker data</div>
       </div>
@@ -626,7 +631,7 @@ def nte_weekly_report_pdf_bytes(project_id):
         from reportlab.lib.pagesizes import letter
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
         from reportlab.lib.units import inch
-        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+        from reportlab.platypus import Image, SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
     except Exception as exc:
         raise RuntimeError("PDF export needs reportlab installed. Run pip install -r requirements.txt.") from exc
 
@@ -661,6 +666,17 @@ def nte_weekly_report_pdf_bytes(project_id):
     completion_values = [money((b.get("completion") or {}).get("completion_percent")) for b in buckets]
     avg_completion = (sum(completion_values) / len(completion_values)) if completion_values else 0
 
+    logo_path = BRAND_DIR / "twin-peaks-logo.png"
+    if logo_path.exists():
+        logo = Image(str(logo_path))
+        max_width = 1.45 * inch
+        max_height = 0.55 * inch
+        scale = min(max_width / logo.imageWidth, max_height / logo.imageHeight)
+        logo.drawWidth = logo.imageWidth * scale
+        logo.drawHeight = logo.imageHeight * scale
+        logo.hAlign = "LEFT"
+        story.append(logo)
+        story.append(Spacer(1, 0.08 * inch))
     story.append(Paragraph("T&amp;M NTE Weekly Usage Report", styles["Title"]))
     story.append(Paragraph(f"{html_escape(project['project_code'])} / {html_escape(project['name'])} / {html_escape(project['customer'])}", styles["Muted"]))
     story.append(Paragraph(f"Generated {datetime.now().strftime('%Y-%m-%d %H:%M')} from current tracker data", styles["Muted"]))
@@ -6080,18 +6096,40 @@ HTML = r"""
       --green: #138a5b;
       --red: #b42318;
       --gold: #9a6700;
+      --soft: #fbfcfd;
+      --table-head: #eef2f6;
+      --field-bg: #ffffff;
+      --header-bg: #152332;
+      --shadow-blue: rgba(25, 99, 176, .12);
     }
     * { box-sizing: border-box; }
     body { margin: 0; font-family: "Segoe UI", Arial, sans-serif; color: var(--ink); background: var(--bg); }
-    header { background: #152332; color: white; padding: 14px 24px; display: flex; align-items: center; justify-content: space-between; gap: 20px; border-bottom: 4px solid #ffc20e; }
+    body.dark {
+      color-scheme: dark;
+      --ink: #e9eef5;
+      --muted: #a9b7c7;
+      --line: #334456;
+      --bg: #0f1720;
+      --panel: #172231;
+      --blue: #6ba7ef;
+      --green: #54d391;
+      --red: #ff8a80;
+      --gold: #ffd166;
+      --soft: #111c29;
+      --table-head: #223044;
+      --field-bg: #101a27;
+      --header-bg: #0b121b;
+      --shadow-blue: rgba(107, 167, 239, .18);
+    }
+    header { background: var(--header-bg); color: white; padding: 14px 24px; display: flex; align-items: center; justify-content: space-between; gap: 20px; border-bottom: 4px solid #ffc20e; }
     .brand-lockup { display: flex; align-items: center; gap: 14px; min-width: 280px; }
     .brand-logo { display: flex; align-items: center; justify-content: center; background: white; border-radius: 8px; padding: 8px 10px; border: 1px solid rgba(255,255,255,.3); box-shadow: 0 6px 18px rgba(0,0,0,.18); cursor: pointer; }
     .brand-logo img { display: block; height: 46px; width: auto; }
     .system-menu-wrap { position: relative; }
     .system-menu-btn { width: 34px; height: 34px; border-radius: 6px; border: 1px solid rgba(255,255,255,.35); background: rgba(255,255,255,.12); color: white; cursor: pointer; font-size: 20px; font-weight: 800; line-height: 1; }
-    .system-menu { position: absolute; top: 40px; left: 0; z-index: 40; width: 160px; padding: 6px; background: white; border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 12px 32px rgba(0,0,0,.2); }
-    .system-menu button { display: block; width: 100%; border: 0; background: white; color: var(--ink); text-align: left; padding: 9px 10px; border-radius: 6px; cursor: pointer; font-weight: 650; }
-    .system-menu button:hover { background: #eef2f6; }
+    .system-menu { position: absolute; top: 40px; left: 0; z-index: 40; width: 170px; padding: 6px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 12px 32px rgba(0,0,0,.2); }
+    .system-menu button { display: block; width: 100%; border: 0; background: var(--panel); color: var(--ink); text-align: left; padding: 9px 10px; border-radius: 6px; cursor: pointer; font-weight: 650; }
+    .system-menu button:hover { background: var(--table-head); }
     .brand-title h1 { margin: 0; font-size: 21px; font-weight: 750; }
     .brand-title .subtitle { color: #d8e6f3; font-size: 12px; font-weight: 650; margin-top: 2px; text-transform: uppercase; letter-spacing: .04em; }
     header select { min-width: 360px; padding: 10px 12px; border-radius: 6px; border: 1px solid #8aa0b5; font-weight: 650; }
@@ -6099,15 +6137,15 @@ HTML = r"""
     .project-switcher label { color: #d8e6f3; margin: 0; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
     main { padding: 20px 24px 36px; max-width: 1500px; margin: 0 auto; }
     .app-shell { display: grid; grid-template-columns: 230px minmax(0, 1fr); gap: 18px; align-items: start; }
-    nav { position: sticky; top: 16px; display: flex; flex-direction: column; gap: 8px; background: white; border: 1px solid var(--line); border-radius: 8px; padding: 12px; }
+    nav { position: sticky; top: 16px; display: flex; flex-direction: column; gap: 8px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; }
     nav::before { content: "Navigation"; color: var(--muted); font-size: 12px; font-weight: 750; text-transform: uppercase; letter-spacing: .04em; margin: 2px 2px 4px; }
     nav button { width: 100%; text-align: left; }
-    .nav-subgroup { display: flex; flex-direction: column; gap: 6px; margin: -3px 0 6px 12px; padding: 0 0 0 10px; border-left: 2px solid #e6edf4; }
+    .nav-subgroup { display: flex; flex-direction: column; gap: 6px; margin: -3px 0 6px 12px; padding: 0 0 0 10px; border-left: 2px solid var(--line); }
     .nav-subgroup.hidden { display: none; }
     .nav-subgroup button { font-size: 13px; padding: 8px 10px; }
-    nav button, .btn { border: 1px solid var(--line); background: white; color: var(--ink); padding: 9px 12px; border-radius: 6px; cursor: pointer; font-weight: 600; transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease, background-color .15s ease; }
-    nav button:hover, nav button:focus-visible { border-color: var(--blue); box-shadow: 0 8px 24px rgba(25, 99, 176, .12); outline: none; transform: translateY(-1px); }
-    .btn:hover, .btn:focus-visible { border-color: var(--blue); box-shadow: 0 8px 24px rgba(25, 99, 176, .12); outline: none; transform: translateY(-1px); }
+    nav button, .btn { border: 1px solid var(--line); background: var(--field-bg); color: var(--ink); padding: 9px 12px; border-radius: 6px; cursor: pointer; font-weight: 600; transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease, background-color .15s ease; }
+    nav button:hover, nav button:focus-visible { border-color: var(--blue); box-shadow: 0 8px 24px var(--shadow-blue); outline: none; transform: translateY(-1px); }
+    .btn:hover, .btn:focus-visible { border-color: var(--blue); box-shadow: 0 8px 24px var(--shadow-blue); outline: none; transform: translateY(-1px); }
     nav button.active, .btn.primary { background: var(--blue); color: white; border-color: var(--blue); }
     .btn.danger { color: var(--red); border-color: #f0b8b2; }
     .btn.danger:hover, .btn.danger:focus-visible { border-color: var(--red); box-shadow: 0 8px 24px rgba(180, 35, 24, .12); }
@@ -6116,56 +6154,57 @@ HTML = r"""
     .grid.cols-2 { grid-template-columns: repeat(2, minmax(260px, 1fr)); }
     .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px; min-width: 0; }
     .home-card { cursor: pointer; transition: border-color .15s ease, box-shadow .15s ease; }
-    .home-card:hover { border-color: var(--blue); box-shadow: 0 8px 24px rgba(25, 99, 176, .12); }
+    .home-card:hover { border-color: var(--blue); box-shadow: 0 8px 24px var(--shadow-blue); }
     .attention-panel { margin-bottom: 14px; }
     .section-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
     .section-head h2 { margin: 0 0 4px; }
     .attention-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
-    .attention-card { display: grid; grid-template-columns: 1fr auto; gap: 8px 12px; align-items: center; border: 1px solid var(--line); border-radius: 8px; padding: 12px; background: #fbfcfd; cursor: pointer; transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease; }
-    .attention-card:hover { border-color: var(--blue); box-shadow: 0 8px 22px rgba(25, 99, 176, .11); transform: translateY(-1px); }
-    .attention-card.ok { border-color: #cfe3d7; background: #f7fbf8; }
-    .attention-card.warn { border-color: #f0d08b; background: #fffbef; }
-    .attention-card.bad { border-color: #e5aaa5; background: #fff6f5; }
-    .attention-card .label { color: #34495e; font-size: 12px; font-weight: 800; text-transform: uppercase; }
+    .attention-card { display: grid; grid-template-columns: 1fr auto; gap: 8px 12px; align-items: center; border: 1px solid var(--line); border-radius: 8px; padding: 12px; background: var(--soft); cursor: pointer; transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease; }
+    .attention-card:hover { border-color: var(--blue); box-shadow: 0 8px 22px var(--shadow-blue); transform: translateY(-1px); }
+    .attention-card.ok { border-color: rgba(84, 211, 145, .45); background: color-mix(in srgb, var(--green) 9%, var(--panel)); }
+    .attention-card.warn { border-color: rgba(255, 209, 102, .5); background: color-mix(in srgb, var(--gold) 10%, var(--panel)); }
+    .attention-card.bad { border-color: rgba(255, 138, 128, .5); background: color-mix(in srgb, var(--red) 9%, var(--panel)); }
+    .attention-card .label { color: var(--ink); font-size: 12px; font-weight: 800; text-transform: uppercase; }
     .attention-card .count { font-size: 28px; font-weight: 800; line-height: 1; }
     .attention-card.ok .count { color: var(--green); }
     .attention-card.warn .count { color: var(--amber); }
     .attention-card.bad .count { color: var(--red); }
     .attention-card .detail { color: var(--muted); font-size: 13px; }
-    .attention-card .amount { color: #34495e; font-weight: 700; text-align: right; }
+    .attention-card .amount { color: var(--ink); font-weight: 700; text-align: right; }
     .attention-card .open-link { grid-column: 2; color: var(--blue); font-weight: 800; font-size: 13px; text-align: right; }
     .attention-list { grid-column: 1 / -1; display: grid; gap: 6px; margin-top: 4px; }
-    .attention-item { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 8px; padding: 8px; border: 1px solid rgba(0,0,0,.08); border-radius: 8px; background: rgba(255,255,255,.65); }
+    .attention-item { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 8px; padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: color-mix(in srgb, var(--field-bg) 72%, transparent); }
     .attention-item strong { display: block; font-size: 13px; }
     .attention-item span { color: var(--muted); font-size: 12px; }
     .attention-item .btn { padding: 6px 8px; font-size: 12px; }
     .permission-role { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; margin-top: 12px; }
-    .permission-role-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 12px 14px; background: #eef2f6; font-weight: 800; }
+    .permission-role-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 12px 14px; background: var(--table-head); font-weight: 800; }
     .permission-role table { margin: 0; }
     .permission-role td:last-child, .permission-role th:last-child,
     .permission-role td:nth-last-child(2), .permission-role th:nth-last-child(2) { text-align: center; width: 90px; }
     .permission-role input[type="checkbox"] { width: auto; }
     .kpi { min-height: 98px; }
     .help-card { position: relative; overflow: visible; }
-    .help-marker { position: absolute; top: 10px; right: 10px; z-index: 4; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border: 1px solid var(--line); border-radius: 50%; background: #fbfcfd; color: var(--blue); font-size: 13px; font-weight: 800; cursor: help; }
+    .help-marker { position: absolute; top: 10px; right: 10px; z-index: 4; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border: 1px solid var(--line); border-radius: 50%; background: var(--soft); color: var(--blue); font-size: 13px; font-weight: 800; cursor: help; }
     .help-marker:focus { outline: 2px solid rgba(34, 102, 170, .3); outline-offset: 2px; }
     .inline-help-cell { position: relative; display: inline-flex; align-items: center; gap: 8px; padding-right: 30px; }
     .inline-help-cell .help-marker { position: relative; top: auto; right: auto; flex: 0 0 auto; }
-    .help-popover { position: absolute; top: 28px; right: 0; z-index: 30; display: none; width: min(310px, calc(100vw - 52px)); padding: 10px 12px; border: 1px solid #bfd0e0; border-radius: 8px; background: white; color: var(--ink); box-shadow: 0 14px 34px rgba(15, 35, 55, .18); font-size: 13px; font-weight: 500; line-height: 1.38; text-transform: none; }
+    .help-popover { position: absolute; top: 28px; right: 0; z-index: 30; display: none; width: min(310px, calc(100vw - 52px)); padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--ink); box-shadow: 0 14px 34px rgba(0, 0, 0, .32); font-size: 13px; font-weight: 500; line-height: 1.38; text-transform: none; }
     .help-marker:hover .help-popover, .help-marker:focus .help-popover { display: block; }
     .kpi.clickable { cursor: pointer; transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease; }
-    .kpi.clickable:hover, .kpi.clickable:focus { border-color: var(--blue); box-shadow: 0 8px 24px rgba(25, 99, 176, .12); outline: none; transform: translateY(-1px); }
+    .kpi.clickable:hover, .kpi.clickable:focus { border-color: var(--blue); box-shadow: 0 8px 24px var(--shadow-blue); outline: none; transform: translateY(-1px); }
     .kpi .label { color: var(--muted); font-size: 13px; font-weight: 650; text-transform: uppercase; }
     .kpi .value { font-size: 28px; font-weight: 750; margin-top: 10px; }
     .kpi .hint { color: var(--muted); font-size: 13px; margin-top: 6px; }
     h2 { font-size: 18px; margin: 0 0 12px; }
     h3 { font-size: 15px; margin: 16px 0 8px; }
     label { display: block; font-size: 13px; color: var(--muted); font-weight: 650; margin: 10px 0 5px; }
-    input, select, textarea { width: 100%; border: 1px solid var(--line); border-radius: 6px; padding: 9px 10px; font: inherit; background: white; }
+    input, select, textarea { width: 100%; border: 1px solid var(--line); border-radius: 6px; padding: 9px 10px; font: inherit; background: var(--field-bg); color: var(--ink); }
+    input::placeholder, textarea::placeholder { color: color-mix(in srgb, var(--muted) 78%, transparent); }
     textarea { min-height: 76px; }
-    table { width: 100%; border-collapse: collapse; font-size: 14px; background: white; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; background: var(--panel); }
     th, td { padding: 9px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
-    th { color: #34495e; font-size: 12px; text-transform: uppercase; background: #eef2f6; position: sticky; top: 0; }
+    th { color: var(--ink); font-size: 12px; text-transform: uppercase; background: var(--table-head); position: sticky; top: 0; }
     .sort-header { width: 100%; border: 0; background: transparent; color: inherit; cursor: pointer; font: inherit; font-weight: 800; text-align: left; text-transform: uppercase; padding: 0; }
     .sort-header:hover, .sort-header:focus-visible { color: var(--blue); outline: none; }
     .sort-indicator { color: var(--blue); font-size: 11px; margin-left: 4px; }
@@ -6196,12 +6235,12 @@ HTML = r"""
     #bidTable th:nth-child(14), #bidTable td:nth-child(14) { width: 125px; }
     #bidTable th:nth-child(15), #bidTable td:nth-child(15) { width: 190px; }
     #bidTable th:nth-child(16), #bidTable td:nth-child(16) { width: 80px; }
-    #bidTable tr.bid-stale td { background: #fff1f0; }
+    #bidTable tr.bid-stale td { background: color-mix(in srgb, var(--red) 10%, var(--panel)); }
     #bidTable tr.bid-stale td:first-child { box-shadow: inset 4px 0 0 var(--red); }
-    #bidTable tr.bid-stale input, #bidTable tr.bid-stale select { background: #fff8f7; border-color: #f0b8b5; }
-    #bidTable tr.bid-dirty td { background: #fff8e1; }
+    #bidTable tr.bid-stale input, #bidTable tr.bid-stale select { background: color-mix(in srgb, var(--red) 8%, var(--field-bg)); border-color: color-mix(in srgb, var(--red) 50%, var(--line)); }
+    #bidTable tr.bid-dirty td { background: color-mix(in srgb, var(--gold) 13%, var(--panel)); }
     #bidTable tr.bid-dirty td:first-child { box-shadow: inset 4px 0 0 var(--gold); }
-    #bidTable tr.bid-dirty input, #bidTable tr.bid-dirty select { background: #fffdf3; border-color: #d6a700; }
+    #bidTable tr.bid-dirty input, #bidTable tr.bid-dirty select { background: color-mix(in srgb, var(--gold) 10%, var(--field-bg)); border-color: var(--gold); }
     #bidTable tr.bid-dirty [data-save-bid] { background: var(--gold); color: white; border-color: var(--gold); }
     #mccQuoteItemTable { min-width: 1280px; table-layout: fixed; }
     #mccQuoteItemTable th, #mccQuoteItemTable td { vertical-align: middle; }
@@ -6257,7 +6296,7 @@ HTML = r"""
     #closedPoTable input, #closedPoTable select, #closedPoTable textarea,
     #projectPoTable input, #projectPoTable select, #projectPoTable textarea { min-width: 0; padding: 7px 8px; }
     #officePoTable textarea, #closedPoTable textarea, #projectPoTable textarea { min-height: 62px; }
-    .po-invoice-upload { border: 1px dashed #bfd0e0; background: #f8fbff; border-radius: 8px; padding: 8px; }
+    .po-invoice-upload { border: 1px dashed color-mix(in srgb, var(--blue) 45%, var(--line)); background: color-mix(in srgb, var(--blue) 7%, var(--panel)); border-radius: 8px; padding: 8px; }
     #mccVfdPriceTable { min-width: 1320px; table-layout: fixed; }
     #mccVfdPriceTable th, #mccVfdPriceTable td { vertical-align: middle; }
     #mccVfdPriceTable th:nth-child(1), #mccVfdPriceTable td:nth-child(1) { width: 95px; }
@@ -6278,31 +6317,31 @@ HTML = r"""
     .compact-upload { display: grid; gap: 6px; align-content: start; }
     .compact-upload .upload-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
     .compact-upload input[type="file"] { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
-    .compact-upload .file-picker { display: inline-flex; align-items: center; justify-content: center; border: 1px solid var(--line); border-radius: 6px; background: white; padding: 7px 9px; color: var(--ink); cursor: pointer; font-size: 13px; font-weight: 700; }
+    .compact-upload .file-picker { display: inline-flex; align-items: center; justify-content: center; border: 1px solid var(--line); border-radius: 6px; background: var(--field-bg); padding: 7px 9px; color: var(--ink); cursor: pointer; font-size: 13px; font-weight: 700; }
     .compact-upload .file-name { display: block; min-height: 16px; color: var(--muted); font-size: 12px; line-height: 1.25; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     #subprojectEditTable tr.setup-dirty td,
-    #changeOrderEditTable tr.setup-dirty td { background: #fff8e1; }
+    #changeOrderEditTable tr.setup-dirty td { background: color-mix(in srgb, var(--gold) 13%, var(--panel)); }
     #subprojectEditTable tr.setup-dirty td:first-child,
     #changeOrderEditTable tr.setup-dirty td:first-child { box-shadow: inset 4px 0 0 var(--gold); }
     #subprojectEditTable tr.setup-dirty input,
     #subprojectEditTable tr.setup-dirty select,
     #changeOrderEditTable tr.setup-dirty input,
-    #changeOrderEditTable tr.setup-dirty select { background: #fffdf3; border-color: #d6a700; }
+    #changeOrderEditTable tr.setup-dirty select { background: color-mix(in srgb, var(--gold) 10%, var(--field-bg)); border-color: var(--gold); }
     #subprojectEditTable tr.setup-dirty [data-save-sp],
     #changeOrderEditTable tr.setup-dirty [data-save-co] { background: var(--gold); color: white; border-color: var(--gold); }
     .dashboard-split { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; margin-top: 14px; }
     .dashboard-table-wrap { overflow: auto; max-height: 360px; }
     .dashboard-table-wrap table { min-width: 760px; }
     .hierarchy-wrap { display: grid; gap: 10px; }
-    .hierarchy-node { border: 1px solid var(--line); border-radius: 8px; background: #fbfcfd; padding: 12px; }
+    .hierarchy-node { border: 1px solid var(--line); border-radius: 8px; background: var(--soft); padding: 12px; }
     .hierarchy-node.collapsible { cursor: pointer; transition: border-color .15s ease, box-shadow .15s ease; }
-    .hierarchy-node.collapsible:hover, .hierarchy-node.collapsible:focus { border-color: var(--blue); box-shadow: 0 8px 24px rgba(25, 99, 176, .10); outline: none; }
-    .hierarchy-node.master { border-left: 5px solid var(--blue); background: white; }
+    .hierarchy-node.collapsible:hover, .hierarchy-node.collapsible:focus { border-color: var(--blue); box-shadow: 0 8px 24px var(--shadow-blue); outline: none; }
+    .hierarchy-node.master { border-left: 5px solid var(--blue); background: var(--panel); }
     .hierarchy-node.subproject { margin-left: 24px; border-left: 4px solid var(--green); }
     .hierarchy-node.change-order { margin-left: 52px; border-left: 4px solid var(--gold); }
     .hierarchy-node .node-title { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; font-weight: 750; }
     .hierarchy-title-left { display: inline-flex; align-items: center; gap: 8px; min-width: 0; }
-    .hierarchy-toggle { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border: 1px solid var(--line); border-radius: 50%; background: white; color: var(--blue); font-weight: 800; flex: 0 0 auto; }
+    .hierarchy-toggle { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border: 1px solid var(--line); border-radius: 50%; background: var(--field-bg); color: var(--blue); font-weight: 800; flex: 0 0 auto; }
     .hierarchy-children.collapsed { display: none; }
     .hierarchy-node .node-meta { color: var(--muted); font-size: 13px; margin-top: 4px; }
     .hierarchy-node .node-values { display: flex; gap: 14px; flex-wrap: wrap; color: var(--muted); font-size: 13px; margin-top: 8px; }
@@ -6312,8 +6351,8 @@ HTML = r"""
     .bad { color: var(--red); }
     .warn { color: var(--gold); }
     .hidden { display: none; }
-    body.read-only form input, body.read-only form select, body.read-only form textarea { pointer-events: none; background: #f6f8fa; color: #607080; }
-    body.read-only #changePasswordForm input { pointer-events: auto; background: white; color: var(--ink); }
+    body.read-only form input, body.read-only form select, body.read-only form textarea { pointer-events: none; background: var(--soft); color: var(--muted); }
+    body.read-only #changePasswordForm input { pointer-events: auto; background: var(--field-bg); color: var(--ink); }
     body.read-only form .actions,
     body.read-only [data-save],
     body.read-only [data-save-sp],
@@ -6367,7 +6406,7 @@ HTML = r"""
     .field-po-hero { max-width: 760px; margin: 0 auto 14px; }
     .field-po-hero h2 { font-size: 28px; margin-bottom: 4px; }
     .field-po-steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 12px; }
-    .field-po-step { border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: #fbfcfd; font-weight: 750; }
+    .field-po-step { border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: var(--soft); font-weight: 750; }
     .field-po-step span { display: block; color: var(--muted); font-size: 12px; margin-top: 3px; font-weight: 650; }
     .field-po-panel { max-width: 760px; margin: 0 auto; }
     .field-po-panel label { font-size: 15px; color: var(--ink); margin-top: 16px; }
@@ -6377,17 +6416,17 @@ HTML = r"""
     .field-po-panel textarea { min-height: 132px; }
     .field-po-submit { width: 100%; min-height: 58px; font-size: 18px; }
     .field-po-list { display: grid; gap: 12px; }
-    .field-po-card { border: 1px solid var(--line); border-radius: 8px; background: white; padding: 14px; display: grid; gap: 10px; }
+    .field-po-card { border: 1px solid var(--line); border-radius: 8px; background: var(--panel); padding: 14px; display: grid; gap: 10px; }
     .field-po-card-header { display: flex; justify-content: space-between; gap: 10px; align-items: flex-start; }
     .field-po-card-title { font-size: 18px; font-weight: 800; }
     .field-po-card-meta { color: var(--muted); font-size: 13px; margin-top: 3px; }
-    .field-po-status { border-radius: 999px; padding: 5px 9px; font-size: 12px; font-weight: 800; background: #eef2f6; white-space: nowrap; }
-    .field-po-status-pending-approval { background: #fff7e6; color: #8a5a00; }
-    .field-po-status-open, .field-po-status-issued { background: #eef5ff; color: var(--blue); }
-    .field-po-status-picked-up { background: #e8f7ef; color: var(--green); }
-    .field-po-status-closed { background: #e9eef5; color: var(--muted); }
-    .field-po-status-void { background: #fdecea; color: var(--red); }
-    .pickup-upload { border: 1px dashed #9eb4cb; background: #f8fbff; border-radius: 8px; padding: 12px; }
+    .field-po-status { border-radius: 999px; padding: 5px 9px; font-size: 12px; font-weight: 800; background: var(--table-head); white-space: nowrap; }
+    .field-po-status-pending-approval { background: color-mix(in srgb, var(--gold) 18%, var(--panel)); color: var(--gold); }
+    .field-po-status-open, .field-po-status-issued { background: color-mix(in srgb, var(--blue) 14%, var(--panel)); color: var(--blue); }
+    .field-po-status-picked-up { background: color-mix(in srgb, var(--green) 14%, var(--panel)); color: var(--green); }
+    .field-po-status-closed { background: var(--table-head); color: var(--muted); }
+    .field-po-status-void { background: color-mix(in srgb, var(--red) 14%, var(--panel)); color: var(--red); }
+    .pickup-upload { border: 1px dashed color-mix(in srgb, var(--blue) 45%, var(--line)); background: color-mix(in srgb, var(--blue) 7%, var(--panel)); border-radius: 8px; padding: 12px; }
     .pickup-upload input { width: 100%; min-height: 48px; }
     .pickup-upload .btn { width: 100%; min-height: 48px; justify-content: center; margin-top: 8px; }
     .combo-wrap { position: relative; }
@@ -6399,7 +6438,7 @@ HTML = r"""
       right: 0;
       max-height: 260px;
       overflow: auto;
-      background: white;
+      background: var(--panel);
       border: 1px solid var(--line);
       border-radius: 8px;
       box-shadow: 0 14px 30px rgba(15, 23, 42, 0.16);
@@ -6407,30 +6446,30 @@ HTML = r"""
     .combo-option {
       width: 100%;
       border: 0;
-      background: white;
+      background: var(--panel);
       text-align: left;
       padding: 10px 12px;
-      border-bottom: 1px solid #eef2f6;
+      border-bottom: 1px solid var(--line);
       cursor: pointer;
     }
     .combo-option:hover,
-    .combo-option:focus { background: #eef5ff; outline: none; }
+    .combo-option:focus { background: color-mix(in srgb, var(--blue) 12%, var(--panel)); outline: none; }
     .combo-option strong { display: block; color: var(--ink); }
     .combo-option span { display: block; color: var(--muted); font-size: 12px; margin-top: 2px; }
-    .bar { height: 12px; background: #e8edf2; border-radius: 999px; overflow: hidden; }
+    .bar { height: 12px; background: var(--table-head); border-radius: 999px; overflow: hidden; }
     .bar span { display: block; height: 100%; background: var(--blue); }
-    .invoice-summary { background: #fbfcfd; cursor: pointer; }
+    .invoice-summary { background: var(--soft); cursor: pointer; }
     .invoice-summary td { font-weight: 650; }
     .selectable-row { cursor: pointer; }
-    .selectable-row.selected { background: #eef5ff; }
+    .selectable-row.selected { background: color-mix(in srgb, var(--blue) 12%, var(--panel)); }
     .selectable-row.selected td { font-weight: 700; }
     .trend-metric-row { cursor: pointer; transition: background-color .15s ease, box-shadow .15s ease; }
     .trend-metric-row:hover,
-    .trend-metric-row:focus-within { background: #eef5ff; box-shadow: inset 4px 0 0 var(--blue); }
+    .trend-metric-row:focus-within { background: color-mix(in srgb, var(--blue) 12%, var(--panel)); box-shadow: inset 4px 0 0 var(--blue); }
     .trend-metric-row td:first-child::after { content: "View trend"; display: block; margin-top: 2px; color: var(--muted); font-size: 11px; font-weight: 650; }
-    .invoice-detail { background: #ffffff; }
+    .invoice-detail { background: var(--panel); }
     .invoice-detail td:first-child { padding-left: 34px; }
-    .invoice-toggle { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; margin-right: 8px; border: 1px solid var(--line); border-radius: 6px; background: white; color: var(--blue); font-weight: 800; }
+    .invoice-toggle { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; margin-right: 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--field-bg); color: var(--blue); font-weight: 800; }
     .invoice-line-count { color: var(--muted); font-weight: 600; }
     .pdf-link { color: var(--blue); font-weight: 700; text-decoration: none; }
     .pdf-link:hover { text-decoration: underline; }
@@ -6438,40 +6477,40 @@ HTML = r"""
     .cost-filter-bar label { margin-top: 0; }
     .cost-filter-count { color: var(--muted); font-size: 13px; font-weight: 650; margin: 0 0 10px; }
     .filter-summary { display: flex; gap: 10px; flex-wrap: wrap; margin: 0 0 10px; }
-    .filter-summary .summary-pill { border: 1px solid var(--line); background: #fbfcfd; border-radius: 8px; padding: 9px 12px; min-width: 160px; }
+    .filter-summary .summary-pill { border: 1px solid var(--line); background: var(--soft); border-radius: 8px; padding: 9px 12px; min-width: 160px; }
     .filter-summary .summary-label { color: var(--muted); font-size: 11px; font-weight: 750; text-transform: uppercase; letter-spacing: .04em; }
     .filter-summary .summary-value { color: var(--ink); font-size: 18px; font-weight: 800; margin-top: 3px; }
     .filter-summary .summary-value.amount { color: var(--green); }
-    .segmented { display: inline-flex; gap: 0; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: white; }
-    .segmented button { border: 0; border-right: 1px solid var(--line); background: white; padding: 7px 10px; cursor: pointer; font-weight: 650; }
+    .segmented { display: inline-flex; gap: 0; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: var(--field-bg); }
+    .segmented button { border: 0; border-right: 1px solid var(--line); background: var(--field-bg); color: var(--ink); padding: 7px 10px; cursor: pointer; font-weight: 650; }
     .segmented button:last-child { border-right: 0; }
     .segmented button.active { background: var(--blue); color: white; }
     .trend-chart { width: 100%; height: 300px; display: block; }
-    .trend-axis { stroke: #ccd6df; stroke-width: 1; }
+    .trend-axis { stroke: var(--line); stroke-width: 1; }
     .trend-line-revenue { fill: none; stroke: var(--blue); stroke-width: 3; }
     .trend-line-profit { fill: none; stroke: var(--green); stroke-width: 3; }
-    .trend-point { stroke: white; stroke-width: 2; }
+    .trend-point { stroke: var(--panel); stroke-width: 2; }
     .trend-label { fill: var(--muted); font-size: 12px; }
     .trend-legend { display: flex; gap: 14px; flex-wrap: wrap; color: var(--muted); font-size: 13px; font-weight: 650; margin-top: 8px; }
     .trend-swatch { display: inline-block; width: 18px; height: 4px; border-radius: 999px; vertical-align: middle; margin-right: 6px; }
     .project-banner { display: grid; grid-template-columns: 1.4fr repeat(3, minmax(130px, .45fr)); gap: 12px; align-items: stretch; margin-bottom: 14px; }
-    .project-title { background: #ffffff; border: 1px solid var(--line); border-left: 5px solid var(--blue); border-radius: 8px; padding: 14px 16px; }
+    .project-title { background: var(--panel); border: 1px solid var(--line); border-left: 5px solid var(--blue); border-radius: 8px; padding: 14px 16px; }
     .project-title.clickable, .job-chip.clickable { cursor: pointer; transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease; }
-    .project-title.clickable:hover, .project-title.clickable:focus, .job-chip.clickable:hover, .job-chip.clickable:focus { border-color: var(--blue); box-shadow: 0 8px 24px rgba(25, 99, 176, .12); outline: none; transform: translateY(-1px); }
+    .project-title.clickable:hover, .project-title.clickable:focus, .job-chip.clickable:hover, .job-chip.clickable:focus { border-color: var(--blue); box-shadow: 0 8px 24px var(--shadow-blue); outline: none; transform: translateY(-1px); }
     .project-title .eyebrow { color: var(--muted); font-size: 12px; font-weight: 750; text-transform: uppercase; }
     .project-title .name { font-size: 24px; font-weight: 780; margin-top: 4px; }
-    .job-chip { background: #ffffff; border: 1px solid var(--line); border-radius: 8px; padding: 12px; }
+    .job-chip { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; }
     .job-chip .job { font-size: 20px; font-weight: 780; }
     .job-chip .label { color: var(--muted); font-size: 13px; margin-top: 4px; }
     .modal-backdrop { position: fixed; inset: 0; background: rgba(15, 23, 42, .44); display: flex; align-items: center; justify-content: center; z-index: 50; padding: 20px; }
     .modal-backdrop.hidden { display: none; }
-    .modal { background: white; border-radius: 8px; border: 1px solid var(--line); width: min(460px, 100%); padding: 18px; box-shadow: 0 18px 50px rgba(0,0,0,.22); }
+    .modal { background: var(--panel); border-radius: 8px; border: 1px solid var(--line); width: min(460px, 100%); padding: 18px; box-shadow: 0 18px 50px rgba(0,0,0,.32); }
     .modal.large { width: min(1180px, calc(100vw - 40px)); max-height: calc(100vh - 40px); overflow: auto; }
     .modal h2 { margin-bottom: 8px; }
     .modal p { color: var(--muted); margin: 0; line-height: 1.45; }
     .trend-modal-body .trend-chart { height: 560px; }
-    details { border: 1px solid var(--line); border-radius: 8px; margin-top: 14px; overflow: hidden; background: white; }
-    summary { cursor: pointer; font-weight: 750; padding: 12px 14px; background: #eef2f6; }
+    details { border: 1px solid var(--line); border-radius: 8px; margin-top: 14px; overflow: hidden; background: var(--panel); }
+    summary { cursor: pointer; font-weight: 750; padding: 12px 14px; background: var(--table-head); }
     details .detail-body { padding: 12px; }
     @media (max-width: 1250px) {
       .dashboard-split { grid-template-columns: 1fr; }
@@ -6508,6 +6547,7 @@ HTML = r"""
         <button class="system-menu-btn" id="systemMenuButton" type="button" title="System settings">...</button>
         <div class="system-menu hidden" id="systemMenu">
           <button id="systemAccountBtn" type="button">My Account</button>
+          <button id="systemThemeBtn" type="button">Dark Mode</button>
           <button id="systemAdminBtn" type="button" class="hidden">Admin</button>
           <button id="systemRevisionBtn" type="button" class="hidden">Server Health</button>
           <button id="systemLogoutBtn" type="button">Logout</button>
@@ -7032,6 +7072,12 @@ HTML = r"""
         <div class="actions"><button class="btn primary" type="submit">Save Invoice</button></div>
       </form>
       <div class="panel" style="margin-top:14px">
+        <h2>Imported Vendor Invoice Files</h2>
+        <div id="vendorImportHistoryFilters" class="cost-filter" style="margin-bottom:10px"></div>
+        <div class="muted" id="vendorImportHistoryCount" style="margin-bottom:8px"></div>
+        <div class="table-wrap"><table id="vendorImportHistoryTable"></table></div>
+      </div>
+      <div class="panel" style="margin-top:14px">
         <h2>Vendor Invoice Lines</h2>
         <div id="vendorInvoiceLineFilters"></div>
         <div class="table-wrap"><table id="vendorInvoiceLinesTable"></table></div>
@@ -7554,6 +7600,19 @@ HTML = r"""
     const isTmPricing = v => ['T&M', 'T&M NTE'].includes(String(v || 'Fixed'));
     const htmlEscape = v => String(v ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
     const help = text => `<span class="help-marker" tabindex="0" aria-label="${htmlEscape(text)}">?<span class="help-popover">${htmlEscape(text)}</span></span>`;
+    function applyTheme(theme) {
+      const isDark = theme === 'dark';
+      document.body.classList.toggle('dark', isDark);
+      document.querySelector('meta[name="theme-color"]')?.setAttribute('content', isDark ? '#0b121b' : '#152332');
+      const btn = document.getElementById('systemThemeBtn');
+      if (btn) btn.textContent = isDark ? 'Light Mode' : 'Dark Mode';
+    }
+    function toggleTheme() {
+      const nextTheme = document.body.classList.contains('dark') ? 'light' : 'dark';
+      localStorage.setItem('pm-tracker-theme', nextTheme);
+      applyTheme(nextTheme);
+    }
+    applyTheme(localStorage.getItem('pm-tracker-theme') || 'light');
     function tableStorageKey(table) {
       if (table.id) return `column-widths:${table.id}`;
       const section = table.closest('section')?.id || 'page';
@@ -7927,9 +7986,9 @@ HTML = r"""
       if (tabName === 'home') loadHomeAlerts();
       if (tabName === 'dashboard') refreshOpenDetails();
       if (tabName === 'review') loadCosts();
-      if (tabName === 'import') { loadImportHistory(); loadFieldTicketLines(); }
+      if (tabName === 'import') { loadFieldWiseImportHistory(); loadFieldTicketLines(); }
       if (tabName === 'fieldwiseAudit') loadFieldWiseAuditOmissions();
-      if (tabName === 'invoices') { loadVendorInvoiceLines(); loadVendorAllocationHistory(); }
+      if (tabName === 'invoices') { loadVendorImportHistory(); loadVendorInvoiceLines(); loadVendorAllocationHistory(); }
       if (tabName === 'billing') loadCustomerInvoices();
       if (tabName === 'customerDashboard') loadCustomerDashboard();
       if (tabName === 'nteTracking') loadNteTracking();
@@ -7988,6 +8047,10 @@ HTML = r"""
     document.getElementById('systemAccountBtn').onclick = () => {
       document.getElementById('systemMenu').classList.add('hidden');
       openAccountModal(false);
+    };
+    document.getElementById('systemThemeBtn').onclick = () => {
+      toggleTheme();
+      document.getElementById('systemMenu').classList.add('hidden');
     };
     document.getElementById('systemRevisionBtn').onclick = async () => {
       document.getElementById('systemMenu').classList.add('hidden');
@@ -8369,7 +8432,7 @@ HTML = r"""
       recipientsEl.innerHTML = recipients.length ? `<div class="grid cols-2">${recipients.map(user => {
         const isEmail = String(user.username || '').includes('@');
         const label = `${user.display_name || user.username}${user.display_name ? ' / ' + user.username : ''}`;
-        return `<label style="display:flex;align-items:flex-start;gap:8px;border:1px solid var(--line);border-radius:6px;padding:9px;background:white">
+        return `<label style="display:flex;align-items:flex-start;gap:8px;border:1px solid var(--line);border-radius:6px;padding:9px;background:var(--soft)">
           <input type="checkbox" style="width:auto;margin-top:3px" data-texas-reminder-user="${user.id}" ${Number(user.selected || 0) ? 'checked' : ''}>
           <span><strong>${htmlEscape(label)}</strong>${isEmail ? '' : '<div class="muted">Username is not an email address, so email cannot be sent to this user.</div>'}</span>
         </label>`;
@@ -8405,7 +8468,7 @@ HTML = r"""
       document.getElementById('billingReminderRecipients').innerHTML = recipients.length ? `<div class="grid cols-2">${recipients.map(user => {
         const isEmail = String(user.username || '').includes('@');
         const label = `${user.display_name || user.username}${user.display_name ? ' / ' + user.username : ''}`;
-        return `<label style="display:flex;align-items:flex-start;gap:8px;border:1px solid var(--line);border-radius:6px;padding:9px;background:white">
+        return `<label style="display:flex;align-items:flex-start;gap:8px;border:1px solid var(--line);border-radius:6px;padding:9px;background:var(--soft)">
           <input type="checkbox" style="width:auto;margin-top:3px" data-billing-reminder-user="${user.id}" ${Number(user.selected || 0) ? 'checked' : ''}>
           <span><strong>${htmlEscape(label)}</strong>${isEmail ? '' : '<div class="muted">Username is not an email address, so email cannot be sent to this user.</div>'}</span>
         </label>`;
@@ -8446,7 +8509,7 @@ HTML = r"""
       document.getElementById('poReminderRecipients').innerHTML = recipients.length ? `<div class="grid cols-2">${recipients.map(user => {
         const isEmail = String(user.username || '').includes('@');
         const label = `${user.display_name || user.username}${user.display_name ? ' / ' + user.username : ''}`;
-        return `<label style="display:flex;align-items:flex-start;gap:8px;border:1px solid var(--line);border-radius:6px;padding:9px;background:white">
+        return `<label style="display:flex;align-items:flex-start;gap:8px;border:1px solid var(--line);border-radius:6px;padding:9px;background:var(--soft)">
           <input type="checkbox" style="width:auto;margin-top:3px" data-po-reminder-user="${user.id}" ${Number(user.selected || 0) ? 'checked' : ''}>
           <span><strong>${htmlEscape(label)}</strong>${isEmail ? '' : '<div class="muted">Username is not an email address, so email cannot be sent to this user.</div>'}</span>
         </label>`;
@@ -9172,7 +9235,8 @@ HTML = r"""
       loadChangeOrderEditor();
       loadCogCategoryEditor();
       loadInternalRateEditor();
-      loadImportHistory();
+      loadFieldWiseImportHistory();
+      loadVendorImportHistory();
       loadFieldTicketLines();
       loadVendorInvoiceLines();
       loadVendorAllocationHistory();
@@ -10803,21 +10867,27 @@ HTML = r"""
       draw();
     }
 
-    async function loadImportHistory() {
-      const tableEl = document.getElementById('importHistoryTable');
-      const filterEl = document.getElementById('importHistoryFilters');
-      const countEl = document.getElementById('importHistoryCount');
+    async function loadImportHistory(config={}) {
+      const allowedSources = config.allowedSources || ['Field Wise', 'Field Wise PDF'];
+      const tableEl = document.getElementById(config.tableId || 'importHistoryTable');
+      const filterEl = document.getElementById(config.filterId || 'importHistoryFilters');
+      const countEl = document.getElementById(config.countId || 'importHistoryCount');
       if (!tableEl || !state.projectId) return;
-      const imports = await api(`/api/imports?project_id=${state.projectId}`);
+      const allImports = await api(`/api/imports?project_id=${state.projectId}`);
+      const imports = allImports.filter(row => allowedSources.includes(row.source || ''));
       const sources = [...new Set(imports.map(row => row.source || '').filter(Boolean))].sort();
+      const idPrefix = config.idPrefix || 'importHistory';
+      const searchId = `${idPrefix}Search`;
+      const sourceId = `${idPrefix}Source`;
+      const clearId = `${idPrefix}Clear`;
       if (filterEl) {
         filterEl.innerHTML = `
-          <div><label>Search imports</label><input id="importHistorySearch" placeholder="Search file, source, date, amount, records"></div>
-          <div><label>Source</label><select id="importHistorySource"><option value="">All sources</option>${sources.map(source => `<option>${htmlEscape(source)}</option>`).join('')}</select></div>
-          <div style="align-self:end"><button class="btn" id="clearImportHistoryFilters" type="button">Clear</button></div>`;
+          <div><label>Search imports</label><input id="${searchId}" placeholder="Search file, source, date, amount, records"></div>
+          <div><label>Source</label><select id="${sourceId}"><option value="">All ${config.sourceLabel || 'sources'}</option>${sources.map(source => `<option>${htmlEscape(source)}</option>`).join('')}</select></div>
+          <div style="align-self:end"><button class="btn" id="${clearId}" type="button">Clear</button></div>`;
       }
-      const searchEl = document.getElementById('importHistorySearch');
-      const sourceEl = document.getElementById('importHistorySource');
+      const searchEl = document.getElementById(searchId);
+      const sourceEl = document.getElementById(sourceId);
       const draw = () => {
         const query = String(searchEl?.value || '').trim().toLowerCase();
         const sourceFilter = String(sourceEl?.value || '');
@@ -10853,18 +10923,49 @@ HTML = r"""
             method: 'POST',
             body: JSON.stringify({ project_id: state.projectId, source_file: file, source })
           });
-          await refresh();
+          if (config.onDelete === 'vendor') {
+            await loadVendorImportHistory();
+            await loadVendorInvoiceLines();
+            await loadVendorAllocationHistory();
+          } else {
+            await loadFieldWiseImportHistory();
+            await loadFieldTicketLines();
+          }
         });
       };
       if (searchEl) searchEl.oninput = draw;
       if (sourceEl) sourceEl.onchange = draw;
-      const clearBtn = document.getElementById('clearImportHistoryFilters');
+      const clearBtn = document.getElementById(clearId);
       if (clearBtn) clearBtn.onclick = () => {
         if (searchEl) searchEl.value = '';
         if (sourceEl) sourceEl.value = '';
         draw();
       };
       draw();
+    }
+
+    function loadFieldWiseImportHistory() {
+      return loadImportHistory({
+        tableId: 'importHistoryTable',
+        filterId: 'importHistoryFilters',
+        countId: 'importHistoryCount',
+        idPrefix: 'fieldWiseImportHistory',
+        allowedSources: ['Field Wise', 'Field Wise PDF'],
+        sourceLabel: 'Field Wise sources',
+        onDelete: 'fieldwise'
+      });
+    }
+
+    function loadVendorImportHistory() {
+      return loadImportHistory({
+        tableId: 'vendorImportHistoryTable',
+        filterId: 'vendorImportHistoryFilters',
+        countId: 'vendorImportHistoryCount',
+        idPrefix: 'vendorImportHistory',
+        allowedSources: ['Vendor Invoice'],
+        sourceLabel: 'vendor invoice sources',
+        onDelete: 'vendor'
+      });
     }
 
     async function loadVendorInvoiceLines() {
@@ -12644,7 +12745,7 @@ HTML = r"""
       fileInput.value = '';
       markSaved();
       await refresh();
-      await loadImportHistory();
+      await loadFieldWiseImportHistory();
       await loadFieldTicketLines();
     };
     document.getElementById('fieldWiseAuditForm').onsubmit = async e => {
