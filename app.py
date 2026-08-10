@@ -5011,6 +5011,42 @@ def import_vendor_invoice_pdf(path, project_id):
                         current["description"] += " " + line
                 if current:
                     item_lines.append(current)
+    elif "endress+hauser" in lower or "endress + hauser" in lower or ("endress" in lower and "hauser" in lower):
+        vendor = "Endress+Hauser"
+        invoice_number = first_regex([r"Number\s*:\s*([A-Za-z0-9\-]+)", r"Invoice\s+No\.?\s*([A-Za-z0-9\-]+)"], text, flags=re.IGNORECASE)
+        invoice_date = date_text(first_regex([r"Billing\s+Date\s*:\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4})", r"Date\s*:\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4})"], text, flags=re.IGNORECASE))
+        order_number = first_regex([r"Your\s+PO\s*:\s*([A-Za-z0-9\-]+)", r"Customer\s+PO\s*:\s*([A-Za-z0-9\-]+)"], text, flags=re.IGNORECASE)
+        total_due = parse_money_text(first_regex([r"Total\s+Invoice\s+Amount\s+\$?\s*([0-9,]+\.[0-9]{2})", r"Total\s+Amount\s+\$?\s*([0-9,]+\.[0-9]{2})"], text, flags=re.IGNORECASE))
+        item_lines = []
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        for i, line in enumerate(lines):
+            match = re.match(
+                r"^([0-9]+)\s+([0-9.]+)\s+([A-Za-z]+)\s+([A-Za-z0-9/+\-]+)\s+([0-9,]+\.[0-9]{2})\s+([0-9,]+\.[0-9]{2})$",
+                line,
+            )
+            if not match:
+                continue
+            item_no, qty, unit, order_code, unit_price, extension = match.groups()
+            description_parts = []
+            for follow in lines[i + 1:i + 10]:
+                if re.search(r"^(Serial number|Commodity Code|Country of origin|US:|Order:|Total prices|Logistic Service|Supply Chain|Total Amount)\b", follow, flags=re.IGNORECASE):
+                    break
+                description_parts.append(follow)
+            description = " ".join(description_parts).strip() or order_code
+            item_lines.append({
+                "product_code": order_code,
+                "description": f"{order_code} {description}".strip(),
+                "qty": qty,
+                "unit_price": unit_price,
+                "amount": extension,
+            })
+
+        logistic_service = parse_money_text(first_regex([r"Logistic\s+Service\s+([0-9,]+\.[0-9]{2})"], text, flags=re.IGNORECASE))
+        supply_chain_surcharge = parse_money_text(first_regex([r"Supply\s+Chain\s+Sur\.?\s+([0-9,]+\.[0-9]{2})"], text, flags=re.IGNORECASE))
+        if logistic_service:
+            item_lines.append({"product_code": "Logistic Service", "description": "Logistic service", "qty": 1, "unit_price": logistic_service, "amount": logistic_service})
+        if supply_chain_surcharge:
+            item_lines.append({"product_code": "Supply Chain Surcharge", "description": "Supply chain surcharge", "qty": 1, "unit_price": supply_chain_surcharge, "amount": supply_chain_surcharge})
     elif "vega americas" in lower:
         vendor = "VEGA Americas"
         invoice_number = first_regex([r"Invoice\s+No\.\s*([A-Za-z0-9\-]+)"], text, flags=re.IGNORECASE)
@@ -5442,6 +5478,8 @@ def extract_vendor_invoice_total(path):
         r"INVOICETOTAL\s*\n\s*\$?([0-9,]+\.[0-9]{2})",
         r"Net Invoice Amount\s+\$\s*([0-9,]+\.[0-9]{2})",
         r"BALANCE\s+DUE\s+\$?([0-9,]+\.[0-9]{2})",
+        r"Total\s+Invoice\s+Amount\s+\$?\s*([0-9,]+\.[0-9]{2})",
+        r"Total\s+Amount\s+\$?\s*([0-9,]+\.[0-9]{2})",
         r"(?:Total|Amount Due)\s*:?\s*\$?\s*([0-9,]+\.[0-9]{2})",
         r"Total\s*\n?\s*\$?([0-9,]+\.[0-9]{2})",
     ]
@@ -6366,6 +6404,7 @@ HTML = r"""
     body.read-only [data-toggle-user],
     body.read-only [data-save-invoice-subproject],
     body.read-only [data-save-customer-invoice],
+    body.read-only [data-delete-customer-invoice],
     body.read-only [data-allocate-invoice],
     body.read-only [data-delete-financial-report],
     body.read-only [data-omit-fieldwise],
@@ -11090,6 +11129,7 @@ HTML = r"""
             <td>
               <button class="btn" data-edit-customer-allocation="${i.id}" type="button">Edit Allocation</button>
               <button class="btn" data-save-customer-invoice="${i.id}" type="button">Save</button>
+              <button class="btn danger" data-delete-customer-invoice="${i.id}" data-invoice-number="${htmlEscape(i.invoice_number || '')}" type="button">Delete</button>
             </td>
           </tr>`;
         }).join('')}</tbody>`;
@@ -11104,6 +11144,14 @@ HTML = r"""
         const fields = {};
         tableEl.querySelectorAll(`[data-cinv="${id}"]`).forEach(el => fields[el.dataset.field] = el.value);
         await api(`/api/customer-invoices/${id}`, { method:'PUT', body: JSON.stringify(fields) });
+        markSaved();
+        await refresh();
+      });
+      tableEl.querySelectorAll('[data-delete-customer-invoice]').forEach(btn => btn.onclick = async () => {
+        const id = btn.dataset.deleteCustomerInvoice;
+        const label = btn.dataset.invoiceNumber || `invoice ${id}`;
+        if (!window.confirm(`Delete customer invoice ${label}?\n\nThis will remove the invoice and its allocation history from this tracker.`)) return;
+        await api(`/api/customer-invoices/${id}`, { method:'DELETE' });
         markSaved();
         await refresh();
       });
@@ -16218,6 +16266,34 @@ class Handler(BaseHTTPRequestHandler):
                     return json_response(self, {"error": "PO invoice not found."}, 404)
                 log_activity(actor, "removed PO vendor invoice", "Purchase Order", po["po_number"] if po else invoice["po_id"], {"invoice_file": invoice["invoice_file"], "invoice_amount": invoice["invoice_amount"]})
                 return json_response(self, {"ok": True})
+            if parsed.path.startswith("/api/customer-invoices/"):
+                actor = current_user(self)
+                if not can_edit_permission(actor, "customer_billing"):
+                    return json_response(self, {"error": "Customer Billing edit access required."}, 403)
+                invoice_id = parsed.path.rsplit("/", 1)[-1]
+                with db() as con:
+                    invoice = con.execute("SELECT * FROM customer_invoices WHERE id = ?", (invoice_id,)).fetchone()
+                    if not invoice:
+                        return json_response(self, {"error": "Customer invoice not found."}, 404)
+                    allocation_count = con.execute(
+                        "SELECT COUNT(*) AS c FROM customer_invoice_allocations WHERE customer_invoice_id = ?",
+                        (invoice_id,),
+                    ).fetchone()["c"]
+                    con.execute("DELETE FROM customer_invoice_allocations WHERE customer_invoice_id = ?", (invoice_id,))
+                    deleted = con.execute("DELETE FROM customer_invoices WHERE id = ?", (invoice_id,)).rowcount
+                log_activity(
+                    actor,
+                    "deleted customer invoice",
+                    "Customer Billing",
+                    invoice["invoice_number"] or invoice_id,
+                    {
+                        "project_id": invoice["project_id"],
+                        "amount": invoice["amount"],
+                        "paid_amount": invoice["paid_amount"],
+                        "allocations_deleted": allocation_count,
+                    },
+                )
+                return json_response(self, {"ok": True, "deleted": deleted})
             if parsed.path.startswith("/api/nte-coding-rules/"):
                 actor = current_user(self)
                 if not can_edit_permission(actor, "nte_tracking"):
