@@ -984,13 +984,37 @@ def nte_weekly_report_pdf_bytes(project_id):
     story.append(Paragraph(f"{html_escape(project['project_code'])} / {html_escape(project['name'])} / {html_escape(project['customer'])}", styles["Muted"]))
     story.append(Paragraph(f"Generated {datetime.now().strftime('%Y-%m-%d %H:%M')} from current tracker data", styles["Muted"]))
     story.append(Spacer(1, 0.14 * inch))
+    summary_header_style = ParagraphStyle(name="SummaryHeader", parent=styles["Small"], fontName="Helvetica-Bold", textColor=colors.HexColor("#31445a"), fontSize=7.2, leading=8.6)
+    summary_value_style = ParagraphStyle(name="SummaryValue", parent=styles["Small"], fontName="Helvetica-Bold", fontSize=7.4, leading=9)
+    summary_note_style = ParagraphStyle(name="SummaryNote", parent=styles["Small"], fontSize=6.8, leading=8.2, textColor=colors.HexColor("#5c6d80"))
     summary_table = Table(
         [
-            ["Current Budget", "Used", "Remaining", "Estimated Cost to Completion", "Avg Field Completion", "Labor Hours"],
-            [dollars(total_budget), dollars(total_used), dollars(total_remaining), dollars(total_estimated_at_completion) if projected_buckets else "Needs field %", f"{avg_completion:.1f}%", f"{total_labor_used:,.2f} / {total_labor_budget:,.2f}"],
-            ["", "", "", f"{dollars(total_estimated_variance)} projected variance" if projected_buckets else "", "Average of main buckets", f"{total_unproductive:,.2f} unproductive hrs flagged"],
+            [
+                Paragraph("Current Budget", summary_header_style),
+                Paragraph("Used", summary_header_style),
+                Paragraph("Remaining", summary_header_style),
+                Paragraph("Estimated Cost to Completion", summary_header_style),
+                Paragraph("Avg Field Completion", summary_header_style),
+                Paragraph("Labor Hours", summary_header_style),
+            ],
+            [
+                Paragraph(dollars(total_budget), summary_value_style),
+                Paragraph(dollars(total_used), summary_value_style),
+                Paragraph(dollars(total_remaining), summary_value_style),
+                Paragraph(dollars(total_estimated_at_completion) if projected_buckets else "Needs field %", summary_value_style),
+                Paragraph(f"{avg_completion:.1f}%", summary_value_style),
+                Paragraph(f"{total_labor_used:,.2f} / {total_labor_budget:,.2f}", summary_value_style),
+            ],
+            [
+                "",
+                "",
+                "",
+                Paragraph(f"{dollars(total_estimated_variance)} projected variance" if projected_buckets else "", summary_note_style),
+                Paragraph("Average of main buckets", summary_note_style),
+                Paragraph(f"{total_unproductive:,.2f} unproductive hrs flagged", summary_note_style),
+            ],
         ],
-        colWidths=[1.05 * inch, 0.95 * inch, 0.95 * inch, 1.25 * inch, 1.08 * inch, 1.35 * inch],
+        colWidths=[0.92 * inch, 0.78 * inch, 0.86 * inch, 1.52 * inch, 1.06 * inch, 1.36 * inch],
     )
     summary_table.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#eaf0f5")),
