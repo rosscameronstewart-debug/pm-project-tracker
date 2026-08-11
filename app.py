@@ -435,6 +435,164 @@ def purchase_order_html(po):
 </html>"""
 
 
+def nte_snapshot_date():
+    return datetime.now().date().isoformat()
+
+
+def nte_snapshot_rows(data):
+    buckets = data.get("buckets", [])
+    projected_buckets = [b for b in buckets if money((b.get("completion") or {}).get("completion_percent")) > 0]
+    rows = []
+    if projected_buckets:
+        rows.append({
+            "metric_key": "estimated_cost_to_completion_total",
+            "metric_label": "Total Estimated Cost to Completion",
+            "bucket_id": None,
+            "subbucket_id": None,
+            "value": sum(money(b.get("estimated_cost_at_completion")) for b in projected_buckets),
+            "notes": "Total of buckets with field completion entered",
+        })
+    for bucket in projected_buckets:
+        rows.append({
+            "metric_key": "estimated_cost_to_completion_bucket",
+            "metric_label": f"{bucket.get('name')} Estimated Cost to Completion",
+            "bucket_id": bucket.get("id"),
+            "subbucket_id": None,
+            "value": money(bucket.get("estimated_cost_at_completion")),
+            "notes": bucket.get("estimated_completion_status") or "",
+        })
+        for sub in bucket.get("subbuckets", []):
+            rows.append({
+                "metric_key": "estimated_cost_to_completion_subbucket",
+                "metric_label": f"{bucket.get('name')} / {sub.get('name')} Estimated Cost to Completion",
+                "bucket_id": bucket.get("id"),
+                "subbucket_id": sub.get("id"),
+                "value": money(sub.get("estimated_cost_at_completion")),
+                "notes": sub.get("estimated_completion_status") or "",
+            })
+    return rows
+
+
+def save_nte_weekly_kpi_snapshot(project_id, data, snapshot_date=None):
+    snapshot_date = snapshot_date or nte_snapshot_date()
+    now = datetime.now().isoformat(timespec="seconds")
+    rows = nte_snapshot_rows(data)
+    if not rows:
+        return []
+    with db() as con:
+        for row in rows:
+            existing = con.execute(
+                """
+                SELECT id
+                FROM nte_weekly_kpi_snapshots
+                WHERE project_id = ?
+                  AND snapshot_date = ?
+                  AND metric_key = ?
+                  AND COALESCE(bucket_id, 0) = COALESCE(?, 0)
+                  AND COALESCE(subbucket_id, 0) = COALESCE(?, 0)
+                """,
+                (project_id, snapshot_date, row["metric_key"], row.get("bucket_id"), row.get("subbucket_id")),
+            ).fetchone()
+            if existing:
+                con.execute(
+                    """
+                    UPDATE nte_weekly_kpi_snapshots
+                    SET metric_label = ?, value = ?, notes = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (row["metric_label"], row["value"], row.get("notes") or "", now, existing["id"]),
+                )
+            else:
+                con.execute(
+                    """
+                    INSERT INTO nte_weekly_kpi_snapshots (
+                      project_id, snapshot_date, metric_key, metric_label,
+                      bucket_id, subbucket_id, value, notes, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        project_id,
+                        snapshot_date,
+                        row["metric_key"],
+                        row["metric_label"],
+                        row.get("bucket_id"),
+                        row.get("subbucket_id"),
+                        row["value"],
+                        row.get("notes") or "",
+                        now,
+                    ),
+                )
+    return rows
+
+
+def nte_kpi_history(project_id, metric_key="estimated_cost_to_completion_total", limit=14):
+    with db() as con:
+        rows = [dict(r) for r in con.execute(
+            """
+            SELECT snapshot_date, metric_label, value, notes
+            FROM nte_weekly_kpi_snapshots
+            WHERE project_id = ?
+              AND metric_key = ?
+              AND bucket_id IS NULL
+              AND subbucket_id IS NULL
+            ORDER BY snapshot_date DESC
+            LIMIT ?
+            """,
+            (project_id, metric_key, limit),
+        ).fetchall()]
+    return list(reversed(rows))
+
+
+def nte_kpi_trend_svg(points):
+    if not points:
+        return '<p class="muted">The trend will start after the first report is generated with field completion entered.</p>'
+    width, height = 900, 270
+    left, right, top, bottom = 76, 24, 22, 52
+    chart_w = width - left - right
+    chart_h = height - top - bottom
+    values = [money(p.get("value")) for p in points]
+    min_v = min(values)
+    max_v = max(values)
+    if min_v == max_v:
+        pad = max(max_v * 0.1, 1)
+        min_v -= pad
+        max_v += pad
+    else:
+        pad = (max_v - min_v) * 0.12
+        min_v -= pad
+        max_v += pad
+    def x_pos(i):
+        return left + (chart_w * i / max(1, len(points) - 1))
+    def y_pos(value):
+        return top + chart_h - ((money(value) - min_v) / (max_v - min_v) * chart_h)
+    coords = [(x_pos(i), y_pos(p.get("value"))) for i, p in enumerate(points)]
+    line = " ".join(f"{x:.1f},{y:.1f}" for x, y in coords)
+    y_ticks = [min_v + (max_v - min_v) * i / 4 for i in range(5)]
+    grid = []
+    for tick in y_ticks:
+        y = y_pos(tick)
+        grid.append(f'<line x1="{left}" y1="{y:.1f}" x2="{width-right}" y2="{y:.1f}" class="chart-grid" />')
+        grid.append(f'<text x="{left-8}" y="{y+4:.1f}" text-anchor="end" class="chart-label">${tick:,.0f}</text>')
+    dots = []
+    labels = []
+    for i, point in enumerate(points):
+        x, y = coords[i]
+        dots.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="5" class="chart-dot"><title>{html_escape(point.get("snapshot_date"))}: ${money(point.get("value")):,.2f}</title></circle>')
+        labels.append(f'<text x="{x:.1f}" y="{height-24}" text-anchor="middle" class="chart-label">{html_escape(str(point.get("snapshot_date"))[5:])}</text>')
+    return f"""
+      <svg class="trend-chart" viewBox="0 0 {width} {height}" role="img" aria-label="Estimated Cost to Completion week over week trend">
+        <rect x="0" y="0" width="{width}" height="{height}" class="chart-bg"></rect>
+        {''.join(grid)}
+        <line x1="{left}" y1="{top}" x2="{left}" y2="{height-bottom}" class="chart-axis" />
+        <line x1="{left}" y1="{height-bottom}" x2="{width-right}" y2="{height-bottom}" class="chart-axis" />
+        <polyline points="{line}" class="chart-line" />
+        {''.join(dots)}
+        {''.join(labels)}
+      </svg>
+    """
+
+
 def nte_weekly_report_html(project_id):
     project = one("SELECT * FROM projects WHERE id = ?", (project_id,))
     if not project:
@@ -442,6 +600,9 @@ def nte_weekly_report_html(project_id):
     data = nte_summary(project_id, all_targets=True)
     buckets = data.get("buckets", [])
     additions = data.get("additions", [])
+    panel_deliverables = data.get("panel_deliverables", [])
+    save_nte_weekly_kpi_snapshot(project_id, data)
+    kpi_history = nte_kpi_history(project_id)
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
     total_budget = sum(money(b.get("current_budget")) for b in buckets)
     total_used = sum(money(b.get("actual_cost")) for b in buckets)
@@ -566,6 +727,67 @@ def nte_weekly_report_html(project_id):
         </table>
       </section>
     """
+    panel_rows = []
+    for panel in panel_deliverables:
+        panel_rows.append(
+            f"""
+            <tr>
+              <td><strong>{html_escape(panel.get("bucket_name") or "Unassigned")}</strong></td>
+              <td><strong>{html_escape(panel.get("name"))}</strong><div class="muted">{html_escape(panel.get("notes") or "")}</div></td>
+              <td>{money(panel.get("completed_panels")):,.0f} / {money(panel.get("total_panels")):,.0f}</td>
+              <td>{money(panel.get("remaining_panels")):,.0f}</td>
+              <td>{usage_bar(panel.get("completed_panels"), panel.get("total_panels"))}</td>
+            </tr>
+            """
+        )
+    panels_section = f"""
+      <section class="bucket">
+        <div class="bucket-head">
+          <div>
+            <h2>Panel Deliverables</h2>
+            <p>Non-dollar deliverables tracked by completed panel count. These do not affect NTE budget or cost totals.</p>
+          </div>
+          <div>
+            <div class="label">Panel Completion</div>
+            <div class="value">{(sum(money(p.get("completed_panels")) for p in panel_deliverables) / sum(money(p.get("total_panels")) for p in panel_deliverables) * 100) if sum(money(p.get("total_panels")) for p in panel_deliverables) else 0:.1f}%</div>
+          </div>
+        </div>
+        <table>
+          <thead><tr><th>Main Bucket</th><th>Deliverable</th><th>Completed / Total</th><th>Remaining</th><th>Completion</th></tr></thead>
+          <tbody>{''.join(panel_rows) or '<tr><td colspan="5">No panel deliverables are being tracked for this report.</td></tr>'}</tbody>
+        </table>
+      </section>
+    """
+    trend_rows = []
+    for point in kpi_history:
+        trend_rows.append(
+            f"""
+            <tr>
+              <td>{html_escape(point.get("snapshot_date"))}</td>
+              <td>{dollars(point.get("value"))}</td>
+              <td>{html_escape(point.get("notes") or "")}</td>
+            </tr>
+            """
+        )
+    trend_section = f"""
+      <section class="bucket">
+        <div class="bucket-head">
+          <div>
+            <h2>Estimated Cost to Completion Trend</h2>
+            <p>Week-over-week KPI snapshot saved each time this report is generated.</p>
+          </div>
+          <div>
+            <div class="label">Latest Snapshot</div>
+            <div class="value">{dollars(kpi_history[-1].get("value")) if kpi_history else "Needs field %"}</div>
+          </div>
+        </div>
+        <div class="trend-wrap">{nte_kpi_trend_svg(kpi_history)}</div>
+        <table>
+          <thead><tr><th>Snapshot Date</th><th>Estimated Cost to Completion</th><th>Notes</th></tr></thead>
+          <tbody>{''.join(trend_rows) or '<tr><td colspan="3">No KPI snapshots have been saved yet.</td></tr>'}</tbody>
+        </table>
+      </section>
+    """
 
     return f"""<!doctype html>
 <html lang="en">
@@ -603,6 +825,14 @@ def nte_weekly_report_html(project_id):
     .bar {{ height:12px; background:#e1e8ef; border-radius:999px; overflow:hidden; min-width:120px; }}
     .bar span {{ display:block; height:100%; background:linear-gradient(90deg, var(--blue), var(--green)); border-radius:999px; }}
     .bar-label {{ color:var(--muted); font-size:12px; font-weight:700; margin-top:4px; }}
+    .trend-wrap {{ padding:16px; }}
+    .trend-chart {{ width:100%; height:auto; display:block; }}
+    .chart-bg {{ fill:#f7fafc; }}
+    .chart-grid {{ stroke:#d7e0e8; stroke-width:1; }}
+    .chart-axis {{ stroke:#8da0b4; stroke-width:1.5; }}
+    .chart-line {{ fill:none; stroke:var(--blue); stroke-width:4; stroke-linecap:round; stroke-linejoin:round; }}
+    .chart-dot {{ fill:var(--green); stroke:white; stroke-width:2; }}
+    .chart-label {{ fill:#5c6d80; font-size:13px; font-weight:700; }}
     @media print {{ body {{ background:white; }} main {{ padding:0; max-width:none; }} .actions {{ display:none; }} .report {{ border:0; border-radius:0; }} .report-logo {{ width:130px; }} }}
     @media (max-width:920px) {{ .header, .bucket-head {{ grid-template-columns:1fr; }} .brand-title {{ align-items:flex-start; }} .report-logo {{ width:120px; }} .summary {{ grid-template-columns:1fr 1fr; }} }}
   </style>
@@ -630,7 +860,9 @@ def nte_weekly_report_html(project_id):
         <div class="kpi"><div class="label">Labor Hours</div><div class="value">{total_labor_used:,.2f} / {total_labor_budget:,.2f}</div><div class="muted">{total_unproductive:,.2f} unproductive hrs flagged</div></div>
       </div>
       {''.join(bucket_sections) or '<p>No T&M NTE buckets are set up for this project yet.</p>'}
+      {panels_section}
       {additions_section}
+      {trend_section}
     </div>
   </main>
 </body>
@@ -643,6 +875,7 @@ def nte_weekly_report_pdf_bytes(project_id):
         from reportlab.lib.pagesizes import letter
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
         from reportlab.lib.units import inch
+        from reportlab.graphics.shapes import Circle, Drawing, Line, PolyLine, String
         from reportlab.platypus import Image, SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
     except Exception as exc:
         raise RuntimeError("PDF export needs reportlab installed. Run pip install -r requirements.txt.") from exc
@@ -653,6 +886,9 @@ def nte_weekly_report_pdf_bytes(project_id):
     data = nte_summary(project_id, all_targets=True)
     buckets = data.get("buckets", [])
     additions = data.get("additions", [])
+    panel_deliverables = data.get("panel_deliverables", [])
+    save_nte_weekly_kpi_snapshot(project_id, data)
+    kpi_history = nte_kpi_history(project_id)
     buffer = BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=0.45 * inch, leftMargin=0.45 * inch, topMargin=0.45 * inch, bottomMargin=0.45 * inch)
     styles = getSampleStyleSheet()
@@ -668,6 +904,58 @@ def nte_weekly_report_pdf_bytes(project_id):
         if budget <= 0:
             return "0% used"
         return f"{max(0, min(100, (money(used) / budget) * 100)):.1f}% used"
+
+    def kpi_trend_drawing(points):
+        drawing_width = 510
+        drawing_height = 170
+        left = 58
+        right = 16
+        top = 18
+        bottom = 34
+        chart_w = drawing_width - left - right
+        chart_h = drawing_height - top - bottom
+        drawing = Drawing(drawing_width, drawing_height)
+        if not points:
+            drawing.add(String(12, 86, "The trend will start after the first report is generated with field completion entered.", fontSize=8, fillColor=colors.HexColor("#5c6d80")))
+            return drawing
+        values = [money(p.get("value")) for p in points]
+        min_v = min(values)
+        max_v = max(values)
+        if min_v == max_v:
+            pad = max(max_v * 0.1, 1)
+            min_v -= pad
+            max_v += pad
+        else:
+            pad = (max_v - min_v) * 0.12
+            min_v -= pad
+            max_v += pad
+
+        def x_pos(i):
+            return left + (chart_w * i / max(1, len(points) - 1))
+
+        def y_pos(value):
+            return bottom + ((money(value) - min_v) / (max_v - min_v) * chart_h)
+
+        for i in range(5):
+            tick = min_v + (max_v - min_v) * i / 4
+            y = y_pos(tick)
+            drawing.add(Line(left, y, drawing_width - right, y, strokeColor=colors.HexColor("#d7e0e8"), strokeWidth=0.5))
+            drawing.add(String(4, y - 3, f"${tick:,.0f}", fontSize=7, fillColor=colors.HexColor("#5c6d80")))
+        drawing.add(Line(left, bottom, left, drawing_height - top, strokeColor=colors.HexColor("#8da0b4"), strokeWidth=1))
+        drawing.add(Line(left, bottom, drawing_width - right, bottom, strokeColor=colors.HexColor("#8da0b4"), strokeWidth=1))
+        flat_points = []
+        for i, point in enumerate(points):
+            x = x_pos(i)
+            y = y_pos(point.get("value"))
+            flat_points.extend([x, y])
+        if len(flat_points) >= 4:
+            drawing.add(PolyLine(flat_points, strokeColor=colors.HexColor("#2266aa"), strokeWidth=2.2))
+        for i, point in enumerate(points):
+            x = x_pos(i)
+            y = y_pos(point.get("value"))
+            drawing.add(Circle(x, y, 3.3, fillColor=colors.HexColor("#16845b"), strokeColor=colors.white, strokeWidth=1))
+            drawing.add(String(x - 13, 10, str(point.get("snapshot_date"))[5:], fontSize=7, fillColor=colors.HexColor("#5c6d80")))
+        return drawing
 
     total_budget = sum(money(b.get("current_budget")) for b in buckets)
     total_used = sum(money(b.get("actual_cost")) for b in buckets)
@@ -762,6 +1050,32 @@ def nte_weekly_report_pdf_bytes(project_id):
         story.append(table)
         story.append(Spacer(1, 0.16 * inch))
 
+    story.append(Paragraph("Panel Deliverables", styles["Heading2"]))
+    story.append(Paragraph("Non-dollar deliverables tracked by completed panel count. These do not affect NTE budget or cost totals.", styles["Muted"]))
+    panel_rows = [["Main Bucket", "Deliverable", "Completed / Total", "Remaining", "Completion"]]
+    for panel in panel_deliverables:
+        panel_rows.append([
+            Paragraph(html_escape(panel.get("bucket_name") or "Unassigned"), styles["Small"]),
+            Paragraph(f"{html_escape(panel.get('name'))}<br/><font color='#5c6d80'>{html_escape(panel.get('notes') or '')}</font>", styles["Small"]),
+            f"{money(panel.get('completed_panels')):,.0f} / {money(panel.get('total_panels')):,.0f}",
+            f"{money(panel.get('remaining_panels')):,.0f}",
+            f"{money(panel.get('completion_percent')):.1f}%",
+        ])
+    if len(panel_rows) == 1:
+        panel_rows.append([Paragraph("No panel deliverables are being tracked for this report.", styles["Small"]), "", "", "", ""])
+    panel_table = Table(panel_rows, colWidths=[1.35 * inch, 2.05 * inch, 1.1 * inch, 0.85 * inch, 1.0 * inch], repeatRows=1)
+    panel_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#eaf0f5")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#31445a")),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#d7e0e8")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8fafc")]),
+    ]))
+    story.append(panel_table)
+    story.append(Spacer(1, 0.16 * inch))
+
     story.append(Paragraph("Budget Additions", styles["Heading2"]))
     story.append(Paragraph("Documented customer-approved or pending increases to the NTE budget.", styles["Muted"]))
     addition_rows = [["Bucket / Sub-Bucket", "Status", "Amount", "Split", "Dates", "Approver", "Reason / Backup"]]
@@ -804,6 +1118,31 @@ def nte_weekly_report_pdf_bytes(project_id):
         ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8fafc")]),
     ]))
     story.append(addition_table)
+    story.append(Spacer(1, 0.18 * inch))
+
+    story.append(Paragraph("Estimated Cost to Completion Trend", styles["Heading2"]))
+    story.append(Paragraph("Week-over-week KPI snapshot saved each time this report is generated.", styles["Muted"]))
+    story.append(kpi_trend_drawing(kpi_history))
+    trend_rows = [["Snapshot Date", "Estimated Cost to Completion", "Notes"]]
+    for point in kpi_history:
+        trend_rows.append([
+            html_escape(point.get("snapshot_date")),
+            dollars(point.get("value")),
+            Paragraph(html_escape(point.get("notes") or ""), styles["Small"]),
+        ])
+    if len(trend_rows) == 1:
+        trend_rows.append([Paragraph("No KPI snapshots have been saved yet.", styles["Small"]), "", ""])
+    trend_table = Table(trend_rows, colWidths=[1.15 * inch, 1.6 * inch, 3.75 * inch], repeatRows=1)
+    trend_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#eaf0f5")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#31445a")),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#d7e0e8")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8fafc")]),
+    ]))
+    story.append(trend_table)
 
     doc.build(story)
     return buffer.getvalue()
@@ -957,6 +1296,43 @@ def init_db():
               created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
               created_by_username TEXT,
               created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS nte_panel_deliverables (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+              bucket_id INTEGER REFERENCES nte_buckets(id) ON DELETE CASCADE,
+              name TEXT NOT NULL,
+              total_panels REAL DEFAULT 0,
+              completed_panels REAL DEFAULT 0,
+              notes TEXT,
+              sort_order INTEGER DEFAULT 0,
+              active INTEGER DEFAULT 1,
+              created_at TEXT NOT NULL,
+              updated_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS nte_weekly_kpi_snapshots (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+              snapshot_date TEXT NOT NULL,
+              metric_key TEXT NOT NULL,
+              metric_label TEXT NOT NULL,
+              bucket_id INTEGER REFERENCES nte_buckets(id) ON DELETE CASCADE,
+              subbucket_id INTEGER REFERENCES nte_subbuckets(id) ON DELETE CASCADE,
+              value REAL DEFAULT 0,
+              notes TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_nte_weekly_kpi_snapshots_unique
+            ON nte_weekly_kpi_snapshots (
+              project_id,
+              snapshot_date,
+              metric_key,
+              COALESCE(bucket_id, 0),
+              COALESCE(subbucket_id, 0)
             );
 
             CREATE TABLE IF NOT EXISTS nte_coding_rules (
@@ -1534,6 +1910,9 @@ def init_db():
         nte_completion_cols = [r["name"] for r in con.execute("PRAGMA table_info(nte_completion_updates)").fetchall()]
         if "bucket_id" not in nte_completion_cols:
             con.execute("ALTER TABLE nte_completion_updates ADD COLUMN bucket_id INTEGER REFERENCES nte_buckets(id) ON DELETE CASCADE")
+        nte_panel_cols = [r["name"] for r in con.execute("PRAGMA table_info(nte_panel_deliverables)").fetchall()]
+        if "bucket_id" not in nte_panel_cols:
+            con.execute("ALTER TABLE nte_panel_deliverables ADD COLUMN bucket_id INTEGER REFERENCES nte_buckets(id) ON DELETE CASCADE")
         con.execute(
             """
             UPDATE cost_records
@@ -5896,6 +6275,17 @@ def nte_summary(project_id, subproject_id=None, change_order_id=None, seed_defau
             """,
             (project_id, *target_params),
         ).fetchall()]
+        panel_deliverables = [dict(r) for r in con.execute(
+            """
+            SELECT p.*, b.name AS bucket_name
+            FROM nte_panel_deliverables p
+            LEFT JOIN nte_buckets b ON b.id = p.bucket_id
+            WHERE p.project_id = ?
+              AND COALESCE(p.active, 1) = 1
+            ORDER BY COALESCE(b.sort_order, 9999), b.name, p.sort_order, p.name, p.id
+            """,
+            (project_id,),
+        ).fetchall()]
         actuals = {
             r["nte_subbucket_id"]: money(r["actual"])
             for r in con.execute(
@@ -6021,7 +6411,14 @@ def nte_summary(project_id, subproject_id=None, change_order_id=None, seed_defau
             sub["estimated_cost_to_complete"] = sub_estimated_to_complete
             sub["estimated_completion_variance"] = sub_estimated_variance
             sub["estimated_completion_status"] = "No field completion entered" if completion_percent <= 0 else ("Projected under budget" if sub_estimated_variance >= 0 else "Projected over budget")
-    return {"buckets": list(by_bucket.values()), "additions": additions}
+    for panel in panel_deliverables:
+        total_panels = money(panel.get("total_panels"))
+        completed_panels = min(total_panels, money(panel.get("completed_panels"))) if total_panels > 0 else money(panel.get("completed_panels"))
+        panel["total_panels"] = total_panels
+        panel["completed_panels"] = completed_panels
+        panel["remaining_panels"] = max(0, total_panels - completed_panels)
+        panel["completion_percent"] = round((completed_panels / total_panels) * 100, 1) if total_panels > 0 else 0
+    return {"buckets": list(by_bucket.values()), "additions": additions, "panel_deliverables": panel_deliverables}
 
 
 def nte_rule_suggestion(con, record):
@@ -6241,6 +6638,9 @@ HTML = r"""
     .grid { display: grid; gap: 14px; }
     .grid.cols-4 { grid-template-columns: repeat(4, minmax(180px, 1fr)); }
     .grid.cols-2 { grid-template-columns: repeat(2, minmax(260px, 1fr)); }
+    .inline-form { display: grid; grid-template-columns: minmax(170px, 1.2fr) minmax(180px, 1.4fr) minmax(110px, .65fr) minmax(110px, .65fr) minmax(150px, 1fr) 80px auto; gap: 10px; align-items: end; }
+    .progress { height: 10px; min-width: 110px; margin-top: 5px; border-radius: 999px; overflow: hidden; background: color-mix(in srgb, var(--line) 72%, transparent); }
+    .progress span { display: block; height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--blue), var(--green)); }
     .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px; min-width: 0; }
     .home-card { cursor: pointer; transition: border-color .15s ease, box-shadow .15s ease; }
     .home-card:hover { border-color: var(--blue); box-shadow: 0 8px 24px var(--shadow-blue); }
@@ -7245,6 +7645,24 @@ HTML = r"""
         </div>
         <div class="table-wrap"><table id="nteBucketTable"></table></div>
       </div>
+      <div class="panel" style="margin-top:14px">
+        <div class="section-head">
+          <div>
+            <h2>Panel Deliverables</h2>
+            <p class="muted">Track purchased panels by count only. These percentages do not affect NTE dollars, costs, or billing.</p>
+          </div>
+        </div>
+        <form id="ntePanelForm" class="inline-form">
+          <select name="bucket_id" id="ntePanelBucket" required></select>
+          <input name="name" placeholder="Panel deliverable name" required>
+          <input name="total_panels" type="number" step="1" min="0" placeholder="Total panels" required>
+          <input name="completed_panels" type="number" step="1" min="0" placeholder="Completed" value="0">
+          <input name="notes" placeholder="Notes">
+          <input name="sort_order" type="number" step="1" value="10" title="Sort order">
+          <button class="btn primary" type="submit">Add Panels</button>
+        </form>
+        <div class="table-wrap" style="margin-top:12px"><table id="ntePanelTable"></table></div>
+      </div>
       <form class="panel" id="nteAdditionForm" style="margin-top:14px">
         <h2>Documented Budget Addition</h2>
         <p class="muted">Use this when the customer adds scope or approves more NTE budget. Attach the backup so the change is defensible later.</p>
@@ -7677,7 +8095,7 @@ HTML = r"""
     let projectPoRows = [];
     let customerDashboardData = null;
     let nteTargets = [];
-    let nteData = { buckets: [], additions: [] };
+    let nteData = { buckets: [], additions: [], panel_deliverables: [] };
     let nteCosts = [];
     let nteRules = [];
     let rolePermissionsData = null;
@@ -11248,7 +11666,7 @@ HTML = r"""
 
     function renderNteBucketSelectors() {
       const bucketOptions = (nteData.buckets || []).map(b => `<option value="${b.id}">${htmlEscape(b.name)}</option>`).join('');
-      ['nteSubbucketBucket','nteAdditionBucket'].forEach(id => {
+      ['nteSubbucketBucket','nteAdditionBucket','ntePanelBucket'].forEach(id => {
         const el = document.getElementById(id);
         if (el) el.innerHTML = bucketOptions || '<option value="">Create a bucket first</option>';
       });
@@ -11385,6 +11803,50 @@ HTML = r"""
         const fields = {};
         tableEl.querySelectorAll(`[data-nte-sub="${id}"]`).forEach(el => fields[el.dataset.field] = el.value);
         await api(`/api/nte-subbuckets/${id}`, { method:'PUT', body: JSON.stringify(fields) });
+        markSaved();
+        await loadNteTracking(false);
+      });
+    }
+
+    function renderNtePanels() {
+      const tableEl = document.getElementById('ntePanelTable');
+      if (!tableEl) return;
+      const panels = nteData.panel_deliverables || [];
+      if (!panels.length) {
+        tableEl.innerHTML = '<tbody><tr><td>No panel deliverables have been added yet.</td></tr></tbody>';
+        return;
+      }
+      const bucketOptions = selected => (nteData.buckets || []).map(bucket => `<option value="${bucket.id}" ${String(selected || '') === String(bucket.id) ? 'selected' : ''}>${htmlEscape(bucket.name || '')}</option>`).join('');
+      tableEl.innerHTML = `
+        <thead><tr><th>Main Bucket</th><th>Deliverable</th><th>Total Panels</th><th>Completed</th><th>Remaining</th><th>% Complete</th><th>Notes</th><th></th></tr></thead>
+        <tbody>${panels.map(panel => `
+          <tr>
+            <td><select data-nte-panel="${panel.id}" data-field="bucket_id">${bucketOptions(panel.bucket_id)}</select></td>
+            <td><input data-nte-panel="${panel.id}" data-field="name" value="${htmlEscape(panel.name || '')}"></td>
+            <td><input data-nte-panel="${panel.id}" data-field="total_panels" type="number" step="1" min="0" value="${Number(panel.total_panels || 0).toFixed(0)}"></td>
+            <td><input data-nte-panel="${panel.id}" data-field="completed_panels" type="number" step="1" min="0" value="${Number(panel.completed_panels || 0).toFixed(0)}"></td>
+            <td>${Number(panel.remaining_panels || 0).toFixed(0)}</td>
+            <td><strong>${Number(panel.completion_percent || 0).toFixed(1)}%</strong><div class="progress"><span style="width:${Math.max(0, Math.min(100, Number(panel.completion_percent || 0)))}%"></span></div></td>
+            <td><input data-nte-panel="${panel.id}" data-field="notes" value="${htmlEscape(panel.notes || '')}"></td>
+            <td class="actions-cell">
+              <button class="btn" data-save-nte-panel="${panel.id}" type="button">Save</button>
+              <button class="btn danger" data-delete-nte-panel="${panel.id}" type="button">Delete</button>
+            </td>
+          </tr>
+        `).join('')}</tbody>`;
+      tableEl.querySelectorAll('[data-save-nte-panel]').forEach(btn => btn.onclick = async () => {
+        const id = btn.dataset.saveNtePanel;
+        const fields = {};
+        tableEl.querySelectorAll(`[data-nte-panel="${id}"]`).forEach(el => fields[el.dataset.field] = el.value);
+        await api(`/api/nte-panel-deliverables/${id}`, { method:'PUT', body: JSON.stringify(fields) });
+        markSaved();
+        await loadNteTracking(false);
+      });
+      tableEl.querySelectorAll('[data-delete-nte-panel]').forEach(btn => btn.onclick = async () => {
+        const id = btn.dataset.deleteNtePanel;
+        const panel = panels.find(p => String(p.id) === String(id));
+        if (!confirm(`Delete panel deliverable "${panel?.name || 'this line'}"?`)) return;
+        await api(`/api/nte-panel-deliverables/${id}`, { method:'DELETE' });
         markSaved();
         await loadNteTracking(false);
       });
@@ -11587,12 +12049,13 @@ HTML = r"""
         : 'No T&M NTE jobs have been set up in this master project yet.';
       if (!nteTargets.length) {
         if (resultEl) resultEl.textContent = 'Set a subproject or change order pricing method to T&M NTE in Setup to start tracking buckets.';
-        nteData = { buckets: [], additions: [] };
+        nteData = { buckets: [], additions: [], panel_deliverables: [] };
         nteCosts = [];
         nteRules = [];
         renderNteSummary();
         renderNteBucketSelectors();
         renderNteBuckets();
+        renderNtePanels();
         renderNteAdditions();
         renderNteCosts();
         renderNteRules();
@@ -11606,6 +12069,7 @@ HTML = r"""
       renderNteSummary();
       renderNteBucketSelectors();
       renderNteBuckets();
+      renderNtePanels();
       renderNteAdditions();
       renderNteCosts();
       renderNteRules();
@@ -11668,6 +12132,18 @@ HTML = r"""
         markSaved();
         await loadNteTracking(false);
       };
+    const ntePanelForm = document.getElementById('ntePanelForm');
+    if (ntePanelForm) ntePanelForm.onsubmit = async event => {
+      event.preventDefault();
+      const data = formDataObj(event.target);
+      data.project_id = state.projectId;
+      await api('/api/nte-panel-deliverables', { method:'POST', body: JSON.stringify(data) });
+      event.target.reset();
+      event.target.elements.completed_panels.value = '0';
+      event.target.elements.sort_order.value = '10';
+      markSaved();
+      await loadNteTracking(false);
+    };
     document.getElementById('nteSubbucketForm').onsubmit = async event => {
       event.preventDefault();
       const data = formDataObj(event.target);
@@ -13823,6 +14299,52 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 log_activity(actor, "added NTE sub-bucket", "T&M NTE", name, {"bucket_id": data.get("bucket_id")})
                 return json_response(self, {"id": new_id})
+            if parsed.path == "/api/nte-panel-deliverables":
+                actor = current_user(self)
+                if not can_edit_permission(actor, "nte_tracking"):
+                    return json_response(self, {"error": "T&M NTE edit access required."}, 403)
+                data = parse_json(self)
+                name = str(data.get("name") or "").strip()
+                project_id = data.get("project_id")
+                bucket_id = data.get("bucket_id")
+                total_panels = money(data.get("total_panels"))
+                completed_panels = money(data.get("completed_panels"))
+                if not project_id:
+                    return json_response(self, {"error": "Project is required."}, 400)
+                if not bucket_id:
+                    return json_response(self, {"error": "Choose the main bucket this panel deliverable belongs to."}, 400)
+                if not name:
+                    return json_response(self, {"error": "Panel deliverable name is required."}, 400)
+                if total_panels <= 0:
+                    return json_response(self, {"error": "Enter the total number of panels."}, 400)
+                if completed_panels < 0 or completed_panels > total_panels:
+                    return json_response(self, {"error": "Completed panels must be between 0 and the total panel count."}, 400)
+                now = datetime.now().isoformat(timespec="seconds")
+                with db() as con:
+                    bucket = con.execute("SELECT id, name FROM nte_buckets WHERE id = ? AND project_id = ?", (bucket_id, project_id)).fetchone()
+                    if not bucket:
+                        return json_response(self, {"error": "Selected bucket does not belong to this project."}, 400)
+                new_id = execute(
+                    """
+                    INSERT INTO nte_panel_deliverables (
+                      project_id, bucket_id, name, total_panels, completed_panels, notes, sort_order, active, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                    """,
+                    (
+                        project_id,
+                        bucket_id,
+                        name,
+                        total_panels,
+                        completed_panels,
+                        data.get("notes") or "",
+                        int(money(data.get("sort_order"))),
+                        now,
+                        now,
+                    ),
+                )
+                log_activity(actor, "added NTE panel deliverable", "T&M NTE", name, {"project_id": project_id, "bucket_id": bucket_id, "bucket": bucket["name"], "total_panels": total_panels, "completed_panels": completed_panels})
+                return json_response(self, {"id": new_id})
             if parsed.path == "/api/nte-apply-rules":
                 actor = current_user(self)
                 if not can_edit_permission(actor, "nte_tracking"):
@@ -15572,6 +16094,48 @@ class Handler(BaseHTTPRequestHandler):
                     ),
                 )
                 return json_response(self, {"ok": True})
+            if parsed.path.startswith("/api/nte-panel-deliverables/"):
+                actor = current_user(self)
+                if not can_edit_permission(actor, "nte_tracking"):
+                    return json_response(self, {"error": "T&M NTE edit access required."}, 403)
+                panel_id = parsed.path.rsplit("/", 1)[-1]
+                name = str(data.get("name") or "").strip()
+                bucket_id = data.get("bucket_id")
+                total_panels = money(data.get("total_panels"))
+                completed_panels = money(data.get("completed_panels"))
+                if not bucket_id:
+                    return json_response(self, {"error": "Choose the main bucket this panel deliverable belongs to."}, 400)
+                if not name:
+                    return json_response(self, {"error": "Panel deliverable name is required."}, 400)
+                if total_panels <= 0:
+                    return json_response(self, {"error": "Enter the total number of panels."}, 400)
+                if completed_panels < 0 or completed_panels > total_panels:
+                    return json_response(self, {"error": "Completed panels must be between 0 and the total panel count."}, 400)
+                with db() as con:
+                    panel = con.execute("SELECT project_id FROM nte_panel_deliverables WHERE id = ?", (panel_id,)).fetchone()
+                    if not panel:
+                        return json_response(self, {"error": "Panel deliverable not found."}, 404)
+                    bucket = con.execute("SELECT id, name FROM nte_buckets WHERE id = ? AND project_id = ?", (bucket_id, panel["project_id"])).fetchone()
+                    if not bucket:
+                        return json_response(self, {"error": "Selected bucket does not belong to this project."}, 400)
+                    updated = con.execute(
+                        """
+                        UPDATE nte_panel_deliverables
+                        SET bucket_id = ?, name = ?, total_panels = ?, completed_panels = ?, notes = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            bucket_id,
+                            name,
+                            total_panels,
+                            completed_panels,
+                            data.get("notes") or "",
+                            datetime.now().isoformat(timespec="seconds"),
+                            panel_id,
+                        ),
+                    ).rowcount
+                log_activity(actor, "updated NTE panel deliverable", "T&M NTE", name, {"panel_id": panel_id, "bucket_id": bucket_id, "bucket": bucket["name"], "total_panels": total_panels, "completed_panels": completed_panels})
+                return json_response(self, {"ok": True, "updated": updated})
             if parsed.path.startswith("/api/nte-cost-records/"):
                 actor = current_user(self)
                 if not can_edit_permission(actor, "nte_tracking"):
@@ -16388,6 +16952,18 @@ class Handler(BaseHTTPRequestHandler):
                     rule["match_text"] if rule else rule_id,
                     {"bucket": rule["bucket_name"] if rule else "", "subbucket": rule["subbucket_name"] if rule else ""},
                 )
+                return json_response(self, {"ok": True})
+            if parsed.path.startswith("/api/nte-panel-deliverables/"):
+                actor = current_user(self)
+                if not can_edit_permission(actor, "nte_tracking"):
+                    return json_response(self, {"error": "T&M NTE edit access required."}, 403)
+                panel_id = parsed.path.rsplit("/", 1)[-1]
+                with db() as con:
+                    panel = con.execute("SELECT * FROM nte_panel_deliverables WHERE id = ?", (panel_id,)).fetchone()
+                    if not panel:
+                        return json_response(self, {"error": "Panel deliverable not found."}, 404)
+                    con.execute("UPDATE nte_panel_deliverables SET active = 0, updated_at = ? WHERE id = ?", (datetime.now().isoformat(timespec="seconds"), panel_id))
+                log_activity(actor, "deleted NTE panel deliverable", "T&M NTE", panel["name"], {"project_id": panel["project_id"], "panel_id": panel_id})
                 return json_response(self, {"ok": True})
             if parsed.path.startswith("/api/nte-buckets/"):
                 actor = current_user(self)
