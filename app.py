@@ -6314,7 +6314,14 @@ def nte_summary(project_id, subproject_id=None, change_order_id=None, seed_defau
             r["nte_subbucket_id"]: money(r["actual"])
             for r in con.execute(
                 """
-                SELECT nte_subbucket_id, COALESCE(SUM(amount), 0) AS actual
+                SELECT
+                  nte_subbucket_id,
+                  COALESCE(SUM(
+                    CASE
+                      WHEN COALESCE(sales_amount, 0) <> 0 THEN sales_amount
+                      ELSE amount
+                    END
+                  ), 0) AS actual
                 FROM cost_records
                 WHERE project_id = ? AND nte_subbucket_id IS NOT NULL
                 GROUP BY nte_subbucket_id
@@ -6755,6 +6762,19 @@ HTML = r"""
     #bidTable tr.bid-dirty td:first-child { box-shadow: inset 4px 0 0 var(--gold); }
     #bidTable tr.bid-dirty input, #bidTable tr.bid-dirty select { background: color-mix(in srgb, var(--gold) 10%, var(--field-bg)); border-color: var(--gold); }
     #bidTable tr.bid-dirty [data-save-bid] { background: var(--gold); color: white; border-color: var(--gold); }
+    #usersTable { min-width: 980px; table-layout: fixed; }
+    #usersTable th:nth-child(1), #usersTable td:nth-child(1) { width: 260px; }
+    #usersTable th:nth-child(2), #usersTable td:nth-child(2) { width: 190px; }
+    #usersTable th:nth-child(3), #usersTable td:nth-child(3) { width: 160px; }
+    #usersTable th:nth-child(4), #usersTable td:nth-child(4) { width: 130px; }
+    #usersTable th:nth-child(5), #usersTable td:nth-child(5) { width: 145px; }
+    #usersTable th:nth-child(6), #usersTable td:nth-child(6) { width: 150px; }
+    #usersTable th:nth-child(7), #usersTable td:nth-child(7) { width: 170px; }
+    #usersTable td { overflow-wrap: anywhere; word-break: normal; }
+    #usersTable select, #usersTable input { min-width: 0; }
+    #usersTable label { display: flex; align-items: center; gap: 6px; margin: 0; white-space: nowrap; }
+    #usersTable label input[type="checkbox"] { width: auto; flex: 0 0 auto; }
+    #usersTable td:last-child { white-space: normal; }
     #mccQuoteItemTable { min-width: 1280px; table-layout: fixed; }
     #mccQuoteItemTable th, #mccQuoteItemTable td { vertical-align: middle; }
     #mccQuoteItemTable th:nth-child(1), #mccQuoteItemTable td:nth-child(1) { width: 135px; }
@@ -12955,8 +12975,8 @@ HTML = r"""
       document.getElementById('usersTable').innerHTML = `
         <thead><tr><th>Username</th><th>Name</th><th>Role</th><th>PO Trust</th><th>Status</th><th>Password</th><th></th></tr></thead>
         <tbody>${users.map(u => `<tr>
-          <td>${u.username}</td>
-          <td>${u.display_name || ''}</td>
+          <td>${htmlEscape(u.username || '')}</td>
+          <td>${htmlEscape(u.display_name || '')}</td>
           <td><select data-user-role="${u.id}">${roleOptions.map(role => `<option ${u.role === role ? 'selected' : ''}>${htmlEscape(role)}</option>`).join('')}</select></td>
           <td><label><input data-user-po-auto-issue="${u.id}" type="checkbox" ${Number(u.po_auto_issue || 0) ? 'checked' : ''}> Auto-issue</label></td>
           <td>${u.active ? 'Active' : 'Inactive'}${Number(u.must_change_password || 0) ? '<div class="muted">Must change password</div>' : ''}</td>
