@@ -3130,6 +3130,66 @@ def panel_shop_labor_records_from_tables(tables, work_description):
     return records
 
 
+def fieldwise_time_entry_labor_records_from_text(text, work_description):
+    records = []
+    in_time_entries = False
+    stop_prefixes = (
+        "subtotal",
+        "non-taxable-total",
+        "taxable-total",
+        "tax ",
+        "total",
+        "materials",
+        "equipment",
+        "field ticket #",
+        "page ",
+    )
+    for raw_line in str(text or "").splitlines():
+        line = re.sub(r"\s+", " ", raw_line).strip()
+        if not line:
+            continue
+        lower = line.lower()
+        if lower == "time entries":
+            in_time_entries = True
+            continue
+        if not in_time_entries:
+            continue
+        if lower == "name date":
+            continue
+        if lower.startswith(stop_prefixes):
+            break
+        line_match = re.match(
+            r"^(.+?)\s+(\d{1,2}/\d{1,2}/\d{2,4})\s+(.+)$",
+            line,
+            flags=re.IGNORECASE,
+        )
+        if not line_match:
+            continue
+        employee = line_match.group(1).strip()
+        entry_text = line_match.group(3).strip()
+        if not employee:
+            continue
+        for entry_match in re.finditer(r"(.+?)\s+(Reg|OT)\s+([0-9]+(?:\.[0-9]+)?)", entry_text, flags=re.IGNORECASE):
+            labor_class = entry_match.group(1).strip()
+            rate_text = entry_match.group(2).strip().upper()
+            rate_type = "OT" if rate_text == "OT" else "Reg"
+            hours = money(entry_match.group(3))
+            if not labor_class or hours <= 0:
+                continue
+            records.append(
+                {
+                    "cost_type": "Labor",
+                    "item": f"{employee} - {labor_class} - {rate_type}",
+                    "description": work_description,
+                    "qty": hours,
+                    "rate": 0,
+                    "amount": 0,
+                    "source_page": None,
+                }
+            )
+    return records
+
+
 def apply_internal_rate(category_type, category, raw_rate, rate_set_id=None):
     if category_type not in ("Labor", "Equipment"):
         return 0
@@ -5246,6 +5306,8 @@ def import_fieldwise_pdf(path, project_id):
                 add_fieldwise_item_row(row, page_number)
 
     for record in panel_shop_labor_records_from_tables(tables, work_description):
+        add_extracted_record(record)
+    for record in fieldwise_time_entry_labor_records_from_text(text, work_description):
         add_extracted_record(record)
 
     if not records:
