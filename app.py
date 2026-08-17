@@ -3171,6 +3171,13 @@ def fieldwise_time_entry_labor_records_from_text(text, work_description):
             continue
         for entry_match in re.finditer(r"(.+?)\s+(Reg|OT)\s+([0-9]+(?:\.[0-9]+)?)", entry_text, flags=re.IGNORECASE):
             labor_class = entry_match.group(1).strip()
+            # Field Wise sometimes exports same-line entries as
+            # "Panel Shop 0.75 Panel Shop OT 0.50"; keep only the class
+            # after the previous hour value so OT/ST rates can match.
+            split_on_prior_hours = re.split(r"\b\d+(?:\.\d+)?\b", labor_class)
+            if len(split_on_prior_hours) > 1 and split_on_prior_hours[-1].strip():
+                labor_class = split_on_prior_hours[-1].strip()
+            labor_class = re.sub(r"\s+", " ", labor_class).strip()
             rate_text = entry_match.group(2).strip().upper()
             rate_type = "OT" if rate_text == "OT" else "Reg"
             hours = money(entry_match.group(3))
