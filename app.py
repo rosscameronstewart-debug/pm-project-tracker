@@ -12135,22 +12135,31 @@ HTML = r"""
         tableEl.innerHTML = '<tbody><tr><td>No budget reallocations have been entered yet.</td></tr></tbody>';
         return;
       }
-      tableEl.innerHTML = `<thead><tr><th>Created</th><th>From</th><th>To</th><th>Status</th><th>Total</th><th>Labor</th><th>Material</th><th>Equipment</th><th>Requested</th><th>Approved</th><th>Approver</th><th>Backup</th><th>Reason</th></tr></thead>
+      tableEl.innerHTML = `<thead><tr><th>Created</th><th>From</th><th>To</th><th>Status</th><th>Total</th><th>Labor</th><th>Material</th><th>Equipment</th><th>Requested</th><th>Approved</th><th>Approver</th><th>Backup</th><th>Reason</th><th></th></tr></thead>
         <tbody>${reallocations.map(r => `<tr>
           <td>${htmlEscape((r.created_at || '').replace('T', ' '))}<div class="muted">${htmlEscape(r.created_by_username || '')}</div></td>
           <td>${htmlEscape(r.from_bucket_name || '')}</td>
           <td>${htmlEscape(r.to_bucket_name || '')}</td>
-          <td>${htmlEscape(r.status || '')}</td>
+          <td><select data-nte-reallocation="${r.id}" data-field="status">${['Pending','Approved','Rejected'].map(v => `<option ${r.status === v ? 'selected' : ''}>${v}</option>`).join('')}</select></td>
           <td>${money(r.amount)}</td>
           <td>${money(r.labor_amount)}</td>
           <td>${money(r.material_amount)}</td>
           <td>${money(r.equipment_amount)}</td>
-          <td>${htmlEscape(r.requested_date || '')}</td>
-          <td>${htmlEscape(r.approved_date || '')}</td>
-          <td>${htmlEscape(r.approver || '')}</td>
+          <td><input data-nte-reallocation="${r.id}" data-field="requested_date" type="date" value="${htmlEscape(r.requested_date || '')}"></td>
+          <td><input data-nte-reallocation="${r.id}" data-field="approved_date" type="date" value="${htmlEscape(r.approved_date || '')}"></td>
+          <td><input data-nte-reallocation="${r.id}" data-field="approver" value="${htmlEscape(r.approver || '')}"></td>
           <td>${r.support_file ? pdfLink({ source_file: r.support_file }) : '<span class="muted">None</span>'}</td>
-          <td>${htmlEscape(r.reason || '')}</td>
+          <td><input data-nte-reallocation="${r.id}" data-field="reason" value="${htmlEscape(r.reason || '')}"></td>
+          <td><button class="btn" data-save-nte-reallocation="${r.id}" type="button">Save</button></td>
         </tr>`).join('')}</tbody>`;
+      tableEl.querySelectorAll('[data-save-nte-reallocation]').forEach(btn => btn.onclick = async () => {
+        const id = btn.dataset.saveNteReallocation;
+        const fields = {};
+        tableEl.querySelectorAll(`[data-nte-reallocation="${id}"]`).forEach(el => fields[el.dataset.field] = el.value);
+        await api(`/api/nte-reallocations/${id}`, { method:'PUT', body: JSON.stringify(fields) });
+        markSaved();
+        await loadNteTracking(false);
+      });
     }
 
     function updateNteReallocationTotal() {
@@ -16483,6 +16492,45 @@ class Handler(BaseHTTPRequestHandler):
                     ),
                 )
                 return json_response(self, {"ok": True})
+            if parsed.path.startswith("/api/nte-reallocations/"):
+                actor = current_user(self)
+                if not can_edit_permission(actor, "nte_tracking"):
+                    return json_response(self, {"error": "T&M NTE edit access required."}, 403)
+                reallocation_id = parsed.path.rsplit("/", 1)[-1]
+                status = data.get("status") or "Pending"
+                if status not in ("Pending", "Approved", "Rejected"):
+                    return json_response(self, {"error": "Choose Pending, Approved, or Rejected."}, 400)
+                with db() as con:
+                    reallocation = con.execute(
+                        """
+                        SELECT r.*, from_b.name AS from_bucket_name, to_b.name AS to_bucket_name
+                        FROM nte_bucket_reallocations r
+                        JOIN nte_buckets from_b ON from_b.id = r.from_bucket_id
+                        JOIN nte_buckets to_b ON to_b.id = r.to_bucket_id
+                        WHERE r.id = ?
+                        """,
+                        (reallocation_id,),
+                    ).fetchone()
+                    if not reallocation:
+                        return json_response(self, {"error": "NTE reallocation not found."}, 404)
+                    updated = con.execute(
+                        """
+                        UPDATE nte_bucket_reallocations
+                        SET status = ?, requested_date = ?, approved_date = ?, approver = ?, reason = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            status,
+                            data.get("requested_date") or "",
+                            data.get("approved_date") or "",
+                            data.get("approver") or "",
+                            data.get("reason") or "",
+                            reallocation_id,
+                        ),
+                    ).rowcount
+                label = f"{reallocation['from_bucket_name']} -> {reallocation['to_bucket_name']}"
+                log_activity(actor, "updated NTE budget reallocation", "T&M NTE", label, {"reallocation_id": reallocation_id, "status": status})
+                return json_response(self, {"ok": True, "updated": updated})
             if parsed.path.startswith("/api/nte-panel-deliverables/"):
                 actor = current_user(self)
                 if not can_edit_permission(actor, "nte_tracking"):
