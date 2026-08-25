@@ -1260,6 +1260,130 @@ def nte_weekly_report_pdf_bytes(project_id):
     return buffer.getvalue()
 
 
+def nte_budget_approval_pdf_bytes(kind, item_id):
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import letter
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import inch
+        from reportlab.platypus import Image, SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    except Exception as exc:
+        raise RuntimeError("PDF export needs reportlab installed. Run pip install -r requirements.txt.") from exc
+
+    kind = str(kind or "").strip().lower()
+    if kind == "addition":
+        record = one(
+            """
+            SELECT a.*, p.project_code, p.name AS project_name, p.customer, b.name AS bucket_name, sb.name AS subbucket_name
+            FROM nte_bucket_additions a
+            JOIN projects p ON p.id = a.project_id
+            JOIN nte_buckets b ON b.id = a.bucket_id
+            LEFT JOIN nte_subbuckets sb ON sb.id = a.subbucket_id
+            WHERE a.id = ?
+            """,
+            (item_id,),
+        )
+        title = "T&M NTE Budget Addition Approval"
+        movement_label = "Budget Increase"
+        from_to_rows = [["Bucket", record["bucket_name"] if record else ""], ["Sub-Bucket", record["subbucket_name"] if record and record["subbucket_name"] else "Bucket level"]]
+    elif kind == "reallocation":
+        record = one(
+            """
+            SELECT r.*, p.project_code, p.name AS project_name, p.customer,
+                   from_b.name AS from_bucket_name, to_b.name AS to_bucket_name
+            FROM nte_bucket_reallocations r
+            JOIN projects p ON p.id = r.project_id
+            JOIN nte_buckets from_b ON from_b.id = r.from_bucket_id
+            JOIN nte_buckets to_b ON to_b.id = r.to_bucket_id
+            WHERE r.id = ?
+            """,
+            (item_id,),
+        )
+        title = "T&M NTE Budget Reallocation Approval"
+        movement_label = "Budget Transfer"
+        from_to_rows = [["From Bucket", record["from_bucket_name"] if record else ""], ["To Bucket", record["to_bucket_name"] if record else ""]]
+    else:
+        return None
+    if not record:
+        return None
+
+    def dollars(value):
+        return f"${money(value):,.2f}"
+
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=0.55 * inch, leftMargin=0.55 * inch, topMargin=0.5 * inch, bottomMargin=0.5 * inch)
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(name="Muted", parent=styles["Normal"], textColor=colors.HexColor("#5c6d80"), fontSize=9, leading=12))
+    styles.add(ParagraphStyle(name="Small", parent=styles["Normal"], fontSize=9, leading=12))
+    story = []
+    logo_path = BRAND_DIR / "twin-peaks-logo.png"
+    if logo_path.exists():
+        logo = Image(str(logo_path))
+        max_width = 1.6 * inch
+        max_height = 0.6 * inch
+        scale = min(max_width / logo.imageWidth, max_height / logo.imageHeight)
+        logo.drawWidth = logo.imageWidth * scale
+        logo.drawHeight = logo.imageHeight * scale
+        logo.hAlign = "LEFT"
+        story.append(logo)
+        story.append(Spacer(1, 0.1 * inch))
+    story.append(Paragraph(html_escape(title), styles["Title"]))
+    story.append(Paragraph(f"{html_escape(record['project_code'])} / {html_escape(record['project_name'])} / {html_escape(record['customer'])}", styles["Muted"]))
+    story.append(Paragraph(f"Generated {datetime.now().strftime('%Y-%m-%d %H:%M')}", styles["Muted"]))
+    story.append(Spacer(1, 0.18 * inch))
+
+    detail_rows = [
+        ["Approval Type", movement_label],
+        ["Status", record["status"] or ""],
+        ["Total Amount", dollars(record["amount"])],
+        ["Labor", dollars(record["labor_amount"])],
+        ["Material", dollars(record["material_amount"])],
+        ["Equipment", dollars(record["equipment_amount"])],
+        ["Requested Date", record["requested_date"] or ""],
+        ["Approved Date", record["approved_date"] or ""],
+        ["Approver", record["approver"] or ""],
+    ]
+    detail_rows.extend(from_to_rows)
+    detail_table = Table([[Paragraph(html_escape(str(label)), styles["Small"]), Paragraph(html_escape(str(value)), styles["Small"])] for label, value in detail_rows], colWidths=[1.6 * inch, 4.8 * inch])
+    detail_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#eaf0f5")),
+        ("TEXTCOLOR", (0, 0), (0, -1), colors.HexColor("#31445a")),
+        ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#d7e0e8")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("TOPPADDING", (0, 0), (-1, -1), 7),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+    ]))
+    story.append(detail_table)
+    story.append(Spacer(1, 0.18 * inch))
+    story.append(Paragraph("<b>Reason</b>", styles["Small"]))
+    story.append(Paragraph(html_escape(record["reason"] or "No reason entered."), styles["Small"]))
+    if record["notes"]:
+        story.append(Spacer(1, 0.08 * inch))
+        story.append(Paragraph("<b>Notes</b>", styles["Small"]))
+        story.append(Paragraph(html_escape(record["notes"]), styles["Small"]))
+    story.append(Spacer(1, 0.28 * inch))
+    story.append(Paragraph("Customer Approval", styles["Heading2"]))
+    signature_rows = [
+        ["Authorized Signature", ""],
+        ["Printed Name", ""],
+        ["Title", ""],
+        ["Date", ""],
+    ]
+    signature_table = Table(signature_rows, colWidths=[1.7 * inch, 4.7 * inch], rowHeights=[0.48 * inch] * 4)
+    signature_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#eaf0f5")),
+        ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#8da0b4")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    story.append(signature_table)
+    story.append(Spacer(1, 0.14 * inch))
+    story.append(Paragraph("Please sign and return this document. The signed copy will be attached to the tracker record.", styles["Muted"]))
+    doc.build(story)
+    return buffer.getvalue()
+
+
 def db():
     DATA_DIR.mkdir(exist_ok=True)
     UPLOAD_DIR.mkdir(exist_ok=True)
@@ -1392,6 +1516,7 @@ def init_db():
               approver TEXT,
               reason TEXT,
               support_file TEXT,
+              signed_file TEXT,
               notes TEXT,
               created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
               created_by_username TEXT,
@@ -1413,6 +1538,7 @@ def init_db():
               approver TEXT,
               reason TEXT,
               support_file TEXT,
+              signed_file TEXT,
               notes TEXT,
               created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
               created_by_username TEXT,
@@ -2040,6 +2166,11 @@ def init_db():
             con.execute("ALTER TABLE nte_bucket_additions ADD COLUMN material_amount REAL DEFAULT 0")
         if "equipment_amount" not in nte_addition_cols:
             con.execute("ALTER TABLE nte_bucket_additions ADD COLUMN equipment_amount REAL DEFAULT 0")
+        if "signed_file" not in nte_addition_cols:
+            con.execute("ALTER TABLE nte_bucket_additions ADD COLUMN signed_file TEXT")
+        nte_reallocation_cols = [r["name"] for r in con.execute("PRAGMA table_info(nte_bucket_reallocations)").fetchall()]
+        if "signed_file" not in nte_reallocation_cols:
+            con.execute("ALTER TABLE nte_bucket_reallocations ADD COLUMN signed_file TEXT")
         nte_completion_cols = [r["name"] for r in con.execute("PRAGMA table_info(nte_completion_updates)").fetchall()]
         if "bucket_id" not in nte_completion_cols:
             con.execute("ALTER TABLE nte_completion_updates ADD COLUMN bucket_id INTEGER REFERENCES nte_buckets(id) ON DELETE CASCADE")
@@ -12190,7 +12321,7 @@ HTML = r"""
       const bucketById = Object.fromEntries((nteData.buckets || []).map(b => [b.id, b]));
       const subById = {};
       (nteData.buckets || []).forEach(b => (b.subbuckets || []).forEach(s => subById[s.id] = s));
-      tableEl.innerHTML = `<thead><tr><th>Created</th><th>Bucket</th><th>Status</th><th>Total</th><th>Labor</th><th>Material</th><th>Equipment</th><th>Requested</th><th>Approved</th><th>Approver</th><th>Backup</th><th>Reason</th></tr></thead>
+      tableEl.innerHTML = `<thead><tr><th>Created</th><th>Bucket</th><th>Status</th><th>Total</th><th>Labor</th><th>Material</th><th>Equipment</th><th>Requested</th><th>Approved</th><th>Approver</th><th>Backup</th><th>Approval</th><th>Reason</th></tr></thead>
         <tbody>${additions.map(a => `<tr>
           <td>${htmlEscape((a.created_at || '').replace('T', ' '))}<div class="muted">${htmlEscape(a.created_by_username || '')}</div></td>
           <td>${htmlEscape(bucketById[a.bucket_id]?.name || '')}</td>
@@ -12203,8 +12334,30 @@ HTML = r"""
           <td>${htmlEscape(a.approved_date || '')}</td>
           <td>${htmlEscape(a.approver || '')}</td>
           <td>${a.support_file ? pdfLink({ source_file: a.support_file }) : '<span class="muted">None</span>'}</td>
+          <td>
+            <a class="btn" href="/nte-budget-addition-approval.pdf?id=${a.id}" target="_blank" rel="noopener">Download PDF</a>
+            <div class="muted" style="margin-top:6px">${a.signed_file ? `Signed: ${pdfLink({ source_file: a.signed_file })}` : 'No signed copy'}</div>
+            <div class="compact-upload" style="margin-top:6px">
+              <input data-nte-addition-signed-file="${a.id}" id="nteAdditionSignedFile${a.id}" type="file" accept=".pdf,.png,.jpg,.jpeg,.webp">
+              <label class="file-picker" for="nteAdditionSignedFile${a.id}">Choose signed copy</label>
+              <button class="btn" data-upload-nte-addition-signed="${a.id}" type="button">Upload Signed</button>
+            </div>
+          </td>
           <td>${htmlEscape(a.reason || '')}</td>
         </tr>`).join('')}</tbody>`;
+      tableEl.querySelectorAll('[data-upload-nte-addition-signed]').forEach(btn => btn.onclick = async () => {
+        const id = btn.dataset.uploadNteAdditionSigned;
+        const input = tableEl.querySelector(`[data-nte-addition-signed-file="${id}"]`);
+        if (!input?.files?.length) {
+          window.alert('Choose the signed approval file first.');
+          return;
+        }
+        const formData = new FormData();
+        formData.append('signed_file', input.files[0]);
+        await api(`/api/nte-additions/${id}/signed`, { method:'POST', body: formData });
+        markSaved();
+        await loadNteTracking(false);
+      });
     }
 
     function updateNteAdditionTotal() {
@@ -12223,7 +12376,7 @@ HTML = r"""
         tableEl.innerHTML = '<tbody><tr><td>No budget reallocations have been entered yet.</td></tr></tbody>';
         return;
       }
-      tableEl.innerHTML = `<thead><tr><th>Created</th><th>From</th><th>To</th><th>Status</th><th>Total</th><th>Labor</th><th>Material</th><th>Equipment</th><th>Requested</th><th>Approved</th><th>Approver</th><th>Backup</th><th>Reason</th><th></th></tr></thead>
+      tableEl.innerHTML = `<thead><tr><th>Created</th><th>From</th><th>To</th><th>Status</th><th>Total</th><th>Labor</th><th>Material</th><th>Equipment</th><th>Requested</th><th>Approved</th><th>Approver</th><th>Backup</th><th>Approval</th><th>Reason</th><th></th></tr></thead>
         <tbody>${reallocations.map(r => `<tr>
           <td>${htmlEscape((r.created_at || '').replace('T', ' '))}<div class="muted">${htmlEscape(r.created_by_username || '')}</div></td>
           <td>${htmlEscape(r.from_bucket_name || '')}</td>
@@ -12237,6 +12390,15 @@ HTML = r"""
           <td><input data-nte-reallocation="${r.id}" data-field="approved_date" type="date" value="${htmlEscape(r.approved_date || '')}"></td>
           <td><input data-nte-reallocation="${r.id}" data-field="approver" value="${htmlEscape(r.approver || '')}"></td>
           <td>${r.support_file ? pdfLink({ source_file: r.support_file }) : '<span class="muted">None</span>'}</td>
+          <td>
+            <a class="btn" href="/nte-budget-reallocation-approval.pdf?id=${r.id}" target="_blank" rel="noopener">Download PDF</a>
+            <div class="muted" style="margin-top:6px">${r.signed_file ? `Signed: ${pdfLink({ source_file: r.signed_file })}` : 'No signed copy'}</div>
+            <div class="compact-upload" style="margin-top:6px">
+              <input data-nte-reallocation-signed-file="${r.id}" id="nteReallocationSignedFile${r.id}" type="file" accept=".pdf,.png,.jpg,.jpeg,.webp">
+              <label class="file-picker" for="nteReallocationSignedFile${r.id}">Choose signed copy</label>
+              <button class="btn" data-upload-nte-reallocation-signed="${r.id}" type="button">Upload Signed</button>
+            </div>
+          </td>
           <td><input data-nte-reallocation="${r.id}" data-field="reason" value="${htmlEscape(r.reason || '')}"></td>
           <td><button class="btn" data-save-nte-reallocation="${r.id}" type="button">Save</button></td>
         </tr>`).join('')}</tbody>`;
@@ -12245,6 +12407,19 @@ HTML = r"""
         const fields = {};
         tableEl.querySelectorAll(`[data-nte-reallocation="${id}"]`).forEach(el => fields[el.dataset.field] = el.value);
         await api(`/api/nte-reallocations/${id}`, { method:'PUT', body: JSON.stringify(fields) });
+        markSaved();
+        await loadNteTracking(false);
+      });
+      tableEl.querySelectorAll('[data-upload-nte-reallocation-signed]').forEach(btn => btn.onclick = async () => {
+        const id = btn.dataset.uploadNteReallocationSigned;
+        const input = tableEl.querySelector(`[data-nte-reallocation-signed-file="${id}"]`);
+        if (!input?.files?.length) {
+          window.alert('Choose the signed approval file first.');
+          return;
+        }
+        const formData = new FormData();
+        formData.append('signed_file', input.files[0]);
+        await api(`/api/nte-reallocations/${id}/signed`, { method:'POST', body: formData });
         markSaved();
         await loadNteTracking(false);
       });
@@ -14003,6 +14178,24 @@ class Handler(BaseHTTPRequestHandler):
                 safe_project = re.sub(r"[^A-Za-z0-9_-]+", "-", str(project["project_code"] if project else "project")).strip("-") or "project"
                 filename = f"{safe_project}-tm-nte-weekly-report-{datetime.now().strftime('%Y%m%d')}.pdf"
                 return download_response(self, data, filename, "application/pdf")
+            if parsed.path == "/nte-budget-addition-approval.pdf":
+                if not can_view_permission(user, "nte_tracking"):
+                    return text_response(self, "T&M NTE access required", "text/plain", 403)
+                item_id = qs.get("id", [""])[0]
+                data = nte_budget_approval_pdf_bytes("addition", item_id)
+                if data is None:
+                    return text_response(self, "Budget addition not found", "text/plain", 404)
+                filename = f"nte-budget-addition-approval-{item_id or 'record'}.pdf"
+                return download_response(self, data, filename, "application/pdf")
+            if parsed.path == "/nte-budget-reallocation-approval.pdf":
+                if not can_view_permission(user, "nte_tracking"):
+                    return text_response(self, "T&M NTE access required", "text/plain", 403)
+                item_id = qs.get("id", [""])[0]
+                data = nte_budget_approval_pdf_bytes("reallocation", item_id)
+                if data is None:
+                    return text_response(self, "Budget reallocation not found", "text/plain", 404)
+                filename = f"nte-budget-reallocation-approval-{item_id or 'record'}.pdf"
+                return download_response(self, data, filename, "application/pdf")
             if parsed.path.startswith("/po/"):
                 po_id = parsed.path.rsplit("/", 1)[-1]
                 po = one("SELECT * FROM purchase_orders WHERE id = ?", (po_id,))
@@ -14577,6 +14770,70 @@ class Handler(BaseHTTPRequestHandler):
                     new_id = cur.lastrowid
                 log_activity(actor, "updated NTE field completion", "T&M NTE", bucket["name"], {"project_id": project_id, "bucket_id": bucket_id, "completion_percent": completion_percent, "report_date": data.get("report_date") or ""})
                 return json_response(self, {"id": new_id})
+            if parsed.path.startswith("/api/nte-additions/") and parsed.path.endswith("/signed"):
+                actor = current_user(self)
+                if not can_edit_permission(actor, "nte_tracking"):
+                    return json_response(self, {"error": "T&M NTE edit access required."}, 403)
+                addition_id = parsed.path.strip("/").split("/")[-2]
+                form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": self.headers.get("Content-Type")})
+                file_item = form["signed_file"] if "signed_file" in form else None
+                if file_item is None or not getattr(file_item, "filename", ""):
+                    return json_response(self, {"error": "Choose the signed approval file."}, 400)
+                safe_name = Path(file_item.filename).name
+                suffix = Path(safe_name).suffix.lower()
+                if suffix not in (".pdf", ".png", ".jpg", ".jpeg", ".webp"):
+                    return json_response(self, {"error": "Signed approval must be a PDF or image."}, 400)
+                saved_name = f"{datetime.now().strftime('%Y%m%d%H%M%S')}-nte-addition-signed-{safe_name}"
+                with db() as con:
+                    addition = con.execute(
+                        """
+                        SELECT a.id, a.project_id, b.name AS bucket_name
+                        FROM nte_bucket_additions a
+                        JOIN nte_buckets b ON b.id = a.bucket_id
+                        WHERE a.id = ?
+                        """,
+                        (addition_id,),
+                    ).fetchone()
+                    if not addition:
+                        return json_response(self, {"error": "Budget addition not found."}, 404)
+                    with open(UPLOAD_DIR / saved_name, "wb") as f:
+                        f.write(file_item.file.read())
+                    con.execute("UPDATE nte_bucket_additions SET signed_file = ? WHERE id = ?", (saved_name, addition_id))
+                log_activity(actor, "uploaded signed NTE budget addition approval", "T&M NTE", addition["bucket_name"], {"addition_id": addition_id, "signed_file": saved_name})
+                return json_response(self, {"ok": True, "signed_file": saved_name})
+            if parsed.path.startswith("/api/nte-reallocations/") and parsed.path.endswith("/signed"):
+                actor = current_user(self)
+                if not can_edit_permission(actor, "nte_tracking"):
+                    return json_response(self, {"error": "T&M NTE edit access required."}, 403)
+                reallocation_id = parsed.path.strip("/").split("/")[-2]
+                form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": self.headers.get("Content-Type")})
+                file_item = form["signed_file"] if "signed_file" in form else None
+                if file_item is None or not getattr(file_item, "filename", ""):
+                    return json_response(self, {"error": "Choose the signed approval file."}, 400)
+                safe_name = Path(file_item.filename).name
+                suffix = Path(safe_name).suffix.lower()
+                if suffix not in (".pdf", ".png", ".jpg", ".jpeg", ".webp"):
+                    return json_response(self, {"error": "Signed approval must be a PDF or image."}, 400)
+                saved_name = f"{datetime.now().strftime('%Y%m%d%H%M%S')}-nte-reallocation-signed-{safe_name}"
+                with db() as con:
+                    reallocation = con.execute(
+                        """
+                        SELECT r.id, r.project_id, from_b.name AS from_bucket_name, to_b.name AS to_bucket_name
+                        FROM nte_bucket_reallocations r
+                        JOIN nte_buckets from_b ON from_b.id = r.from_bucket_id
+                        JOIN nte_buckets to_b ON to_b.id = r.to_bucket_id
+                        WHERE r.id = ?
+                        """,
+                        (reallocation_id,),
+                    ).fetchone()
+                    if not reallocation:
+                        return json_response(self, {"error": "Budget reallocation not found."}, 404)
+                    with open(UPLOAD_DIR / saved_name, "wb") as f:
+                        f.write(file_item.file.read())
+                    con.execute("UPDATE nte_bucket_reallocations SET signed_file = ? WHERE id = ?", (saved_name, reallocation_id))
+                label = f"{reallocation['from_bucket_name']} -> {reallocation['to_bucket_name']}"
+                log_activity(actor, "uploaded signed NTE budget reallocation approval", "T&M NTE", label, {"reallocation_id": reallocation_id, "signed_file": saved_name})
+                return json_response(self, {"ok": True, "signed_file": saved_name})
             if parsed.path == "/api/nte-additions":
                 actor = current_user(self)
                 if not can_edit_permission(actor, "nte_tracking"):
