@@ -1310,6 +1310,27 @@ def init_db():
               created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS nte_bucket_reallocations (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+              from_bucket_id INTEGER NOT NULL REFERENCES nte_buckets(id) ON DELETE CASCADE,
+              to_bucket_id INTEGER NOT NULL REFERENCES nte_buckets(id) ON DELETE CASCADE,
+              amount REAL DEFAULT 0,
+              labor_amount REAL DEFAULT 0,
+              material_amount REAL DEFAULT 0,
+              equipment_amount REAL DEFAULT 0,
+              status TEXT DEFAULT 'Pending',
+              requested_date TEXT,
+              approved_date TEXT,
+              approver TEXT,
+              reason TEXT,
+              support_file TEXT,
+              notes TEXT,
+              created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+              created_by_username TEXT,
+              created_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS nte_completion_updates (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -2199,6 +2220,29 @@ def weighted_bid_value(outcome, bid_price, probability):
     return money(bid_price) * money(probability)
 
 
+def next_bid_rfq_no():
+    existing = rows("SELECT rfq_no FROM bid_requests")
+    used = set()
+    max_number = 1000
+    width = 4
+    for bid in existing:
+        rfq = str(bid.get("rfq_no") or "").strip()
+        if rfq:
+            used.add(rfq.upper())
+        match = re.search(r"RFQ\D*(\d+)$", rfq, flags=re.IGNORECASE)
+        if not match:
+            continue
+        number_text = match.group(1)
+        max_number = max(max_number, int(number_text))
+        width = max(width, len(number_text))
+    next_number = max_number + 1
+    while True:
+        candidate = f"RFQ-{next_number:0{width}d}"
+        if candidate.upper() not in used:
+            return candidate
+        next_number += 1
+
+
 def hash_password(password, salt=None):
     salt = salt or secrets.token_hex(16)
     digest = hashlib.pbkdf2_hmac("sha256", str(password).encode("utf-8"), salt.encode("utf-8"), 200000)
@@ -2794,8 +2838,15 @@ def money(value):
 def parse_money_text(value):
     if value is None:
         return 0.0
-    cleaned = re.sub(r"[^0-9.\-]", "", str(value))
-    return money(cleaned)
+    text = str(value).strip()
+    negative = bool(
+        re.search(r"\([^)]+\)", text)
+        or re.search(r"-\s*$", text)
+        or re.search(r"^\s*-", text)
+    )
+    cleaned = re.sub(r"[^0-9.]", "", text)
+    amount = money(cleaned)
+    return -abs(amount) if negative and amount else amount
 
 
 def first_regex(patterns, text, flags=re.IGNORECASE):
@@ -3888,6 +3939,7 @@ def bid_summary():
         "weighted_forecast": weighted_forecast,
         "win_rate": len(won) / (len(won) + len(lost)) if (won or lost) else 0,
         "avg_target_margin": sum(margins) / len(margins) if margins else 0,
+        "next_rfq_no": next_bid_rfq_no(),
         "open_count": len(open_bids),
         "stage": list(stage.values()),
         "estimator": list(estimator.values()),
@@ -5733,10 +5785,17 @@ def import_vendor_invoice_pdf(path, project_id):
                 break
     elif "border states" in lower:
         vendor = "Border States"
-        invoice_number = first_regex([r"Invoice:\s*([A-Za-z0-9\-]+)"], text, flags=re.IGNORECASE)
-        invoice_date = first_regex([r"Invoice:\s*[A-Za-z0-9\-]+\s+Date:\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{4})"], text, flags=re.IGNORECASE)
+        invoice_number = first_regex([r"Credit\s+memo:\s*([A-Za-z0-9\-]+)", r"Invoice:\s*([A-Za-z0-9\-]+)"], text, flags=re.IGNORECASE)
+        invoice_date = first_regex(
+            [
+                r"Credit\s+memo:\s*[A-Za-z0-9\-]+\s+Date:\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{4})",
+                r"Invoice:\s*[A-Za-z0-9\-]+\s+Date:\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{4})",
+            ],
+            text,
+            flags=re.IGNORECASE,
+        )
         order_number = first_regex([r"P\.O\.#:\s*(.+)"], text, flags=re.IGNORECASE)
-        total_due = parse_money_text(first_regex([r"Net Invoice Amount\s+\$\s*([0-9,]+\.[0-9]{2})", r"Total\s+\$\s*([0-9,]+\.[0-9]{2})"], text, flags=re.IGNORECASE))
+        total_due = parse_money_text(first_regex([r"Net Invoice Amount\s+\$\s*([0-9,]+\.[0-9]{2}-?)", r"Total\s+\$\s*([0-9,]+\.[0-9]{2}-?)"], text, flags=re.IGNORECASE))
         item_lines = []
         current = None
         for raw_line in text.splitlines():
@@ -5760,7 +5819,7 @@ def import_vendor_invoice_pdf(path, project_id):
             if not current:
                 continue
             batch = re.match(
-                r"^Batch Total:\s*([0-9,]+(?:\.[0-9]+)?)\s+([A-Za-z]+)\s+([0-9,]+(?:\.[0-9]+)?)\s+([0-9,]+\.[0-9]{2})\s*/\s*([0-9,]+(?:\.[0-9]+)?)\s+([A-Za-z]+)\s+([0-9,]+\.[0-9]{2})$",
+                r"^Batch Total:\s*([0-9,]+(?:\.[0-9]+)?)\s+([A-Za-z]+)\s+([0-9,]+(?:\.[0-9]+)?)\s+([0-9,]+\.[0-9]{2}-?)\s*/\s*([0-9,]+(?:\.[0-9]+)?)\s+([A-Za-z]+)\s+([0-9,]+\.[0-9]{2}-?)$",
                 line,
                 flags=re.IGNORECASE,
             )
@@ -6368,6 +6427,18 @@ def nte_summary(project_id, subproject_id=None, change_order_id=None, seed_defau
             """,
             (project_id, *target_params),
         ).fetchall()]
+        reallocations = [dict(r) for r in con.execute(
+            f"""
+            SELECT r.*, from_b.name AS from_bucket_name, to_b.name AS to_bucket_name
+            FROM nte_bucket_reallocations r
+            JOIN nte_buckets from_b ON from_b.id = r.from_bucket_id
+            JOIN nte_buckets to_b ON to_b.id = r.to_bucket_id
+            WHERE r.project_id = ?
+              {target_filter.replace("subproject_id", "from_b.subproject_id").replace("change_order_id", "from_b.change_order_id")}
+            ORDER BY r.created_at DESC, r.id DESC
+            """,
+            (project_id, *target_params),
+        ).fetchall()]
         panel_deliverables = [dict(r) for r in con.execute(
             """
             SELECT p.*, b.name AS bucket_name
@@ -6438,6 +6509,26 @@ def nte_summary(project_id, subproject_id=None, change_order_id=None, seed_defau
                 pending_bucket_allocations[addition["bucket_id"]]["Labor"] += money(addition.get("labor_amount"))
                 pending_bucket_allocations[addition["bucket_id"]]["Material"] += money(addition.get("material_amount"))
                 pending_bucket_allocations[addition["bucket_id"]]["Equipment"] += money(addition.get("equipment_amount"))
+    reallocations_by_bucket = {}
+    pending_reallocation_allocations = {}
+    for reallocation in reallocations:
+        if reallocation.get("status") == "Approved":
+            from_bucket_id = reallocation["from_bucket_id"]
+            to_bucket_id = reallocation["to_bucket_id"]
+            amount = money(reallocation["amount"])
+            labor_amount = money(reallocation.get("labor_amount"))
+            material_amount = money(reallocation.get("material_amount"))
+            equipment_amount = money(reallocation.get("equipment_amount"))
+            reallocations_by_bucket[from_bucket_id] = reallocations_by_bucket.get(from_bucket_id, 0) - amount
+            reallocations_by_bucket[to_bucket_id] = reallocations_by_bucket.get(to_bucket_id, 0) + amount
+            pending_reallocation_allocations.setdefault(from_bucket_id, {"Labor": 0, "Material": 0, "Equipment": 0})
+            pending_reallocation_allocations.setdefault(to_bucket_id, {"Labor": 0, "Material": 0, "Equipment": 0})
+            pending_reallocation_allocations[from_bucket_id]["Labor"] -= labor_amount
+            pending_reallocation_allocations[from_bucket_id]["Material"] -= material_amount
+            pending_reallocation_allocations[from_bucket_id]["Equipment"] -= equipment_amount
+            pending_reallocation_allocations[to_bucket_id]["Labor"] += labor_amount
+            pending_reallocation_allocations[to_bucket_id]["Material"] += material_amount
+            pending_reallocation_allocations[to_bucket_id]["Equipment"] += equipment_amount
     allocation_targets = {}
     for sub in sub_rows:
         target_map = allocation_targets.setdefault(sub["bucket_id"], {})
@@ -6448,28 +6539,34 @@ def nte_summary(project_id, subproject_id=None, change_order_id=None, seed_defau
             target_map["Material"] = sub["id"]
         elif cost_type == "Equipment" and "Equipment" not in target_map:
             target_map["Equipment"] = sub["id"]
-    by_bucket = {b["id"]: {**b, "subbuckets": [], "original_budget": 0, "approved_additions": 0, "current_budget": 0, "actual_cost": 0, "remaining": 0, "labor_hours_budget": 0, "labor_hours_used": 0, "labor_hours_remaining": 0, "unproductive_labor_hours": 0} for b in bucket_rows}
+    by_bucket = {b["id"]: {**b, "subbuckets": [], "original_budget": 0, "approved_additions": 0, "approved_reallocations": 0, "current_budget": 0, "actual_cost": 0, "remaining": 0, "labor_hours_budget": 0, "labor_hours_used": 0, "labor_hours_remaining": 0, "unproductive_labor_hours": 0} for b in bucket_rows}
     for sub in sub_rows:
         approved = additions_by_sub.get(sub["id"], 0)
         bucket_allocations = pending_bucket_allocations.get(sub["bucket_id"], {})
+        reallocated = 0
+        reallocation_allocations = pending_reallocation_allocations.get(sub["bucket_id"], {})
         target_map = allocation_targets.get(sub["bucket_id"], {})
         if target_map.get("Labor") == sub["id"]:
             approved += bucket_allocations.get("Labor", 0)
+            reallocated += reallocation_allocations.get("Labor", 0)
         if target_map.get("Material") == sub["id"]:
             approved += bucket_allocations.get("Material", 0)
+            reallocated += reallocation_allocations.get("Material", 0)
         if target_map.get("Equipment") == sub["id"]:
             approved += bucket_allocations.get("Equipment", 0)
+            reallocated += reallocation_allocations.get("Equipment", 0)
         actual = actuals.get(sub["id"], 0)
         labor_hours_budget = money(sub.get("labor_hours_budget")) if sub.get("cost_type") == "Labor" else 0
         labor_hours_used = labor_hours_actuals.get(sub["id"], 0) if sub.get("cost_type") == "Labor" else 0
         unproductive_hours = unproductive_labor_hours.get(sub["id"], 0) if sub.get("cost_type") == "Labor" else 0
-        current = money(sub["original_budget"]) + approved
-        item = {**sub, "approved_additions": approved, "current_budget": current, "actual_cost": actual, "remaining": current - actual, "labor_hours_budget": labor_hours_budget, "labor_hours_used": labor_hours_used, "labor_hours_remaining": labor_hours_budget - labor_hours_used, "unproductive_labor_hours": unproductive_hours}
+        current = money(sub["original_budget"]) + approved + reallocated
+        item = {**sub, "approved_additions": approved, "approved_reallocations": reallocated, "current_budget": current, "actual_cost": actual, "remaining": current - actual, "labor_hours_budget": labor_hours_budget, "labor_hours_used": labor_hours_used, "labor_hours_remaining": labor_hours_budget - labor_hours_used, "unproductive_labor_hours": unproductive_hours}
         bucket = by_bucket.get(sub["bucket_id"])
         if bucket:
             bucket["subbuckets"].append(item)
             bucket["original_budget"] += money(sub["original_budget"])
             bucket["approved_additions"] += approved
+            bucket["approved_reallocations"] += reallocated
             bucket["actual_cost"] += actual
             bucket["labor_hours_budget"] += labor_hours_budget
             bucket["labor_hours_used"] += labor_hours_used
@@ -6477,7 +6574,9 @@ def nte_summary(project_id, subproject_id=None, change_order_id=None, seed_defau
     completions = nte_completion_by_bucket(project_id)
     for bucket in by_bucket.values():
         bucket["approved_additions"] = max(bucket["approved_additions"], additions_by_bucket.get(bucket["id"], bucket["approved_additions"]))
-        bucket["current_budget"] = bucket["original_budget"] + bucket["approved_additions"]
+        if bucket["id"] in reallocations_by_bucket:
+            bucket["approved_reallocations"] = reallocations_by_bucket[bucket["id"]]
+        bucket["current_budget"] = bucket["original_budget"] + bucket["approved_additions"] + bucket["approved_reallocations"]
         bucket["remaining"] = bucket["current_budget"] - bucket["actual_cost"]
         bucket["labor_hours_remaining"] = bucket["labor_hours_budget"] - bucket["labor_hours_used"]
         bucket["completion"] = completions.get(bucket["id"], {"completion_percent": 0, "report_date": "", "notes": "", "created_by_username": "", "created_at": ""})
@@ -6518,7 +6617,7 @@ def nte_summary(project_id, subproject_id=None, change_order_id=None, seed_defau
         panel["completed_panels"] = completed_panels
         panel["remaining_panels"] = max(0, total_panels - completed_panels)
         panel["completion_percent"] = round((completed_panels / total_panels) * 100, 1) if total_panels > 0 else 0
-    return {"buckets": list(by_bucket.values()), "additions": additions, "panel_deliverables": panel_deliverables}
+    return {"buckets": list(by_bucket.values()), "additions": additions, "reallocations": reallocations, "panel_deliverables": panel_deliverables}
 
 
 def nte_rule_suggestion(con, record):
@@ -7799,6 +7898,30 @@ HTML = r"""
         <h2>Addition History</h2>
         <div class="table-wrap"><table id="nteAdditionTable"></table></div>
       </div>
+      <form class="panel" id="nteReallocationForm" style="margin-top:14px">
+        <h2>Documented Budget Reallocation</h2>
+        <p class="muted">Use this to move existing NTE budget between main buckets without changing the total NTE. Attach backup so the transfer is traceable later.</p>
+        <div class="grid cols-4">
+          <div><label>From Bucket</label><select name="from_bucket_id" id="nteReallocationFromBucket"></select></div>
+          <div><label>To Bucket</label><select name="to_bucket_id" id="nteReallocationToBucket"></select></div>
+          <div><label>Labor Transfer</label><input name="labor_amount" type="number" step="0.01" value="0"></div>
+          <div><label>Material Transfer</label><input name="material_amount" type="number" step="0.01" value="0"></div>
+          <div><label>Equipment Transfer</label><input name="equipment_amount" type="number" step="0.01" value="0"></div>
+          <div><label>Total Transfer</label><input name="amount" id="nteReallocationAmount" type="number" step="0.01" value="0" readonly></div>
+          <div><label>Status</label><select name="status"><option>Pending</option><option>Approved</option><option>Rejected</option></select></div>
+          <div><label>Requested Date</label><input name="requested_date" type="date"></div>
+          <div><label>Approved Date</label><input name="approved_date" type="date"></div>
+          <div><label>Approver</label><input name="approver" placeholder="Customer / internal approval"></div>
+          <div><label>Backup Document</label><input name="support_file" type="file" accept=".pdf,.png,.jpg,.jpeg,.webp,.xlsx,.xlsm"></div>
+        </div>
+        <label>Reason</label><input name="reason" placeholder="Why budget moved between buckets">
+        <label>Notes</label><textarea name="notes" placeholder="Internal notes"></textarea>
+        <div class="actions"><button class="btn primary" type="submit">Add Reallocation</button></div>
+      </form>
+      <div class="panel" style="margin-top:14px">
+        <h2>Reallocation History</h2>
+        <div class="table-wrap"><table id="nteReallocationTable"></table></div>
+      </div>
       <div class="panel" id="nteCodingPanel" style="margin-top:14px">
         <h2>Field Wise NTE Coding</h2>
         <p class="muted">Only unfinished Field Wise NTE lines show here. Use Remember to teach the app how similar lines should be coded next time.</p>
@@ -7955,7 +8078,7 @@ HTML = r"""
       <form class="panel" id="bidForm" style="margin-top:14px">
         <h2>Add Bid / RFQ</h2>
         <div class="grid cols-4">
-          <div><label>RFQ No.</label><input name="rfq_no" placeholder="RFQ-1012" required></div>
+          <div><label>RFQ No.</label><input name="rfq_no" placeholder="Auto generated" readonly required></div>
           <div><label>Date Received</label><input name="date_received" type="date"></div>
           <div><label>Customer</label><input name="customer"></div>
           <div><label>Project Name</label><input name="project_name" required></div>
@@ -8208,7 +8331,7 @@ HTML = r"""
     let projectPoRows = [];
     let customerDashboardData = null;
     let nteTargets = [];
-    let nteData = { buckets: [], additions: [], panel_deliverables: [] };
+    let nteData = { buckets: [], additions: [], reallocations: [], panel_deliverables: [] };
     let nteCosts = [];
     let nteRules = [];
     let rolePermissionsData = null;
@@ -11779,7 +11902,7 @@ HTML = r"""
 
     function renderNteBucketSelectors() {
       const bucketOptions = (nteData.buckets || []).map(b => `<option value="${b.id}">${htmlEscape(b.name)}</option>`).join('');
-      ['nteSubbucketBucket','nteAdditionBucket','ntePanelBucket'].forEach(id => {
+      ['nteSubbucketBucket','nteAdditionBucket','ntePanelBucket','nteReallocationFromBucket','nteReallocationToBucket'].forEach(id => {
         const el = document.getElementById(id);
         if (el) el.innerHTML = bucketOptions || '<option value="">Create a bucket first</option>';
       });
@@ -11795,6 +11918,7 @@ HTML = r"""
       const buckets = nteData.buckets || [];
       const original = buckets.reduce((sum, b) => sum + Number(b.original_budget || 0), 0);
       const additions = buckets.reduce((sum, b) => sum + Number(b.approved_additions || 0), 0);
+      const reallocations = buckets.reduce((sum, b) => sum + Math.abs(Number(b.approved_reallocations || 0)), 0) / 2;
       const current = buckets.reduce((sum, b) => sum + Number(b.current_budget || 0), 0);
       const actual = buckets.reduce((sum, b) => sum + Number(b.actual_cost || 0), 0);
       const remaining = current - actual;
@@ -11810,6 +11934,7 @@ HTML = r"""
         <div class="panel kpi"><div class="label">Avg Field Completion</div><div class="value">${avgCompletion.toFixed(1)}%</div><div class="hint">Average of main buckets</div></div>
         <div class="panel kpi"><div class="label">Original Budget</div><div class="value">${money(original)}</div><div class="hint">Sub-bucket starting budgets</div></div>
         <div class="panel kpi"><div class="label">Approved Additions</div><div class="value">${money(additions)}</div><div class="hint">Approved documented increases</div></div>
+        <div class="panel kpi"><div class="label">Approved Transfers</div><div class="value">${money(reallocations)}</div><div class="hint">Budget moved between buckets</div></div>
         <div class="panel kpi"><div class="label">Actual Cost</div><div class="value">${money(actual)}</div><div class="hint">Assigned cost records</div></div>
         <div class="panel kpi"><div class="label">Remaining NTE</div><div class="value ${remaining < 0 ? 'bad' : 'good'}">${money(remaining)}</div><div class="hint">Current budget less actual cost</div></div>
         <div class="panel kpi"><div class="label">Estimated Cost to Completion</div><div class="value ${projectedBuckets.length && estimatedVariance < 0 ? 'bad' : ''}">${projectedBuckets.length ? money(estimatedAtCompletion) : 'Needs field %'}</div><div class="hint">${projectedBuckets.length ? `${money(estimatedVariance)} projected variance` : 'Enter field completion per bucket'}</div></div>
@@ -11835,13 +11960,14 @@ HTML = r"""
         return;
       }
       tableEl.innerHTML = `
-        <thead><tr><th>Bucket / Sub-Bucket</th><th>Type</th><th>Original</th><th>Additions</th><th>Current Budget</th><th>Actual</th><th>Remaining</th><th>Estimated Cost to Completion</th><th>Labor Hours</th><th>Unproductive</th><th>Field Completion</th><th>Description</th><th></th></tr></thead>
+        <thead><tr><th>Bucket / Sub-Bucket</th><th>Type</th><th>Original</th><th>Additions</th><th>Transfers</th><th>Current Budget</th><th>Actual</th><th>Remaining</th><th>Estimated Cost to Completion</th><th>Labor Hours</th><th>Unproductive</th><th>Field Completion</th><th>Description</th><th></th></tr></thead>
         <tbody>${buckets.map(bucket => `
           <tr class="invoice-summary">
             <td><input data-nte-bucket="${bucket.id}" data-field="name" value="${htmlEscape(bucket.name || '')}"></td>
             <td>Bucket</td>
             <td>${money(bucket.original_budget)}</td>
             <td>${money(bucket.approved_additions)}</td>
+            <td class="${Number(bucket.approved_reallocations || 0) < 0 ? 'bad' : Number(bucket.approved_reallocations || 0) > 0 ? 'good' : ''}">${money(bucket.approved_reallocations)}</td>
             <td>${money(bucket.current_budget)}</td>
             <td>${money(bucket.actual_cost)}</td>
             <td class="${Number(bucket.remaining || 0) < 0 ? 'bad' : ''}">${money(bucket.remaining)}</td>
@@ -11870,6 +11996,7 @@ HTML = r"""
               <td><select data-nte-sub="${sub.id}" data-field="cost_type">${['Labor','Material','Field Ticket Material','Equipment','Rental','Other'].map(v => `<option ${sub.cost_type === v ? 'selected' : ''}>${v}</option>`).join('')}</select></td>
               <td><input data-nte-sub="${sub.id}" data-field="original_budget" type="number" step="0.01" value="${Number(sub.original_budget || 0).toFixed(2)}"></td>
               <td>${money(sub.approved_additions)}</td>
+              <td class="${Number(sub.approved_reallocations || 0) < 0 ? 'bad' : Number(sub.approved_reallocations || 0) > 0 ? 'good' : ''}">${money(sub.approved_reallocations)}</td>
               <td>${money(sub.current_budget)}</td>
               <td>${money(sub.actual_cost)}</td>
               <td class="${Number(sub.remaining || 0) < 0 ? 'bad' : ''}">${money(sub.remaining)}</td>
@@ -11994,6 +12121,40 @@ HTML = r"""
 
     function updateNteAdditionTotal() {
       const form = document.getElementById('nteAdditionForm');
+      if (!form) return;
+      const total = ['labor_amount', 'material_amount', 'equipment_amount']
+        .reduce((sum, name) => sum + Number(form.elements[name]?.value || 0), 0);
+      if (form.elements.amount) form.elements.amount.value = total.toFixed(2);
+    }
+
+    function renderNteReallocations() {
+      const tableEl = document.getElementById('nteReallocationTable');
+      if (!tableEl) return;
+      const reallocations = nteData.reallocations || [];
+      if (!reallocations.length) {
+        tableEl.innerHTML = '<tbody><tr><td>No budget reallocations have been entered yet.</td></tr></tbody>';
+        return;
+      }
+      tableEl.innerHTML = `<thead><tr><th>Created</th><th>From</th><th>To</th><th>Status</th><th>Total</th><th>Labor</th><th>Material</th><th>Equipment</th><th>Requested</th><th>Approved</th><th>Approver</th><th>Backup</th><th>Reason</th></tr></thead>
+        <tbody>${reallocations.map(r => `<tr>
+          <td>${htmlEscape((r.created_at || '').replace('T', ' '))}<div class="muted">${htmlEscape(r.created_by_username || '')}</div></td>
+          <td>${htmlEscape(r.from_bucket_name || '')}</td>
+          <td>${htmlEscape(r.to_bucket_name || '')}</td>
+          <td>${htmlEscape(r.status || '')}</td>
+          <td>${money(r.amount)}</td>
+          <td>${money(r.labor_amount)}</td>
+          <td>${money(r.material_amount)}</td>
+          <td>${money(r.equipment_amount)}</td>
+          <td>${htmlEscape(r.requested_date || '')}</td>
+          <td>${htmlEscape(r.approved_date || '')}</td>
+          <td>${htmlEscape(r.approver || '')}</td>
+          <td>${r.support_file ? pdfLink({ source_file: r.support_file }) : '<span class="muted">None</span>'}</td>
+          <td>${htmlEscape(r.reason || '')}</td>
+        </tr>`).join('')}</tbody>`;
+    }
+
+    function updateNteReallocationTotal() {
+      const form = document.getElementById('nteReallocationForm');
       if (!form) return;
       const total = ['labor_amount', 'material_amount', 'equipment_amount']
         .reduce((sum, name) => sum + Number(form.elements[name]?.value || 0), 0);
@@ -12162,7 +12323,7 @@ HTML = r"""
         : 'No T&M NTE jobs have been set up in this master project yet.';
       if (!nteTargets.length) {
         if (resultEl) resultEl.textContent = 'Set a subproject or change order pricing method to T&M NTE in Setup to start tracking buckets.';
-        nteData = { buckets: [], additions: [], panel_deliverables: [] };
+        nteData = { buckets: [], additions: [], reallocations: [], panel_deliverables: [] };
         nteCosts = [];
         nteRules = [];
         renderNteSummary();
@@ -12170,6 +12331,7 @@ HTML = r"""
         renderNteBuckets();
         renderNtePanels();
         renderNteAdditions();
+        renderNteReallocations();
         renderNteCosts();
         renderNteRules();
         return;
@@ -12184,6 +12346,7 @@ HTML = r"""
       renderNteBuckets();
       renderNtePanels();
       renderNteAdditions();
+      renderNteReallocations();
       renderNteCosts();
       renderNteRules();
     }
@@ -12278,6 +12441,21 @@ HTML = r"""
       await api('/api/nte-additions', { method:'POST', body: formData });
       event.target.reset();
       updateNteAdditionTotal();
+      markSaved();
+      await loadNteTracking(false);
+    };
+    document.querySelectorAll('#nteReallocationForm input[name="labor_amount"], #nteReallocationForm input[name="material_amount"], #nteReallocationForm input[name="equipment_amount"]').forEach(el => {
+      el.oninput = updateNteReallocationTotal;
+      el.onchange = updateNteReallocationTotal;
+    });
+    document.getElementById('nteReallocationForm').onsubmit = async event => {
+      event.preventDefault();
+      updateNteReallocationTotal();
+      const formData = new FormData(event.target);
+      formData.set('project_id', state.projectId);
+      await api('/api/nte-reallocations', { method:'POST', body: formData });
+      event.target.reset();
+      updateNteReallocationTotal();
       markSaved();
       await loadNteTracking(false);
     };
@@ -12807,6 +12985,7 @@ HTML = r"""
 
     async function loadBidDashboard() {
       const summary = await api('/api/bid-summary');
+      setNextBidRfq(summary.next_rfq_no);
       document.getElementById('bidKpis').innerHTML = `
         <div class="panel kpi"><div class="label">Open Pipeline</div><div class="value">${money(summary.open_pipeline)}</div><div class="hint">${summary.open_count} open RFQ(s)</div></div>
         <div class="panel kpi"><div class="label">Weighted Forecast</div><div class="value">${money(summary.weighted_forecast)}</div></div>
@@ -12859,6 +13038,21 @@ HTML = r"""
       draw();
     }
 
+    async function setNextBidRfq(rfqNo='') {
+      const form = document.getElementById('bidForm');
+      const rfqInput = form?.elements?.rfq_no;
+      if (!rfqInput) return;
+      if (!rfqNo) {
+        try {
+          const next = await api('/api/bids/next-rfq');
+          rfqNo = next.rfq_no || '';
+        } catch (err) {
+          console.error(err);
+        }
+      }
+      if (rfqNo) rfqInput.value = rfqNo;
+    }
+
     function wireBidSaves(scope=document) {
       scope.querySelectorAll('[data-bid]').forEach(el => {
         el.oninput = () => el.closest('tr')?.classList.add('bid-dirty');
@@ -12869,10 +13063,14 @@ HTML = r"""
           const id = btn.dataset.saveBid;
           const fields = {};
           scope.querySelectorAll(`[data-bid="${id}"]`).forEach(el => fields[el.dataset.field] = el.value);
-          await api(`/api/bids/${id}`, { method:'PUT', body: JSON.stringify(fields) });
-          btn.closest('tr')?.classList.remove('bid-dirty');
-          markSaved();
-          await loadBidDashboard();
+          try {
+            await api(`/api/bids/${id}`, { method:'PUT', body: JSON.stringify(fields) });
+            btn.closest('tr')?.classList.remove('bid-dirty');
+            markSaved();
+            await loadBidDashboard();
+          } catch (err) {
+            window.alert(err.message || 'Unable to save bid.');
+          }
         };
       });
     }
@@ -13399,10 +13597,15 @@ HTML = r"""
     };
     document.getElementById('bidForm').onsubmit = async e => {
       e.preventDefault();
-      await api('/api/bids', { method:'POST', body: JSON.stringify(formDataObj(e.target)) });
-      e.target.reset();
-      markSaved();
-      await loadBidDashboard();
+      try {
+        await api('/api/bids', { method:'POST', body: JSON.stringify(formDataObj(e.target)) });
+        e.target.reset();
+        markSaved();
+        await loadBidDashboard();
+      } catch (err) {
+        window.alert(err.message || 'Unable to add bid.');
+        await setNextBidRfq();
+      }
     };
     document.getElementById('userForm').onsubmit = async e => {
       e.preventDefault();
@@ -13895,6 +14098,8 @@ class Handler(BaseHTTPRequestHandler):
                 return json_response(self, home_alerts())
             if parsed.path == "/api/bid-summary":
                 return json_response(self, bid_summary())
+            if parsed.path == "/api/bids/next-rfq":
+                return json_response(self, {"rfq_no": next_bid_rfq_no()})
             if parsed.path == "/api/mcc-quote-items":
                 if not can_view_permission(user, "mcc_quotes") and not can_view_permission(user, "mcc_quote_setup"):
                     return json_response(self, {"error": "Quoting access required."}, 403)
@@ -14341,6 +14546,74 @@ class Handler(BaseHTTPRequestHandler):
                         ),
                     )
                 log_activity(actor, "added NTE budget addition", "T&M NTE", bucket["name"], {"amount": amount, "labor_amount": labor_amount, "material_amount": material_amount, "equipment_amount": equipment_amount, "status": form.getfirst("status") or "Pending", "support_file": saved_name})
+                return json_response(self, {"id": cur.lastrowid, "support_file": saved_name})
+            if parsed.path == "/api/nte-reallocations":
+                actor = current_user(self)
+                if not can_edit_permission(actor, "nte_tracking"):
+                    return json_response(self, {"error": "T&M NTE edit access required."}, 403)
+                form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": self.headers.get("Content-Type")})
+                project_id = form.getfirst("project_id")
+                from_bucket_id = form.getfirst("from_bucket_id")
+                to_bucket_id = form.getfirst("to_bucket_id")
+                labor_amount = money(form.getfirst("labor_amount"))
+                material_amount = money(form.getfirst("material_amount"))
+                equipment_amount = money(form.getfirst("equipment_amount"))
+                amount = labor_amount + material_amount + equipment_amount
+                if not project_id or not from_bucket_id or not to_bucket_id:
+                    return json_response(self, {"error": "Choose both a from bucket and a to bucket."}, 400)
+                if str(from_bucket_id) == str(to_bucket_id):
+                    return json_response(self, {"error": "Choose two different buckets for a reallocation."}, 400)
+                if labor_amount < 0 or material_amount < 0 or equipment_amount < 0:
+                    return json_response(self, {"error": "Transfer amounts must be zero or greater."}, 400)
+                if amount <= 0:
+                    return json_response(self, {"error": "Enter at least one Labor, Material, or Equipment transfer amount."}, 400)
+                file_item = form["support_file"] if "support_file" in form else None
+                saved_name = ""
+                if file_item is not None and getattr(file_item, "filename", ""):
+                    safe_name = Path(file_item.filename).name
+                    suffix = Path(safe_name).suffix.lower()
+                    if suffix not in (".pdf", ".png", ".jpg", ".jpeg", ".webp", ".xlsx", ".xlsm"):
+                        return json_response(self, {"error": "Backup must be a PDF, image, or Excel file."}, 400)
+                    saved_name = f"{datetime.now().strftime('%Y%m%d%H%M%S')}-nte-reallocation-{safe_name}"
+                    with open(UPLOAD_DIR / saved_name, "wb") as f:
+                        f.write(file_item.file.read())
+                now = datetime.now().isoformat(timespec="seconds")
+                with db() as con:
+                    from_bucket = con.execute("SELECT id, name FROM nte_buckets WHERE id = ? AND project_id = ?", (from_bucket_id, project_id)).fetchone()
+                    to_bucket = con.execute("SELECT id, name FROM nte_buckets WHERE id = ? AND project_id = ?", (to_bucket_id, project_id)).fetchone()
+                    if not from_bucket or not to_bucket:
+                        return json_response(self, {"error": "Both buckets must belong to the selected project."}, 400)
+                    cur = con.execute(
+                        """
+                        INSERT INTO nte_bucket_reallocations (
+                          project_id, from_bucket_id, to_bucket_id, amount, labor_amount, material_amount, equipment_amount, status, requested_date,
+                          approved_date, approver, reason, support_file, notes,
+                          created_by_user_id, created_by_username, created_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            project_id,
+                            from_bucket_id,
+                            to_bucket_id,
+                            amount,
+                            labor_amount,
+                            material_amount,
+                            equipment_amount,
+                            form.getfirst("status") or "Pending",
+                            form.getfirst("requested_date") or "",
+                            form.getfirst("approved_date") or "",
+                            form.getfirst("approver") or "",
+                            form.getfirst("reason") or "",
+                            saved_name,
+                            form.getfirst("notes") or "",
+                            actor["id"] if actor else None,
+                            actor["username"] if actor else "",
+                            now,
+                        ),
+                    )
+                label = f"{from_bucket['name']} -> {to_bucket['name']}"
+                log_activity(actor, "added NTE budget reallocation", "T&M NTE", label, {"amount": amount, "labor_amount": labor_amount, "material_amount": material_amount, "equipment_amount": equipment_amount, "status": form.getfirst("status") or "Pending", "support_file": saved_name})
                 return json_response(self, {"id": cur.lastrowid, "support_file": saved_name})
             if parsed.path == "/api/nte-defaults":
                 actor = current_user(self)
@@ -15369,6 +15642,9 @@ class Handler(BaseHTTPRequestHandler):
                 bid_price = bid_price_value(estimated_cost, target_margin)
                 outcome = data.get("outcome") or "Pending"
                 weighted = weighted_bid_value(outcome, bid_price, probability)
+                rfq_no = str(data.get("rfq_no") or "").strip() or next_bid_rfq_no()
+                if one("SELECT id FROM bid_requests WHERE upper(rfq_no) = upper(?)", (rfq_no,)):
+                    return json_response(self, {"error": f"{rfq_no} already exists. Use the next available RFQ number."}, 409)
                 new_id = execute(
                     """
                     INSERT INTO bid_requests (
@@ -15379,7 +15655,7 @@ class Handler(BaseHTTPRequestHandler):
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        data.get("rfq_no"),
+                        rfq_no,
                         data.get("date_received"),
                         data.get("customer"),
                         data.get("project_name"),
@@ -16403,6 +16679,11 @@ class Handler(BaseHTTPRequestHandler):
                 bid_price = bid_price_value(estimated_cost, target_margin, data.get("bid_price"))
                 outcome = data.get("outcome") or "Pending"
                 weighted = weighted_bid_value(outcome, bid_price, probability)
+                rfq_no = str(data.get("rfq_no") or "").strip()
+                if not rfq_no:
+                    return json_response(self, {"error": "RFQ No. is required."}, 400)
+                if one("SELECT id FROM bid_requests WHERE upper(rfq_no) = upper(?) AND id <> ?", (rfq_no, bid_id)):
+                    return json_response(self, {"error": f"{rfq_no} already exists on another bid."}, 409)
                 execute(
                     """
                     UPDATE bid_requests
@@ -16413,7 +16694,7 @@ class Handler(BaseHTTPRequestHandler):
                     WHERE id = ?
                     """,
                     (
-                        data.get("rfq_no"),
+                        rfq_no,
                         data.get("date_received"),
                         data.get("customer"),
                         data.get("project_name"),
