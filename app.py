@@ -4305,6 +4305,8 @@ def home_alerts():
         SELECT COUNT(*) AS count, COALESCE(SUM(COALESCE(bid_price, 0)), 0) AS value
         FROM bid_requests
         WHERE COALESCE(outcome, 'Pending') NOT IN ('Won', 'Lost')
+          AND COALESCE(outcome, 'Pending') NOT IN ('Pending', 'Submitted')
+          AND COALESCE(stage, '') NOT IN ('Pending', 'Submitted')
           AND COALESCE(go_no_go, '') <> 'No Go'
           AND TRIM(COALESCE(bid_due_date, '')) <> ''
           AND bid_due_date < ?
@@ -6059,6 +6061,44 @@ def import_vendor_invoice_pdf(path, project_id):
                 current["description"] += " " + line
         if current and parse_money_text(current.get("amount")):
             item_lines.append(current)
+    elif "crescent electric" in lower or "crescentelectric.com" in lower:
+        vendor = "Crescent Electric"
+        invoice_number = first_regex(
+            [
+                r"INVOICE\s+DATE\s+CUSTOMER\s+NO\.\s+INVOICE\s+NO\.\s*\n\s*[0-9/]+\s+[0-9]+\s+([A-Za-z0-9.\-]+)",
+                r"INVOICE\s+NUMBER\s+([A-Za-z0-9.\-]+)",
+                r"\b([A-Z][0-9]{9}\.[0-9]{3})\b",
+            ],
+            text,
+            flags=re.IGNORECASE,
+        )
+        invoice_date = date_text(first_regex([r"\b([0-9]{1,2}/[0-9]{1,2}/[0-9]{2})\s+[0-9]+\s+" + re.escape(invoice_number)], text, flags=re.IGNORECASE)) if invoice_number else ""
+        if not invoice_date:
+            invoice_date = date_text(first_regex([r"INVOICE\s+DATE\s+([0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4})", r"\b([0-9]{1,2}/[0-9]{1,2}/[0-9]{2})\s+[0-9]+\s+[A-Za-z0-9.\-]+"], text, flags=re.IGNORECASE))
+        order_number = first_regex(
+            [
+                r"ORDERED\s+BY\s+CUST\s+PO\s+ORDER\s+DATE\s+REFERENCE\s*\n.*?\s+([A-Za-z0-9\-]+)\s+[0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4}",
+                r"CUST\s+PO\s+([A-Za-z0-9\-]+)",
+            ],
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        total_due = parse_money_text(first_regex([r"INVOICE\s+TOTAL\s+\$?([0-9,]+\.[0-9]{2})", r"TOTAL\s+AMOUNT\s*\n?.*?\$?([0-9,]+\.[0-9]{2})"], text, flags=re.IGNORECASE | re.DOTALL))
+        item_lines = []
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            match = re.match(r"^([0-9.]+)\s+ea\s+([0-9.]+)\s+ea\s+(.+?)\s+\$?([0-9,]+\.[0-9]{2,4})/ea\s+\$?([0-9,]+\.[0-9]{2})$", line, flags=re.IGNORECASE)
+            if not match:
+                continue
+            ordered_qty, shipped_qty, description, unit_price, extension = match.groups()
+            item_lines.append({
+                "product_code": description.split()[0] if description.split() else "Crescent Item",
+                "description": description,
+                "qty": shipped_qty or ordered_qty,
+                "unit_price": unit_price,
+                "amount": extension,
+            })
+            break
     elif "mccody" in lower or "fromthedirtup" in lower:
         vendor = "McCody Concrete Products"
         header = re.search(
@@ -6243,6 +6283,7 @@ def extract_vendor_invoice_total(path):
     if not text:
         return 0.0
     patterns = [
+        r"INVOICE\s+TOTAL\s+\$?([0-9,]+\.[0-9]{2})",
         r"Amount Due\s+\$?([0-9,]+\.[0-9]{2})",
         r"TOTAL\s+DUE\s*[-=]*>?\s*\$?([0-9,]+\.[0-9]{2})",
         r"TOTALDUE\s*\n?\s*\$?([0-9,]+\.[0-9]{2})",
