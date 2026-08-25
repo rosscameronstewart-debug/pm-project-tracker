@@ -600,6 +600,7 @@ def nte_weekly_report_html(project_id):
     data = nte_summary(project_id, all_targets=True)
     buckets = data.get("buckets", [])
     additions = data.get("additions", [])
+    reallocations = data.get("reallocations", [])
     panel_deliverables = data.get("panel_deliverables", [])
     save_nte_weekly_kpi_snapshot(project_id, data)
     kpi_history = nte_kpi_history(project_id)
@@ -724,6 +725,49 @@ def nte_weekly_report_html(project_id):
         <table>
           <thead><tr><th>Created</th><th>Bucket / Sub-Bucket</th><th>Status</th><th>Amount</th><th>Split</th><th>Dates</th><th>Approver</th><th>Reason / Backup</th></tr></thead>
           <tbody>{''.join(addition_rows) or '<tr><td colspan="8">No budget additions have been entered for this report.</td></tr>'}</tbody>
+        </table>
+      </section>
+    """
+    reallocation_rows = []
+    for reallocation in reallocations:
+        backup = ""
+        if reallocation.get("support_file"):
+            safe_name = quote(reallocation.get("support_file"))
+            backup = f'<div><a href="/uploads/{safe_name}" target="_blank" rel="noopener">Backup</a></div>'
+        reallocation_rows.append(
+            f"""
+            <tr>
+              <td>{html_escape((reallocation.get("created_at") or "").replace("T", " "))}</td>
+              <td><strong>{html_escape(reallocation.get("from_bucket_name") or "")}</strong></td>
+              <td><strong>{html_escape(reallocation.get("to_bucket_name") or "")}</strong></td>
+              <td>{html_escape(reallocation.get("status") or "")}</td>
+              <td>{dollars(reallocation.get("amount"))}</td>
+              <td>
+                <div>Labor: {dollars(reallocation.get("labor_amount"))}</div>
+                <div>Material: {dollars(reallocation.get("material_amount"))}</div>
+                <div>Equipment: {dollars(reallocation.get("equipment_amount"))}</div>
+              </td>
+              <td>{html_escape(reallocation.get("requested_date") or "")}<div class="muted">Approved {html_escape(reallocation.get("approved_date") or "")}</div></td>
+              <td>{html_escape(reallocation.get("approver") or "")}</td>
+              <td>{html_escape(reallocation.get("reason") or "")}<div class="muted">{html_escape(reallocation.get("notes") or "")}</div>{backup}</td>
+            </tr>
+            """
+        )
+    reallocations_section = f"""
+      <section class="bucket">
+        <div class="bucket-head">
+          <div>
+            <h2>Budget Reallocations</h2>
+            <p>Documented transfers of existing NTE budget between main buckets. Approved transfers move budget but do not increase the total NTE.</p>
+          </div>
+          <div>
+            <div class="label">Transfer Total</div>
+            <div class="value">{dollars(sum(money(r.get("amount")) for r in reallocations))}</div>
+          </div>
+        </div>
+        <table>
+          <thead><tr><th>Created</th><th>From Bucket</th><th>To Bucket</th><th>Status</th><th>Amount</th><th>Split</th><th>Dates</th><th>Approver</th><th>Reason / Backup</th></tr></thead>
+          <tbody>{''.join(reallocation_rows) or '<tr><td colspan="9">No budget reallocations have been entered for this report.</td></tr>'}</tbody>
         </table>
       </section>
     """
@@ -862,6 +906,7 @@ def nte_weekly_report_html(project_id):
       {''.join(bucket_sections) or '<p>No T&M NTE buckets are set up for this project yet.</p>'}
       {panels_section}
       {additions_section}
+      {reallocations_section}
       {trend_section}
     </div>
   </main>
@@ -886,6 +931,7 @@ def nte_weekly_report_pdf_bytes(project_id):
     data = nte_summary(project_id, all_targets=True)
     buckets = data.get("buckets", [])
     additions = data.get("additions", [])
+    reallocations = data.get("reallocations", [])
     panel_deliverables = data.get("panel_deliverables", [])
     save_nte_weekly_kpi_snapshot(project_id, data)
     kpi_history = nte_kpi_history(project_id)
@@ -1142,6 +1188,48 @@ def nte_weekly_report_pdf_bytes(project_id):
         ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8fafc")]),
     ]))
     story.append(addition_table)
+    story.append(Spacer(1, 0.18 * inch))
+
+    story.append(Paragraph("Budget Reallocations", styles["Heading2"]))
+    story.append(Paragraph("Documented transfers of existing NTE budget between main buckets. Approved transfers move budget but do not increase the total NTE.", styles["Muted"]))
+    reallocation_rows = [["From Bucket", "To Bucket", "Status", "Amount", "Split", "Dates", "Approver", "Reason / Backup"]]
+    for reallocation in reallocations:
+        split = (
+            f"Labor: {dollars(reallocation.get('labor_amount'))}<br/>"
+            f"Material: {dollars(reallocation.get('material_amount'))}<br/>"
+            f"Equipment: {dollars(reallocation.get('equipment_amount'))}"
+        )
+        dates = html_escape(reallocation.get("requested_date") or "")
+        if reallocation.get("approved_date"):
+            dates += f"<br/>Approved {html_escape(reallocation.get('approved_date'))}"
+        reason = html_escape(reallocation.get("reason") or "")
+        if reallocation.get("notes"):
+            reason += f"<br/><font color='#5c6d80'>{html_escape(reallocation.get('notes'))}</font>"
+        if reallocation.get("support_file"):
+            reason += f"<br/><font color='#5c6d80'>Backup: {html_escape(reallocation.get('support_file'))}</font>"
+        reallocation_rows.append([
+            Paragraph(html_escape(reallocation.get("from_bucket_name") or ""), styles["Small"]),
+            Paragraph(html_escape(reallocation.get("to_bucket_name") or ""), styles["Small"]),
+            Paragraph(html_escape(reallocation.get("status") or ""), styles["Small"]),
+            dollars(reallocation.get("amount")),
+            Paragraph(split, styles["Small"]),
+            Paragraph(dates, styles["Small"]),
+            Paragraph(html_escape(reallocation.get("approver") or ""), styles["Small"]),
+            Paragraph(reason or "-", styles["Small"]),
+        ])
+    if len(reallocation_rows) == 1:
+        reallocation_rows.append([Paragraph("No budget reallocations have been entered for this report.", styles["Small"]), "", "", "", "", "", "", ""])
+    reallocation_table = Table(reallocation_rows, colWidths=[0.95 * inch, 0.95 * inch, 0.62 * inch, 0.72 * inch, 1.0 * inch, 0.82 * inch, 0.72 * inch, 1.35 * inch], repeatRows=1)
+    reallocation_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#eaf0f5")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#31445a")),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#d7e0e8")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8fafc")]),
+    ]))
+    story.append(reallocation_table)
     story.append(Spacer(1, 0.18 * inch))
 
     story.append(Paragraph("Estimated Cost to Completion Trend", styles["Heading2"]))
