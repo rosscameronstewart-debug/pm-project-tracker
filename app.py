@@ -7100,6 +7100,7 @@ HTML = r"""
     .grid { display: grid; gap: 14px; }
     .grid.cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
     .grid.cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .admin-grid { display: grid; grid-template-columns: 1fr; gap: 14px; }
     .inline-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(170px, 100%), 1fr)); gap: 10px; align-items: end; }
     .progress { height: 10px; min-width: 110px; margin-top: 5px; border-radius: 999px; overflow: hidden; background: color-mix(in srgb, var(--line) 72%, transparent); }
     .progress span { display: block; height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--blue), var(--green)); }
@@ -7207,6 +7208,11 @@ HTML = r"""
     #usersTable label { display: flex; align-items: center; gap: 6px; margin: 0; white-space: nowrap; }
     #usersTable label input[type="checkbox"] { width: auto; flex: 0 0 auto; }
     #usersTable td:last-child { white-space: normal; }
+    #usersTable tr.user-dirty td { background: color-mix(in srgb, var(--gold) 13%, var(--panel)); }
+    #usersTable tr.user-dirty td:first-child { box-shadow: inset 4px 0 0 var(--gold); }
+    #usersTable tr.user-dirty input,
+    #usersTable tr.user-dirty select { background: color-mix(in srgb, var(--gold) 10%, var(--field-bg)); border-color: var(--gold); }
+    #usersTable tr.user-dirty [data-save-user] { background: var(--gold); color: white; border-color: var(--gold); }
     #mccQuoteItemTable { min-width: 1280px; table-layout: fixed; }
     #mccQuoteItemTable th, #mccQuoteItemTable td { vertical-align: middle; }
     #mccQuoteItemTable th:nth-child(1), #mccQuoteItemTable td:nth-child(1) { width: 135px; }
@@ -7328,8 +7334,7 @@ HTML = r"""
     body.read-only [data-save-cost-group],
     body.read-only [data-save-bid],
     body.read-only [data-delete-import],
-    body.read-only [data-reset-user],
-    body.read-only [data-toggle-user],
+    body.read-only [data-save-user],
     body.read-only [data-save-invoice-subproject],
     body.read-only [data-save-customer-invoice],
     body.read-only [data-delete-customer-invoice],
@@ -8402,7 +8407,7 @@ HTML = r"""
     </section>
 
     <section id="admin" class="tab hidden">
-      <div class="grid cols-2">
+      <div class="admin-grid">
         <form class="panel" id="userForm">
           <h2>Add User</h2>
           <label>Username</label><input name="username" required>
@@ -13590,36 +13595,44 @@ HTML = r"""
       const roleOptions = (rolePermissionsData?.roles || ['User','Read Only','TX/Read Only','Field PO','Admin']);
       document.getElementById('usersTable').innerHTML = `
         <thead><tr><th>Username</th><th>Name</th><th>Role</th><th>PO Trust</th><th>Status</th><th>Password</th><th></th></tr></thead>
-        <tbody>${users.map(u => `<tr>
+        <tbody>${users.map(u => `<tr data-user-row="${u.id}">
           <td>${htmlEscape(u.username || '')}</td>
-          <td>${htmlEscape(u.display_name || '')}</td>
+          <td><input data-user-field="${u.id}" data-field="display_name" value="${htmlEscape(u.display_name || '')}"></td>
           <td><select data-user-role="${u.id}">${roleOptions.map(role => `<option ${u.role === role ? 'selected' : ''}>${htmlEscape(role)}</option>`).join('')}</select></td>
           <td><label><input data-user-po-auto-issue="${u.id}" type="checkbox" ${Number(u.po_auto_issue || 0) ? 'checked' : ''}> Auto-issue</label></td>
-          <td>${u.active ? 'Active' : 'Inactive'}${Number(u.must_change_password || 0) ? '<div class="muted">Must change password</div>' : ''}</td>
-          <td><input data-user-password="${u.id}" type="password" placeholder="TPE1776"></td>
+          <td><select data-user-active="${u.id}"><option value="1" ${u.active ? 'selected' : ''}>Active</option><option value="0" ${!u.active ? 'selected' : ''}>Inactive</option></select>${Number(u.must_change_password || 0) ? '<div class="muted">Must change password</div>' : ''}</td>
+          <td><input data-user-password="${u.id}" type="password" placeholder="New password optional"></td>
           <td>
-            <button class="btn" data-reset-user="${u.id}" type="button">Reset Password</button>
-            <button class="btn" data-toggle-user="${u.id}" data-active="${u.active}" type="button">${u.active ? 'Deactivate' : 'Activate'}</button>
+            <button class="btn" data-save-user="${u.id}" type="button">Save</button>
           </td>
         </tr>`).join('')}</tbody>`;
-      document.querySelectorAll('[data-reset-user]').forEach(btn => btn.onclick = async () => {
-        const id = btn.dataset.resetUser;
-        const password = document.querySelector(`[data-user-password="${id}"]`).value || 'TPE1776';
-        await api(`/api/users/${id}`, { method:'PUT', body: JSON.stringify({ password }) });
-        await loadUsers();
+      document.querySelectorAll('#usersTable [data-user-field], #usersTable [data-user-role], #usersTable [data-user-po-auto-issue], #usersTable [data-user-active], #usersTable [data-user-password]').forEach(el => {
+        const markRowDirty = () => {
+          el.closest('tr')?.classList.add('user-dirty');
+          hasUnsavedChanges = true;
+        };
+        el.oninput = markRowDirty;
+        el.onchange = markRowDirty;
       });
-      document.querySelectorAll('[data-toggle-user]').forEach(btn => btn.onclick = async () => {
-        const id = btn.dataset.toggleUser;
-        await api(`/api/users/${id}`, { method:'PUT', body: JSON.stringify({ active: btn.dataset.active === '1' ? 0 : 1 }) });
-        await loadUsers();
-      });
-      document.querySelectorAll('[data-user-role]').forEach(sel => sel.onchange = async () => {
-        await api(`/api/users/${sel.dataset.userRole}`, { method:'PUT', body: JSON.stringify({ role: sel.value }) });
-        await loadUsers();
-      });
-      document.querySelectorAll('[data-user-po-auto-issue]').forEach(box => box.onchange = async () => {
-        await api(`/api/users/${box.dataset.userPoAutoIssue}`, { method:'PUT', body: JSON.stringify({ po_auto_issue: box.checked ? 1 : 0 }) });
-        await loadUsers();
+      document.querySelectorAll('[data-save-user]').forEach(btn => btn.onclick = async () => {
+        const id = btn.dataset.saveUser;
+        const row = btn.closest('tr');
+        const payload = {
+          display_name: row.querySelector(`[data-user-field="${id}"][data-field="display_name"]`)?.value || '',
+          role: row.querySelector(`[data-user-role="${id}"]`)?.value || 'User',
+          po_auto_issue: row.querySelector(`[data-user-po-auto-issue="${id}"]`)?.checked ? 1 : 0,
+          active: row.querySelector(`[data-user-active="${id}"]`)?.value || '1',
+        };
+        const password = row.querySelector(`[data-user-password="${id}"]`)?.value || '';
+        if (password) payload.password = password;
+        await api(`/api/users/${id}`, { method:'PUT', body: JSON.stringify(payload) });
+        row.querySelector(`[data-user-password="${id}"]`).value = '';
+        if (password) {
+          const statusCell = row.querySelector(`[data-user-active="${id}"]`)?.closest('td');
+          if (statusCell && !statusCell.querySelector('.muted')) statusCell.insertAdjacentHTML('beforeend', '<div class="muted">Must change password</div>');
+        }
+        row.classList.remove('user-dirty');
+        if (!document.querySelector('#usersTable tr.user-dirty')) markSaved();
       });
       renderRolePermissions();
     }
@@ -16748,6 +16761,8 @@ class Handler(BaseHTTPRequestHandler):
                     execute("UPDATE users SET password_hash = ?, must_change_password = 1 WHERE id = ?", (hash_password(data.get("password")), user_id))
                 if "role" in data:
                     execute("UPDATE users SET role = ? WHERE id = ?", (clean_role(data.get("role")), user_id))
+                if "display_name" in data:
+                    execute("UPDATE users SET display_name = ? WHERE id = ?", (str(data.get("display_name") or "").strip(), user_id))
                 if "active" in data:
                     execute("UPDATE users SET active = ? WHERE id = ?", (1 if str(data.get("active")) == "1" else 0, user_id))
                 if "po_auto_issue" in data:
