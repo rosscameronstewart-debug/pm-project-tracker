@@ -7202,7 +7202,7 @@ HTML = r"""
     #usersTable th:nth-child(4), #usersTable td:nth-child(4) { width: 130px; }
     #usersTable th:nth-child(5), #usersTable td:nth-child(5) { width: 145px; }
     #usersTable th:nth-child(6), #usersTable td:nth-child(6) { width: 150px; }
-    #usersTable th:nth-child(7), #usersTable td:nth-child(7) { width: 170px; }
+    #usersTable th:nth-child(7), #usersTable td:nth-child(7) { width: 210px; }
     #usersTable td { overflow-wrap: anywhere; word-break: normal; }
     #usersTable select, #usersTable input { min-width: 0; }
     #usersTable label { display: flex; align-items: center; gap: 6px; margin: 0; white-space: nowrap; }
@@ -13604,6 +13604,7 @@ HTML = r"""
           <td><input data-user-password="${u.id}" type="password" placeholder="New password optional"></td>
           <td>
             <button class="btn" data-save-user="${u.id}" type="button">Save</button>
+            ${String(state.currentUser?.id || '') === String(u.id) ? '<div class="muted" style="margin-top:6px">Current user</div>' : `<button class="btn danger" data-delete-user="${u.id}" data-delete-username="${htmlEscape(u.username || '')}" type="button" style="margin-top:6px">Delete</button>`}
             <div class="bad" data-user-error="${u.id}" style="margin-top:6px"></div>
           </td>
         </tr>`).join('')}</tbody>`;
@@ -13644,6 +13645,19 @@ HTML = r"""
         }
         row.classList.remove('user-dirty');
         if (!document.querySelector('#usersTable tr.user-dirty')) markSaved();
+      });
+      document.querySelectorAll('[data-delete-user]').forEach(btn => btn.onclick = async () => {
+        const id = btn.dataset.deleteUser;
+        const username = btn.dataset.deleteUsername || 'this user';
+        if (!confirm(`Delete ${username}? This removes the account and signs them out everywhere.`)) return;
+        try {
+          await api(`/api/users/${id}`, { method:'DELETE' });
+          await loadUsers();
+        } catch (err) {
+          const row = btn.closest('tr');
+          const errorEl = row?.querySelector(`[data-user-error="${id}"]`);
+          if (errorEl) errorEl.textContent = err.message || 'Could not delete user.';
+        }
       });
       renderRolePermissions();
     }
@@ -17670,6 +17684,43 @@ class Handler(BaseHTTPRequestHandler):
                 return json_response(self, {"error": "Login required"}, 401)
             if not require_editor(self):
                 return json_response(self, {"error": "Read-only users cannot make changes."}, 403)
+            if parsed.path.startswith("/api/users/"):
+                actor = current_user(self)
+                if not require_admin(self):
+                    return json_response(self, {"error": "Admin required"}, 403)
+                user_id = parsed.path.rsplit("/", 1)[-1]
+                if str(actor["id"]) == str(user_id):
+                    return json_response(self, {"error": "You cannot delete your own account while logged in."}, 400)
+                with db() as con:
+                    target_user = con.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+                    if not target_user:
+                        return json_response(self, {"error": "User not found."}, 404)
+                    if clean_role(target_user["role"]) == "Admin":
+                        remaining_admins = con.execute(
+                            """
+                            SELECT COUNT(*) AS c
+                            FROM users
+                            WHERE id <> ?
+                              AND active = 1
+                              AND role = 'Admin'
+                            """,
+                            (user_id,),
+                        ).fetchone()["c"]
+                        if not remaining_admins:
+                            return json_response(self, {"error": "At least one active admin account must remain."}, 400)
+                    con.execute("DELETE FROM users WHERE id = ?", (user_id,))
+                log_activity(
+                    actor,
+                    "deleted user",
+                    "User",
+                    target_user["username"],
+                    {
+                        "display_name": target_user["display_name"],
+                        "role": target_user["role"],
+                        "active": target_user["active"],
+                    },
+                )
+                return json_response(self, {"ok": True})
             if parsed.path.startswith("/api/fieldwise-audit-omissions/"):
                 omission_id = parsed.path.rsplit("/", 1)[-1]
                 with db() as con:
