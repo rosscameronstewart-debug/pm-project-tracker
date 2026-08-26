@@ -13596,7 +13596,7 @@ HTML = r"""
       document.getElementById('usersTable').innerHTML = `
         <thead><tr><th>Username</th><th>Name</th><th>Role</th><th>PO Trust</th><th>Status</th><th>Password</th><th></th></tr></thead>
         <tbody>${users.map(u => `<tr data-user-row="${u.id}">
-          <td>${htmlEscape(u.username || '')}</td>
+          <td><input data-user-field="${u.id}" data-field="username" value="${htmlEscape(u.username || '')}" autocapitalize="none" autocorrect="off" spellcheck="false"></td>
           <td><input data-user-field="${u.id}" data-field="display_name" value="${htmlEscape(u.display_name || '')}"></td>
           <td><select data-user-role="${u.id}">${roleOptions.map(role => `<option ${u.role === role ? 'selected' : ''}>${htmlEscape(role)}</option>`).join('')}</select></td>
           <td><label><input data-user-po-auto-issue="${u.id}" type="checkbox" ${Number(u.po_auto_issue || 0) ? 'checked' : ''}> Auto-issue</label></td>
@@ -13604,6 +13604,7 @@ HTML = r"""
           <td><input data-user-password="${u.id}" type="password" placeholder="New password optional"></td>
           <td>
             <button class="btn" data-save-user="${u.id}" type="button">Save</button>
+            <div class="bad" data-user-error="${u.id}" style="margin-top:6px"></div>
           </td>
         </tr>`).join('')}</tbody>`;
       document.querySelectorAll('#usersTable [data-user-field], #usersTable [data-user-role], #usersTable [data-user-po-auto-issue], #usersTable [data-user-active], #usersTable [data-user-password]').forEach(el => {
@@ -13618,6 +13619,7 @@ HTML = r"""
         const id = btn.dataset.saveUser;
         const row = btn.closest('tr');
         const payload = {
+          username: row.querySelector(`[data-user-field="${id}"][data-field="username"]`)?.value || '',
           display_name: row.querySelector(`[data-user-field="${id}"][data-field="display_name"]`)?.value || '',
           role: row.querySelector(`[data-user-role="${id}"]`)?.value || 'User',
           po_auto_issue: row.querySelector(`[data-user-po-auto-issue="${id}"]`)?.checked ? 1 : 0,
@@ -13625,7 +13627,16 @@ HTML = r"""
         };
         const password = row.querySelector(`[data-user-password="${id}"]`)?.value || '';
         if (password) payload.password = password;
-        await api(`/api/users/${id}`, { method:'PUT', body: JSON.stringify(payload) });
+        const errorEl = row.querySelector(`[data-user-error="${id}"]`);
+        if (errorEl) errorEl.textContent = '';
+        try {
+          await api(`/api/users/${id}`, { method:'PUT', body: JSON.stringify(payload) });
+        } catch (err) {
+          if (errorEl) errorEl.textContent = err.message || 'Could not save user.';
+          row.classList.add('user-dirty');
+          hasUnsavedChanges = true;
+          return;
+        }
         row.querySelector(`[data-user-password="${id}"]`).value = '';
         if (password) {
           const statusCell = row.querySelector(`[data-user-active="${id}"]`)?.closest('td');
@@ -16757,6 +16768,16 @@ class Handler(BaseHTTPRequestHandler):
                     return json_response(self, {"error": "Admin required"}, 403)
                 user_id = parsed.path.rsplit("/", 1)[-1]
                 target_user = one("SELECT username, display_name, role, active FROM users WHERE id = ?", (user_id,))
+                if not target_user:
+                    return json_response(self, {"error": "User not found."}, 404)
+                if "username" in data:
+                    new_username = str(data.get("username") or "").strip()
+                    if not new_username:
+                        return json_response(self, {"error": "Username is required."}, 400)
+                    duplicate_user = one("SELECT id FROM users WHERE lower(username) = lower(?) AND id <> ?", (new_username, user_id))
+                    if duplicate_user:
+                        return json_response(self, {"error": "That username is already in use."}, 400)
+                    execute("UPDATE users SET username = ? WHERE id = ?", (new_username, user_id))
                 if "password" in data and data.get("password"):
                     execute("UPDATE users SET password_hash = ?, must_change_password = 1 WHERE id = ?", (hash_password(data.get("password")), user_id))
                 if "role" in data:
@@ -16767,7 +16788,7 @@ class Handler(BaseHTTPRequestHandler):
                     execute("UPDATE users SET active = ? WHERE id = ?", (1 if str(data.get("active")) == "1" else 0, user_id))
                 if "po_auto_issue" in data:
                     execute("UPDATE users SET po_auto_issue = ? WHERE id = ?", (1 if str(data.get("po_auto_issue")) == "1" else 0, user_id))
-                log_activity(current_user(self), "updated user", "User", target_user["username"] if target_user else user_id, {"changed_fields": list(data.keys()), "new_role": clean_role(data.get("role")) if "role" in data else None, "active": data.get("active") if "active" in data else None, "po_auto_issue": data.get("po_auto_issue") if "po_auto_issue" in data else None})
+                log_activity(current_user(self), "updated user", "User", target_user["username"], {"changed_fields": list(data.keys()), "new_username": str(data.get("username") or "").strip() if "username" in data else None, "new_role": clean_role(data.get("role")) if "role" in data else None, "active": data.get("active") if "active" in data else None, "po_auto_issue": data.get("po_auto_issue") if "po_auto_issue" in data else None})
                 return json_response(self, {"ok": True})
             if parsed.path.startswith("/api/purchase-orders/"):
                 po_id = parsed.path.rsplit("/", 1)[-1]
