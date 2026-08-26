@@ -5079,6 +5079,18 @@ def send_email(to_address, subject, body):
         smtp.send_message(message)
 
 
+def smtp_status():
+    return {
+        "configured": bool(SMTP_HOST and SMTP_FROM),
+        "host": SMTP_HOST,
+        "port": SMTP_PORT,
+        "from": SMTP_FROM,
+        "username_set": bool(SMTP_USERNAME),
+        "password_set": bool(SMTP_PASSWORD),
+        "tls": SMTP_USE_TLS,
+    }
+
+
 def log_texas_upload_reminder(reminder_date, recipient, subject, status, error=""):
     execute(
         """
@@ -8443,6 +8455,14 @@ HTML = r"""
           <div class="actions"><a class="btn primary" href="/api/admin/database-backup">Download Database Backup</a></div>
         </div>
         <div class="panel">
+          <h2>Email Test</h2>
+          <p class="muted">Confirm the server can send email before using reminders or welcome emails.</p>
+          <div id="emailStatus" class="muted">Checking email setup...</div>
+          <label>Send Test To</label><input id="testEmailTo" type="email" autocomplete="email" placeholder="name@example.com">
+          <div class="actions"><button class="btn primary" id="sendTestEmail" type="button">Send Test Email</button></div>
+          <div id="testEmailResult" class="muted" style="margin-top:10px"></div>
+        </div>
+        <div class="panel">
           <h2>Activity Log</h2>
           <p class="muted">Review sensitive changes such as deletes, user updates, reminder changes, and audit exceptions.</p>
           <div class="actions"><button class="btn primary" data-open-tab="activity" type="button">Open Activity Log</button></div>
@@ -9051,7 +9071,7 @@ HTML = r"""
       if (tabName === 'projectPo') loadProjectPos();
       if (tabName === 'newMasterProject') loadNewMasterProjectForm();
       if (tabName === 'bids') loadBidDashboard();
-      if (tabName === 'admin') loadUsers();
+      if (tabName === 'admin') { loadUsers(); loadEmailStatus(); }
       if (tabName === 'activity') loadActivityLog();
       if (tabName === 'texasOps') loadTexasOpsDashboard();
       if (tabName === 'texasReminders') loadTexasReminderSetup();
@@ -13772,6 +13792,20 @@ HTML = r"""
       renderActivityLog();
     }
 
+    async function loadEmailStatus() {
+      if (state.currentUser?.role !== 'Admin') return;
+      const target = document.getElementById('emailStatus');
+      if (!target) return;
+      try {
+        const status = await api('/api/admin/email-status');
+        target.innerHTML = status.configured
+          ? `<strong class="good">Configured</strong><br>From ${htmlEscape(status.from || '')} through ${htmlEscape(status.host || '')}:${htmlEscape(status.port || '')}${status.tls ? ' with TLS' : ''}`
+          : '<strong class="warn">Not configured</strong><br>Add SMTP settings on the server before reminders can send.';
+      } catch (err) {
+        target.innerHTML = `<span class="bad">${htmlEscape(err.message || 'Could not check email setup.')}</span>`;
+      }
+    }
+
     document.getElementById('projectForm').onsubmit = async e => {
       e.preventDefault();
       const data = formDataObj(e.target);
@@ -13809,6 +13843,17 @@ HTML = r"""
     document.getElementById('activitySearch').oninput = () => renderActivityLog();
     document.getElementById('activityAction').onchange = () => renderActivityLog();
     document.getElementById('activityLimit').onchange = () => loadActivityLog();
+    document.getElementById('sendTestEmail').onclick = async () => {
+      const resultEl = document.getElementById('testEmailResult');
+      const to = document.getElementById('testEmailTo').value;
+      resultEl.textContent = 'Sending test email...';
+      try {
+        await api('/api/admin/send-test-email', { method:'POST', body: JSON.stringify({ to }) });
+        resultEl.innerHTML = '<strong class="good">Test email sent.</strong>';
+      } catch (err) {
+        resultEl.innerHTML = `<span class="bad">${htmlEscape(err.message || 'Could not send test email.')}</span>`;
+      }
+    };
     document.getElementById('refreshOfficePos').onclick = () => loadOfficePos();
     document.getElementById('officePoSearch').oninput = () => renderOfficePos();
     document.getElementById('officePoStatusFilter').onchange = () => renderOfficePos();
@@ -14468,6 +14513,10 @@ class Handler(BaseHTTPRequestHandler):
                 if not require_admin(self):
                     return json_response(self, {"error": "Admin required"}, 403)
                 return json_response(self, rows("SELECT id, username, display_name, role, active, COALESCE(po_auto_issue, 0) AS po_auto_issue, COALESCE(must_change_password, 0) AS must_change_password, created_at FROM users ORDER BY username"))
+            if parsed.path == "/api/admin/email-status":
+                if not require_admin(self):
+                    return json_response(self, {"error": "Admin required"}, 403)
+                return json_response(self, smtp_status())
             if parsed.path == "/api/role-permissions":
                 if not require_admin(self):
                     return json_response(self, {"error": "Admin required"}, 403)
@@ -14837,6 +14886,22 @@ class Handler(BaseHTTPRequestHandler):
                 return logout_response(self)
             if not current_user(self):
                 return json_response(self, {"error": "Login required"}, 401)
+            if parsed.path == "/api/admin/send-test-email":
+                actor = current_user(self)
+                if not require_admin(self):
+                    return json_response(self, {"error": "Admin required"}, 403)
+                data = parse_json(self)
+                to_address = clean_username(data.get("to"))
+                if not is_valid_user_email(to_address) or to_address == "admin":
+                    return json_response(self, {"error": "Enter a valid test email address."}, 400)
+                subject = "Twin Peaks Project Dashboard email test"
+                body = (
+                    "This is a test email from the Twin Peaks Project Dashboard.\n\n"
+                    "If you received this, the server email settings are working."
+                )
+                send_email(to_address, subject, body)
+                log_activity(actor, "sent test email", "Admin", to_address, {"smtp_from": SMTP_FROM, "smtp_host": SMTP_HOST})
+                return json_response(self, {"ok": True})
             if parsed.path == "/api/change-password":
                 data = parse_json(self)
                 user = current_user(self)
