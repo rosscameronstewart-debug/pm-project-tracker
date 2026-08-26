@@ -2596,6 +2596,17 @@ def clean_role(role):
     return role if role in ROLE_NAMES else "User"
 
 
+def clean_username(username):
+    return str(username or "").strip()
+
+
+def is_valid_user_email(username):
+    username = clean_username(username)
+    if username == "admin":
+        return True
+    return bool(re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", username))
+
+
 def clean_order_type(order_type):
     order_type = str(order_type or "Change Order").strip()
     return order_type if order_type in ("Change Order", "Child Project") else "Change Order"
@@ -8410,7 +8421,7 @@ HTML = r"""
       <div class="admin-grid">
         <form class="panel" id="userForm">
           <h2>Add User</h2>
-          <label>Username</label><input name="username" required>
+          <label>Username</label><input name="username" type="email" autocomplete="username" required>
           <label>Display Name</label><input name="display_name">
           <label>Role</label><select name="role"><option>User</option><option>Read Only</option><option>TX/Read Only</option><option>Field PO</option><option>Admin</option></select>
           <label><input name="po_auto_issue" type="checkbox" value="1"> Auto-issue this user's POs</label>
@@ -8418,7 +8429,7 @@ HTML = r"""
           <div class="actions"><button class="btn primary" type="submit">Add User</button></div>
         </form>
         <div class="panel">
-          <h2>Users</h2>
+          <h2>Users <span class="muted" id="usersCount"></span></h2>
           <div class="table-wrap"><table id="usersTable"></table></div>
         </div>
         <div class="panel" style="grid-column:1 / -1">
@@ -13593,6 +13604,8 @@ HTML = r"""
       if (!rolePermissionsData) rolePermissionsData = await api('/api/role-permissions');
       const users = await api('/api/users');
       const roleOptions = (rolePermissionsData?.roles || ['User','Read Only','TX/Read Only','Field PO','Admin']);
+      const usersCountEl = document.getElementById('usersCount');
+      if (usersCountEl) usersCountEl.textContent = `(${users.length} ${users.length === 1 ? 'user' : 'users'})`;
       document.getElementById('usersTable').innerHTML = `
         <thead><tr><th>Username</th><th>Name</th><th>Role</th><th>PO Trust</th><th>Status</th><th>Password</th><th></th></tr></thead>
         <tbody>${users.map(u => `<tr data-user-row="${u.id}">
@@ -16077,12 +16090,19 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/api/users":
                 if not require_admin(self):
                     return json_response(self, {"error": "Admin required"}, 403)
+                username = clean_username(data.get("username"))
+                if not username:
+                    return json_response(self, {"error": "Username is required."}, 400)
+                if not is_valid_user_email(username):
+                    return json_response(self, {"error": "Username must be a valid email address. Only the built-in admin username can be non-email."}, 400)
+                if one("SELECT id FROM users WHERE lower(username) = lower(?)", (username,)):
+                    return json_response(self, {"error": "That username is already in use."}, 400)
                 po_auto_issue = 1 if str(data.get("po_auto_issue") or "") in ("1", "true", "on") else 0
                 new_id = execute(
                     "INSERT INTO users (username, display_name, password_hash, role, active, po_auto_issue, must_change_password, created_at) VALUES (?, ?, ?, ?, 1, ?, 1, ?)",
-                    (data.get("username"), data.get("display_name"), hash_password(DEFAULT_NEW_USER_PASSWORD), clean_role(data.get("role")), po_auto_issue, now),
+                    (username, data.get("display_name"), hash_password(DEFAULT_NEW_USER_PASSWORD), clean_role(data.get("role")), po_auto_issue, now),
                 )
-                log_activity(current_user(self), "created user", "User", data.get("username"), {"display_name": data.get("display_name"), "role": clean_role(data.get("role")), "po_auto_issue": po_auto_issue})
+                log_activity(current_user(self), "created user", "User", username, {"display_name": data.get("display_name"), "role": clean_role(data.get("role")), "po_auto_issue": po_auto_issue})
                 return json_response(self, {"id": new_id})
             if parsed.path.startswith("/api/projects/") and parsed.path.endswith("/archive"):
                 project_id = parsed.path.split("/")[-2]
@@ -16785,9 +16805,11 @@ class Handler(BaseHTTPRequestHandler):
                 if not target_user:
                     return json_response(self, {"error": "User not found."}, 404)
                 if "username" in data:
-                    new_username = str(data.get("username") or "").strip()
+                    new_username = clean_username(data.get("username"))
                     if not new_username:
                         return json_response(self, {"error": "Username is required."}, 400)
+                    if not is_valid_user_email(new_username):
+                        return json_response(self, {"error": "Username must be a valid email address. Only the built-in admin username can be non-email."}, 400)
                     duplicate_user = one("SELECT id FROM users WHERE lower(username) = lower(?) AND id <> ?", (new_username, user_id))
                     if duplicate_user:
                         return json_response(self, {"error": "That username is already in use."}, 400)
