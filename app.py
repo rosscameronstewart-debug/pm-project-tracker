@@ -13872,6 +13872,7 @@ HTML = r"""
         updateFieldPoCustomerRequirement();
         await loadFieldPoJobs();
         await loadFieldPos();
+        markSaved();
       } catch (err) {
         resultEl.innerHTML = `<span class="bad">${htmlEscape(err.message || 'Could not create PO.')}</span>`;
       }
