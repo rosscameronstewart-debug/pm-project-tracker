@@ -85,6 +85,7 @@ ALL_PERMISSION_DEFINITIONS = [
     {"key": "texas_reminders", "label": "Texas Reminders Setup", "group": "Texas"},
     {"key": "po_requests", "label": "Create / My POs", "group": "Purchase Orders"},
     {"key": "po_review", "label": "Office PO Review", "group": "Purchase Orders"},
+    {"key": "vendor_price_catalog", "label": "Vendor Price Catalog", "group": "Purchase Orders"},
     {"key": "cog_setup", "label": "COG Setup", "group": "Purchase Orders"},
     {"key": "activity", "label": "Activity Log", "group": "Admin"},
     {"key": "admin", "label": "Admin / Users / Backups", "group": "Admin"},
@@ -2029,8 +2030,16 @@ def init_db():
               code TEXT NOT NULL,
               name TEXT NOT NULL UNIQUE,
               description TEXT,
+              restricted INTEGER DEFAULT 0,
               active INTEGER DEFAULT 1,
               created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS cog_category_user_access (
+              cog_category_id INTEGER NOT NULL REFERENCES cog_categories(id) ON DELETE CASCADE,
+              user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+              created_at TEXT NOT NULL,
+              PRIMARY KEY (cog_category_id, user_id)
             );
 
             CREATE TABLE IF NOT EXISTS fieldwise_audit_omissions (
@@ -2044,6 +2053,46 @@ def init_db():
               omitted_by_username TEXT,
               created_at TEXT NOT NULL,
               UNIQUE(ticket_number, order_number)
+            );
+
+            CREATE TABLE IF NOT EXISTS po_invoice_audit_omissions (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              ticket_number TEXT NOT NULL,
+              order_number TEXT NOT NULL,
+              customer TEXT,
+              project_name TEXT,
+              item TEXT,
+              description TEXT,
+              reason TEXT,
+              omitted_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+              omitted_by_username TEXT,
+              created_at TEXT NOT NULL,
+              UNIQUE(ticket_number, order_number, item, description)
+            );
+
+            CREATE TABLE IF NOT EXISTS vendor_price_catalogs (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              vendor TEXT NOT NULL,
+              effective_date TEXT,
+              received_date TEXT,
+              source_file TEXT,
+              notes TEXT,
+              active INTEGER DEFAULT 1,
+              uploaded_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+              uploaded_by_username TEXT,
+              uploaded_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS vendor_price_items (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              catalog_id INTEGER NOT NULL REFERENCES vendor_price_catalogs(id) ON DELETE CASCADE,
+              item_number TEXT,
+              description TEXT,
+              category TEXT,
+              manufacturer TEXT,
+              unit TEXT,
+              unit_price REAL DEFAULT 0,
+              raw_row_json TEXT
             );
             """
         )
@@ -2318,17 +2367,21 @@ def init_db():
                   code TEXT NOT NULL,
                   name TEXT NOT NULL UNIQUE,
                   description TEXT,
+                  restricted INTEGER DEFAULT 0,
                   active INTEGER DEFAULT 1,
                   created_at TEXT NOT NULL
                 );
-                INSERT INTO cog_categories_new (id, code, name, description, active, created_at)
-                SELECT id, code, name, description, COALESCE(active, 1), created_at
+                INSERT INTO cog_categories_new (id, code, name, description, restricted, active, created_at)
+                SELECT id, code, name, description, 0, COALESCE(active, 1), created_at
                 FROM cog_categories;
                 DROP TABLE cog_categories;
                 ALTER TABLE cog_categories_new RENAME TO cog_categories;
                 """
             )
             con.execute("PRAGMA foreign_keys = ON")
+        cog_cols = [r["name"] for r in con.execute("PRAGMA table_info(cog_categories)").fetchall()]
+        if "restricted" not in cog_cols:
+            con.execute("ALTER TABLE cog_categories ADD COLUMN restricted INTEGER DEFAULT 0")
         default_rate_set = con.execute("SELECT id FROM rate_sets WHERE name = 'Current'").fetchone()
         if not default_rate_set:
             cur = con.execute("INSERT INTO rate_sets (name, effective_date, active) VALUES ('Current', '', 1)")
@@ -2848,6 +2901,308 @@ def fieldwise_audit_result(path):
     }
 
 
+def normalized_order_key(value):
+    return str(value or "").strip().upper()
+
+
+def looks_like_purchase_material_line(item, description):
+    text = f"{item or ''} {description or ''}".lower()
+    if not text.strip():
+        return False
+    excluded = (
+        "foreman", "apprentice", "journeyman", "labor", "operator", "shop",
+        " reg", " ot", "regular time", "overtime", "work truck", "truck ",
+        " trailer", "rental", "equipment rental", "service call",
+    )
+    included = (
+        "wire", "cable", "conduit", "emt", "rigid", "pvc", "fitting",
+        "coupling", "connector", "anchor", "bracket", "strut", "panel",
+        "breaker", "mcc", "vfd", "drive", "meter", "lug", "pipe", "bolt",
+        "nut", "washer", "dottie", "curb", "light", "switch", "receptacle",
+        "material", "transformer", "disconnect",
+    )
+    if any(word in text for word in included):
+        return True
+    if any(word in text for word in excluded):
+        return False
+    return True
+
+
+def parse_fieldwise_po_invoice_export(path):
+    if openpyxl is None:
+        raise RuntimeError("Excel import needs openpyxl, but it is not available.")
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    ws = wb["LineItems"] if "LineItems" in wb.sheetnames else wb[wb.sheetnames[0]]
+    rows_iter = ws.iter_rows(values_only=True)
+    try:
+        headers = [str(v or "").strip() for v in next(rows_iter)]
+    except StopIteration:
+        return {"line_count": 0, "purchase_lines": []}
+    header_map = {h.lower(): i for i, h in enumerate(headers)}
+    required = ["customer name", "ticket date", "ticket number", "order number", "item", "description", "quantity", "rate", "sub total"]
+    missing = [h for h in required if h not in header_map]
+    if missing:
+        raise RuntimeError(f"Missing required Field Wise export columns: {', '.join(missing)}")
+
+    def cell(row, name):
+        idx = header_map.get(name.lower())
+        if idx is None or idx >= len(row):
+            return ""
+        return row[idx]
+
+    line_count = 0
+    purchase_lines = []
+    for row in rows_iter:
+        if not row or not any(row):
+            continue
+        line_count += 1
+        amount = money(cell(row, "sub total"))
+        ticket_number = str(cell(row, "ticket number") or "").strip()
+        order_number = str(cell(row, "order number") or "").strip()
+        item = str(cell(row, "item") or "").strip()
+        description = str(cell(row, "description") or "").strip()
+        if not ticket_number or not order_number or amount <= 0:
+            continue
+        if not looks_like_purchase_material_line(item, description):
+            continue
+        purchase_lines.append({
+            "ticket_number": ticket_number,
+            "order_number": order_number,
+            "customer": str(cell(row, "customer name") or "").strip(),
+            "ticket_date": date_text(cell(row, "ticket date")),
+            "status": str(cell(row, "status") or "").strip() if "status" in header_map else "",
+            "item": item,
+            "description": description,
+            "quantity": money(cell(row, "quantity")),
+            "rate": money(cell(row, "rate")),
+            "amount": amount,
+        })
+    return {"line_count": line_count, "purchase_lines": purchase_lines}
+
+
+def po_invoice_audit_result(path):
+    export = parse_fieldwise_po_invoice_export(path)
+    purchase_lines = export.get("purchase_lines", [])
+    with db() as con:
+        omission_rows = con.execute(
+            """
+            SELECT *
+            FROM po_invoice_audit_omissions
+            ORDER BY created_at DESC, ticket_number, order_number
+            """
+        ).fetchall()
+        tracked_rows = con.execute(
+            """
+            SELECT
+              'Subproject' AS item_type,
+              sp.job_number,
+              p.name AS project_name,
+              p.customer,
+              sp.code AS reference_code
+            FROM subprojects sp
+            JOIN projects p ON p.id = sp.project_id
+            WHERE COALESCE(p.status, 'Active') <> 'Archived'
+              AND TRIM(COALESCE(sp.job_number, '')) <> ''
+            UNION ALL
+            SELECT
+              COALESCE(co.order_type, 'Change Order') AS item_type,
+              co.job_number,
+              p.name AS project_name,
+              p.customer,
+              co.co_number AS reference_code
+            FROM change_orders co
+            JOIN projects p ON p.id = co.project_id
+            WHERE COALESCE(p.status, 'Active') <> 'Archived'
+              AND TRIM(COALESCE(co.job_number, '')) <> ''
+            """
+        ).fetchall()
+        invoice_rows = con.execute(
+            """
+            SELECT
+              TRIM(COALESCE(po.job_number, '')) AS job_number,
+              COUNT(poi.id) AS invoice_count,
+              COALESCE(SUM(poi.invoice_amount), 0) AS invoice_total,
+              MAX(poi.uploaded_at) AS last_invoice_at
+            FROM purchase_orders po
+            JOIN purchase_order_invoices poi ON poi.po_id = po.id
+            WHERE TRIM(COALESCE(po.job_number, '')) <> ''
+            GROUP BY TRIM(COALESCE(po.job_number, ''))
+            """
+        ).fetchall()
+
+    tracked_jobs = {normalized_order_key(r["job_number"]): dict(r) for r in tracked_rows}
+    invoices_by_job = {normalized_order_key(r["job_number"]): dict(r) for r in invoice_rows}
+    omissions_by_key = {
+        "|".join([
+            normalized_order_key(r["ticket_number"]),
+            normalized_order_key(r["order_number"]),
+            str(r["item"] or "").strip().lower(),
+            str(r["description"] or "").strip().lower(),
+        ]): dict(r)
+        for r in omission_rows
+    }
+
+    needs_invoice = []
+    covered = []
+    omitted = []
+    untracked = []
+    for line in purchase_lines:
+        order_key = normalized_order_key(line["order_number"])
+        job = tracked_jobs.get(order_key)
+        if not job:
+            untracked.append(line)
+            continue
+        invoice = invoices_by_job.get(order_key)
+        audit_row = {
+            **line,
+            **job,
+            "po_invoice_count": invoice["invoice_count"] if invoice else 0,
+            "po_invoice_total": money(invoice["invoice_total"]) if invoice else 0,
+            "last_invoice_at": invoice["last_invoice_at"] if invoice else "",
+        }
+        if invoice and int(invoice["invoice_count"] or 0) > 0:
+            covered.append(audit_row)
+            continue
+        omit_key = "|".join([
+            normalized_order_key(line["ticket_number"]),
+            order_key,
+            str(line["item"] or "").strip().lower(),
+            str(line["description"] or "").strip().lower(),
+        ])
+        omission = omissions_by_key.get(omit_key)
+        if omission:
+            omitted.append({**audit_row, "omission_id": omission["id"], "omission_reason": omission["reason"] or "", "omitted_by_username": omission["omitted_by_username"] or "", "omitted_at": omission["created_at"] or ""})
+        else:
+            needs_invoice.append(audit_row)
+
+    sort_key = lambda r: (str(r.get("project_name") or ""), str(r.get("order_number") or ""), str(r.get("ticket_number") or ""), str(r.get("item") or ""))
+    needs_invoice.sort(key=sort_key)
+    covered.sort(key=sort_key)
+    omitted.sort(key=sort_key)
+    untracked.sort(key=lambda r: (str(r.get("order_number") or ""), str(r.get("ticket_number") or "")))
+    return {
+        "summary": {
+            "export_line_count": export.get("line_count", 0),
+            "purchase_line_count": len(purchase_lines),
+            "tracked_job_count": len(tracked_jobs),
+            "needs_invoice_count": len(needs_invoice),
+            "covered_count": len(covered),
+            "omitted_count": len(omitted),
+            "untracked_count": len(untracked),
+        },
+        "needs_invoice": needs_invoice,
+        "covered": covered[:250],
+        "omitted": omitted,
+        "untracked": untracked[:250],
+    }
+
+
+def normalized_header(value):
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").strip().lower()).strip()
+
+
+def first_present_index(header_map, names):
+    for name in names:
+        idx = header_map.get(normalized_header(name))
+        if idx is not None:
+            return idx
+    return None
+
+
+def first_matching_header_index(headers, names, prefer_last=False):
+    normalized = [normalized_header(h) for h in headers]
+    for name in names:
+        wanted = normalized_header(name)
+        exact_matches = [idx for idx, header in enumerate(normalized) if header == wanted]
+        if exact_matches:
+            return exact_matches[-1] if prefer_last else exact_matches[0]
+        indexes = range(len(normalized) - 1, -1, -1) if prefer_last else range(len(normalized))
+        for idx in indexes:
+            header = normalized[idx]
+            if header == wanted:
+                return idx
+        for idx in indexes:
+            header = normalized[idx]
+            if wanted and wanted in header:
+                return idx
+    return None
+
+
+def parse_vendor_price_catalog(path):
+    suffix = Path(path).suffix.lower()
+    if suffix in (".xlsx", ".xlsm"):
+        if openpyxl is None:
+            raise RuntimeError("Excel import needs openpyxl, but it is not available.")
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        ws = wb[wb.sheetnames[0]]
+        raw_rows = list(ws.iter_rows(values_only=True))
+    elif suffix == ".csv":
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            raw_rows = list(csv.reader(f))
+    else:
+        raise RuntimeError("Vendor price catalog must be an Excel or CSV file.")
+    if not raw_rows:
+        return []
+
+    header_row_index = None
+    headers = []
+    for idx, row in enumerate(raw_rows[:25]):
+        row_headers = [str(v or "").strip() for v in row]
+        has_price = first_matching_header_index(row_headers, ("unit price", "current price", "cost (1 unit)", "cost", "net price", "trade price", "price")) is not None
+        has_item = first_matching_header_index(row_headers, ("part #", "part number", "part search", "item number", "item", "material", "catalog #", "catalog number", "sku", "description")) is not None
+        if has_price and has_item:
+            header_row_index = idx
+            headers = row_headers
+            break
+    if header_row_index is None:
+        raise RuntimeError("Could not find a header row with item/description and price columns.")
+
+    item_idx = first_matching_header_index(headers, ("part #", "part number", "part search", "item number", "product id", "material", "catalog #", "catalog number", "catalog no", "sku", "product code", "supplier sku", "catno", "partno"))
+    desc_idx = first_matching_header_index(headers, ("part- what the invoices will show", "part (goes on invoices)", "material description", "product description", "ced description", "item description", "description", "name"))
+    category_idx = first_matching_header_index(headers, ("category", "product category", "matl group", "group", "family"))
+    manufacturer_idx = first_matching_header_index(headers, ("manufacturer", "mfr", "mfg", "vendor name", "supplier name", "brand", "supplier"))
+    unit_idx = first_matching_header_index(headers, ("uom", "unit of measure", "bun", "price uom", "per"))
+    price_idx = first_matching_header_index(headers, ("unit price", "current price", "cost (1 unit)", "cost", "net price", "trade price", "price"), prefer_last=True)
+    per_idx = first_matching_header_index(headers, ("sell price per", "price per", "per", "price uom"))
+
+    def row_value(row, idx):
+        if idx is None or idx >= len(row):
+            return ""
+        return row[idx]
+
+    parsed = []
+    for row in raw_rows[header_row_index + 1:]:
+        if not row or not any(str(v or "").strip() for v in row):
+            continue
+        item_number = str(row_value(row, item_idx) or "").strip()
+        description = str(row_value(row, desc_idx) or "").strip()
+        unit_price = parse_money_text(row_value(row, price_idx))
+        per_value = str(row_value(row, per_idx) or "").strip().upper()
+        apply_price_per = per_idx is not None and price_idx is not None and per_idx > price_idx and abs(per_idx - price_idx) <= 2
+        if apply_price_per and per_value in ("C", "100") and unit_price:
+            unit_price = unit_price / 100
+        elif apply_price_per and per_value in ("M", "1000") and unit_price:
+            unit_price = unit_price / 1000
+        elif apply_price_per and per_value not in ("", "E", "EA", "Each".upper()):
+            per_number = money(per_value)
+            if per_number and per_number not in (0, 1):
+                unit_price = unit_price / per_number
+        if not item_number and not description:
+            continue
+        if unit_price == 0:
+            continue
+        parsed.append({
+            "item_number": item_number,
+            "description": description,
+            "category": str(row_value(row, category_idx) or "").strip(),
+            "manufacturer": str(row_value(row, manufacturer_idx) or "").strip(),
+            "unit": str(row_value(row, unit_idx) or "").strip(),
+            "unit_price": unit_price,
+            "raw_row_json": json.dumps([str(v or "") for v in row], default=str),
+        })
+    return parsed
+
+
 def next_po_number(con):
     year = datetime.now().year
     prefix = f"PO-{year}-"
@@ -2955,6 +3310,57 @@ def job_reference_for_po(con, job_key):
     result.setdefault("cog_category_id", None)
     result["job_label"] = " - ".join(str(part or "").strip() for part in label_parts if str(part or "").strip())
     return result
+
+
+def cog_allowed_user_ids(con, cog_category_id):
+    return [
+        int(r["user_id"])
+        for r in con.execute(
+            "SELECT user_id FROM cog_category_user_access WHERE cog_category_id = ?",
+            (cog_category_id,),
+        ).fetchall()
+    ]
+
+
+def user_can_use_cog(con, user, cog_category_id):
+    if not user or not cog_category_id:
+        return False
+    cog = con.execute(
+        "SELECT id, COALESCE(restricted, 0) AS restricted FROM cog_categories WHERE id = ? AND COALESCE(active, 1) = 1",
+        (cog_category_id,),
+    ).fetchone()
+    if not cog:
+        return False
+    if int(cog["restricted"] or 0) == 0:
+        return True
+    access = con.execute(
+        "SELECT 1 FROM cog_category_user_access WHERE cog_category_id = ? AND user_id = ?",
+        (cog_category_id, user["id"]),
+    ).fetchone()
+    return bool(access)
+
+
+def set_cog_user_access(con, cog_category_id, allowed_user_ids):
+    now = datetime.now().isoformat(timespec="seconds")
+    clean_ids = []
+    for user_id in allowed_user_ids or []:
+        try:
+            clean_ids.append(int(user_id))
+        except Exception:
+            continue
+    valid_ids = {
+        int(r["id"])
+        for r in con.execute(
+            "SELECT id FROM users WHERE id IN ({})".format(",".join("?" for _ in clean_ids)) if clean_ids else "SELECT id FROM users WHERE 0",
+            tuple(clean_ids),
+        ).fetchall()
+    }
+    con.execute("DELETE FROM cog_category_user_access WHERE cog_category_id = ?", (cog_category_id,))
+    con.executemany(
+        "INSERT OR IGNORE INTO cog_category_user_access (cog_category_id, user_id, created_at) VALUES (?, ?, ?)",
+        [(cog_category_id, user_id, now) for user_id in sorted(valid_ids)],
+    )
+    return sorted(valid_ids)
 
 
 def seed_bid_tracker_from_workbook():
@@ -7185,6 +7591,10 @@ HTML = r"""
     .sort-indicator { color: var(--blue); font-size: 11px; margin-left: 4px; }
     .table-wrap { width: 100%; max-width: 100%; max-height: 520px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; overscroll-behavior: contain; }
     .table-wrap table { min-width: max(760px, 100%); }
+    #cogCategoryTable { min-width: 1180px; }
+    .cog-access-list { min-width: 260px; max-height: 170px; overflow: auto; display: grid; gap: 6px; padding: 4px; }
+    .access-rule-note { display: block; margin-top: 4px; color: var(--muted); font-size: 12px; line-height: 1.3; }
+    .checkline.compact { margin: 0; font-size: 12px; line-height: 1.25; }
     table.resizable-columns { table-layout: fixed; }
     table.resizable-columns th { position: sticky; }
     .col-resizer { position: absolute; top: 0; right: -3px; width: 7px; height: 100%; cursor: col-resize; user-select: none; touch-action: none; z-index: 2; }
@@ -7314,15 +7724,20 @@ HTML = r"""
     .compact-upload .file-picker { display: inline-flex; align-items: center; justify-content: center; border: 1px solid var(--line); border-radius: 6px; background: var(--field-bg); padding: 7px 9px; color: var(--ink); cursor: pointer; font-size: 13px; font-weight: 700; }
     .compact-upload .file-name { display: block; min-height: 16px; color: var(--muted); font-size: 12px; line-height: 1.25; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     #subprojectEditTable tr.setup-dirty td,
-    #changeOrderEditTable tr.setup-dirty td { background: color-mix(in srgb, var(--gold) 13%, var(--panel)); }
+    #changeOrderEditTable tr.setup-dirty td,
+    #cogCategoryTable tr.setup-dirty td { background: color-mix(in srgb, var(--gold) 13%, var(--panel)); }
     #subprojectEditTable tr.setup-dirty td:first-child,
-    #changeOrderEditTable tr.setup-dirty td:first-child { box-shadow: inset 4px 0 0 var(--gold); }
+    #changeOrderEditTable tr.setup-dirty td:first-child,
+    #cogCategoryTable tr.setup-dirty td:first-child { box-shadow: inset 4px 0 0 var(--gold); }
     #subprojectEditTable tr.setup-dirty input,
     #subprojectEditTable tr.setup-dirty select,
     #changeOrderEditTable tr.setup-dirty input,
-    #changeOrderEditTable tr.setup-dirty select { background: color-mix(in srgb, var(--gold) 10%, var(--field-bg)); border-color: var(--gold); }
+    #changeOrderEditTable tr.setup-dirty select,
+    #cogCategoryTable tr.setup-dirty input,
+    #cogCategoryTable tr.setup-dirty select { background: color-mix(in srgb, var(--gold) 10%, var(--field-bg)); border-color: var(--gold); }
     #subprojectEditTable tr.setup-dirty [data-save-sp],
-    #changeOrderEditTable tr.setup-dirty [data-save-co] { background: var(--gold); color: white; border-color: var(--gold); }
+    #changeOrderEditTable tr.setup-dirty [data-save-co],
+    #cogCategoryTable tr.setup-dirty [data-save-cog] { background: var(--gold); color: white; border-color: var(--gold); }
     .dashboard-split { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(520px, 100%), 1fr)); gap: 14px; margin-top: 14px; }
     .dashboard-table-wrap { overflow: auto; max-height: 360px; }
     .dashboard-table-wrap table { min-width: 760px; }
@@ -7619,6 +8034,8 @@ HTML = r"""
           <button data-tab="fieldPo" data-nav-area="po" data-nav-level="sub">Create PO</button>
           <button data-tab="officePo" data-nav-area="po" data-nav-level="sub">Office PO Review</button>
           <button data-tab="closedPo" data-nav-area="po" data-nav-level="sub">Closed POs</button>
+          <button data-tab="poInvoiceAudit" data-nav-area="po" data-nav-level="sub">Invoice Audit</button>
+          <button data-tab="vendorPriceCatalog" data-nav-area="po" data-nav-level="sub">Price Catalog</button>
           <button data-tab="cogSetup" data-nav-area="po" data-nav-level="sub">COG's Setup</button>
         </div>
         <button data-tab="mccQuotes" data-nav-area="main" data-nav-level="main">Quoting</button>
@@ -7728,14 +8145,69 @@ HTML = r"""
       </div>
     </section>
 
+    <section id="poInvoiceAudit" class="tab hidden">
+      <form class="panel" id="poInvoiceAuditForm">
+        <h2>PO Invoice Audit</h2>
+        <p class="muted">Upload the all-customer Field Wise line export to find tracked job/order material lines that do not have a PO vendor invoice uploaded yet.</p>
+        <label>Field Wise Ticket Export</label>
+        <input id="poInvoiceAuditFile" type="file" accept=".xlsx,.xlsm" required>
+        <div class="actions">
+          <button class="btn primary" type="submit">Run Audit</button>
+          <button class="btn" id="exportPoInvoiceAuditMissing" type="button" disabled>Export Missing Invoice Lines</button>
+        </div>
+        <p id="poInvoiceAuditResult" class="muted"></p>
+        <div id="poInvoiceAuditSummary" class="grid cols-4" style="margin-top:12px"></div>
+        <div id="poInvoiceAuditTables" style="margin-top:12px"></div>
+        <div id="poInvoiceAuditOmissions" style="margin-top:12px"></div>
+      </form>
+    </section>
+
+    <section id="vendorPriceCatalog" class="tab hidden">
+      <div class="panel">
+        <h2>Vendor Price Catalog</h2>
+        <p class="muted">Upload quarterly vendor price lists here. The newest active catalog for each vendor becomes the pricing reference for future audits and lookups.</p>
+        <form id="vendorPriceCatalogForm" enctype="multipart/form-data">
+          <div class="grid cols-4">
+            <div><label>Vendor</label><input name="vendor" id="priceCatalogVendor" placeholder="CED, Border States, etc." required></div>
+            <div><label>Effective Date</label><input name="effective_date" type="date"></div>
+            <div><label>Received Date</label><input name="received_date" type="date"></div>
+            <label class="checkline"><input type="checkbox" name="make_active" checked> Make active for this vendor</label>
+            <div style="grid-column:span 4"><label>Price List File</label><input name="file" type="file" accept=".xlsx,.xlsm,.csv" required></div>
+            <div style="grid-column:span 4"><label>Notes</label><input name="notes" placeholder="Quarter, contact, special terms, or anything useful later"></div>
+          </div>
+          <div class="actions"><button class="btn primary" type="submit">Upload Price Catalog</button></div>
+          <p id="vendorPriceCatalogResult" class="muted"></p>
+        </form>
+      </div>
+      <div class="panel" style="margin-top:14px">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
+          <div>
+            <h2>Catalog History</h2>
+            <p class="muted">Keep prior quarterly lists for reference while using the active list for matching.</p>
+          </div>
+          <button class="btn" id="refreshVendorPriceCatalogs" type="button">Refresh</button>
+        </div>
+        <div class="grid cols-4">
+          <div style="grid-column:span 2"><label>Search</label><input id="vendorPriceCatalogSearch" placeholder="Search vendor, file, item, or description"></div>
+          <div><label>Status</label><select id="vendorPriceCatalogStatus"><option value="">All catalogs</option><option value="active">Active only</option><option value="inactive">Inactive only</option></select></div>
+        </div>
+        <div class="muted" id="vendorPriceCatalogCount" style="margin-top:8px"></div>
+        <div class="table-wrap" style="margin-top:10px"><table id="vendorPriceCatalogTable"></table></div>
+      </div>
+    </section>
+
     <section id="cogSetup" class="tab hidden">
       <div class="panel">
         <h2>COG Categories</h2>
         <p class="muted">Company-wide COG choices for POs that do not belong to a tracked job/order number.</p>
+        <div class="notice">
+          <strong>Access Rules:</strong> check <strong>Restrict PO use</strong> on a COG row, then select the users allowed to create POs with that COG. Admins can always use and manage every COG.
+        </div>
         <div class="grid cols-4">
           <div><label>Name</label><input id="cogName" placeholder="Truck 12"></div>
           <div><label>Internal COG Code</label><input id="cogCode" placeholder="TRUCK"></div>
           <div style="grid-column:span 2"><label>Description</label><input id="cogDescription" placeholder="Optional notes for office review"></div>
+          <label class="checkline"><input type="checkbox" id="cogRestricted"> Restrict to selected users</label>
         </div>
         <div class="actions"><button class="btn primary" id="addCogCategory" type="button">Add COG Category</button></div>
         <div class="table-wrap" style="margin-top:12px"><table id="cogCategoryTable"></table></div>
@@ -8454,7 +8926,7 @@ HTML = r"""
           <p class="muted">Download a snapshot of the SQLite database before major imports, server updates, or cleanup work.</p>
           <div class="actions"><a class="btn primary" href="/api/admin/database-backup">Download Database Backup</a></div>
         </div>
-        <div class="panel">
+        <div class="panel" id="emailTestPanel">
           <h2>Email Test</h2>
           <p class="muted">Confirm the server can send email before using reminders or welcome emails.</p>
           <div id="emailStatus" class="muted">Checking email setup...</div>
@@ -8495,6 +8967,18 @@ HTML = r"""
         <button class="btn" id="discardChanges" type="button">Discard Changes</button>
       </div>
     </div>
+  </div>
+  <div class="modal-backdrop hidden" id="auditReasonModal">
+    <form class="modal" id="auditReasonForm">
+      <h2 id="auditReasonTitle">Mark OK</h2>
+      <p id="auditReasonMessage">Document why this item is OK to omit from future audits.</p>
+      <label style="margin-top:12px">Reason</label>
+      <textarea id="auditReasonText" rows="4" required></textarea>
+      <div class="actions">
+        <button class="btn primary" type="submit">Save</button>
+        <button class="btn" id="cancelAuditReason" type="button">Cancel</button>
+      </div>
+    </form>
   </div>
   <div class="modal-backdrop hidden" id="trendModal">
     <div class="modal large">
@@ -8645,7 +9129,7 @@ HTML = r"""
   <script>
     const PO_FEATURE_ENABLED = true;
     const COG_CUSTOMER_OPTIONAL_NAMES = new Set(['expenses', 'truck & auto expense', 'truck and auto expense']);
-    let state = { projects: [], projectId: null, subprojects: [], changeOrders: [], cogCategories: [], internalRates: [], rateSets: [], currentUser: null };
+    let state = { projects: [], projectId: null, subprojects: [], changeOrders: [], cogCategories: [], cogAccessUsers: [], internalRates: [], rateSets: [], currentUser: null };
     let openSubprojectDetailId = null;
     let masterDetailIsOpen = false;
     let hasUnsavedChanges = false;
@@ -8669,6 +9153,9 @@ HTML = r"""
     let rolePermissionsData = null;
     let fieldWiseAuditData = null;
     let fieldWiseAuditOmissions = [];
+    let poInvoiceAuditData = null;
+    let poInvoiceAuditOmissions = [];
+    let vendorPriceCatalogs = [];
     const collapsedHierarchyNodes = new Set();
     const initializedHierarchyNodes = new Set();
     const money = v => Number(v || 0).toLocaleString(undefined, { style: 'currency', currency: 'USD' });
@@ -8774,6 +9261,8 @@ HTML = r"""
       fieldPo: 'po_requests',
       officePo: 'po_review',
       closedPo: 'po_review',
+      poInvoiceAudit: 'po_review',
+      vendorPriceCatalog: 'vendor_price_catalog',
       cogSetup: 'cog_setup',
       mccQuotes: 'mcc_quotes',
       mccQuoteSetup: 'mcc_quote_setup',
@@ -8793,6 +9282,41 @@ HTML = r"""
     };
     const formDataObj = form => Object.fromEntries(new FormData(form).entries());
     const markSaved = () => { hasUnsavedChanges = false; };
+    function requestAuditReason({ title, message, defaultReason }) {
+      return new Promise(resolve => {
+        const modal = document.getElementById('auditReasonModal');
+        const form = document.getElementById('auditReasonForm');
+        const titleEl = document.getElementById('auditReasonTitle');
+        const messageEl = document.getElementById('auditReasonMessage');
+        const reasonEl = document.getElementById('auditReasonText');
+        const cancelBtn = document.getElementById('cancelAuditReason');
+        if (!modal || !form || !reasonEl) {
+          resolve(defaultReason || '');
+          return;
+        }
+        titleEl.textContent = title || 'Mark OK';
+        messageEl.textContent = message || 'Document why this item is OK to omit from future audits.';
+        reasonEl.value = defaultReason || '';
+        modal.classList.remove('hidden');
+        setTimeout(() => reasonEl.focus(), 0);
+        const cleanup = value => {
+          form.onsubmit = null;
+          cancelBtn.onclick = null;
+          modal.classList.add('hidden');
+          resolve(value);
+        };
+        form.onsubmit = e => {
+          e.preventDefault();
+          const value = reasonEl.value.trim();
+          if (!value) {
+            reasonEl.focus();
+            return;
+          }
+          cleanup(value);
+        };
+        cancelBtn.onclick = () => cleanup(null);
+      });
+    }
     const isTexasReadOnly = () => state.currentUser?.role === 'TX/Read Only';
     const isFieldPoOnly = () => state.currentUser?.role === 'Field PO';
     const canViewPermission = key => {
@@ -8803,7 +9327,10 @@ HTML = r"""
       if (!key || state.currentUser?.role === 'Admin') return true;
       return !!Number(state.currentUser?.permissions?.[key]?.can_edit || 0);
     };
-    const canViewTab = tabName => canViewPermission(TAB_PERMISSIONS[tabName]);
+    const canViewTab = tabName => {
+      if (tabName === 'cogSetup') return state.currentUser?.role === 'Admin';
+      return canViewPermission(TAB_PERMISSIONS[tabName]);
+    };
     const currentUrlTab = () => new URLSearchParams(window.location.search).get('tab') || 'home';
     const currentUrlProjectId = () => Number(new URLSearchParams(window.location.search).get('project_id') || 0);
     function writeAppHistory(tabName, replace=false) {
@@ -8817,7 +9344,10 @@ HTML = r"""
       else window.history.pushState(stateData, '', url);
     }
     const isTemporaryViewControl = target => {
-      return target.closest('.cost-filter') || target.closest('#financialProfitTrend') || target.id === 'showAllCosts';
+      return target.closest('.cost-filter')
+        || target.closest('#financialProfitTrend')
+        || target.closest('#emailTestPanel')
+        || target.id === 'showAllCosts';
     };
     const markUnsaved = event => {
       if (isTemporaryViewControl(event.target)) return;
@@ -8928,7 +9458,7 @@ HTML = r"""
 
     function navOptionsForTab(tabName) {
       const projectTabs = ['dashboard','newMasterProject','setup','import','review','invoices','billing','customerDashboard','nteTracking','projectPo','archivedProjects'];
-      const poTabs = ['fieldPo','officePo','closedPo','cogSetup'];
+      const poTabs = ['fieldPo','officePo','closedPo','poInvoiceAudit','vendorPriceCatalog','cogSetup'];
       const quotingTabs = ['mccQuotes','mccQuoteSetup'];
       const homeTabs = ['home','bids','jobOrderReport','admin','activity'];
       if (projectTabs.includes(tabName)) return 'project';
@@ -9080,6 +9610,8 @@ HTML = r"""
       if (tabName === 'fieldPo') loadFieldPo();
       if (tabName === 'officePo') loadOfficePos();
       if (tabName === 'closedPo') loadClosedPos();
+      if (tabName === 'poInvoiceAudit') loadPoInvoiceAuditOmissions();
+      if (tabName === 'vendorPriceCatalog') loadVendorPriceCatalogs();
       if (tabName === 'cogSetup') loadCogSetup();
       if (tabName === 'mccQuotes') loadMccQuoteBuilder();
       if (tabName === 'mccQuoteSetup') loadMccQuoteSetup();
@@ -10275,7 +10807,12 @@ HTML = r"""
     }
 
     async function loadCogSetup() {
-      state.cogCategories = await api('/api/cog-categories');
+      const [categories, users] = await Promise.all([
+        api('/api/cog-categories'),
+        api('/api/cog-access-users').catch(() => [])
+      ]);
+      state.cogCategories = categories;
+      state.cogAccessUsers = users;
       loadCogCategoryEditor();
     }
 
@@ -10732,7 +11269,11 @@ HTML = r"""
     }
 
     async function markFieldWiseTicketOmitted(row) {
-      const reason = window.prompt(`Why is Field Wise ticket ${row.ticket_number} / order ${row.order_number} OK to omit?`, 'Valid Field Wise ticket, not required in this tracker');
+      const reason = await requestAuditReason({
+        title: 'Mark Field Wise Ticket OK',
+        message: `Why is Field Wise ticket ${row.ticket_number} / order ${row.order_number} OK to omit?`,
+        defaultReason: 'Valid Field Wise ticket, not required in this tracker'
+      });
       if (reason === null) return;
       await api('/api/fieldwise-audit-omissions', {
         method: 'POST',
@@ -10823,6 +11364,224 @@ HTML = r"""
       a.click();
       a.remove();
       URL.revokeObjectURL(url);
+    }
+
+    function poInvoiceAuditRowsTable(title, rows, emptyText, options={}) {
+      const shown = rows.slice(0, 300);
+      const showOmitAction = Boolean(options.showOmitAction);
+      const actionHeader = showOmitAction ? '<th>Action</th>' : '';
+      const omitRowPayload = row => htmlEscape(btoa(unescape(encodeURIComponent(JSON.stringify({
+        ticket_number: row.ticket_number || '',
+        order_number: row.order_number || '',
+        customer: row.customer || '',
+        project_name: row.project_name || '',
+        item: row.item || '',
+        description: row.description || ''
+      })))));
+      return `<div class="panel" style="margin-top:14px">
+        <h2>${htmlEscape(title)}</h2>
+        <div class="muted">${rows.length} line(s)${rows.length > shown.length ? `, showing first ${shown.length}` : ''}</div>
+        <div class="table-wrap" style="margin-top:10px"><table>${shown.length ? `<thead><tr><th>Ticket</th><th>Order #</th><th>Customer</th><th>Project</th><th>Item</th><th>Description</th><th>Date</th><th>Qty</th><th>Amount</th>${actionHeader}</tr></thead><tbody>${shown.map(r => `
+          <tr>
+            <td><strong>${htmlEscape(r.ticket_number || '')}</strong></td>
+            <td>${htmlEscape(r.order_number || '')}</td>
+            <td>${htmlEscape(r.customer || '')}</td>
+            <td>${htmlEscape(r.project_name || '')}<div class="muted">${htmlEscape(r.reference_code || '')}</div></td>
+            <td>${htmlEscape(r.item || '')}</td>
+            <td>${htmlEscape(r.description || '')}</td>
+            <td>${htmlEscape(r.ticket_date || '')}</td>
+            <td>${Number(r.quantity || 0).toLocaleString()}</td>
+            <td>${money(r.amount || 0)}</td>
+            ${showOmitAction ? `<td><button class="btn" type="button" data-omit-po-invoice-row="${omitRowPayload(r)}">Mark OK</button></td>` : ''}
+          </tr>`).join('')}</tbody>` : `<tbody><tr><td>${htmlEscape(emptyText)}</td></tr></tbody>`}</table></div>
+      </div>`;
+    }
+
+    function renderPoInvoiceAuditOmissions() {
+      const el = document.getElementById('poInvoiceAuditOmissions');
+      if (!el) return;
+      const rows = poInvoiceAuditOmissions || [];
+      el.innerHTML = `<div class="panel">
+        <h2>Lines Marked OK To Omit</h2>
+        <p class="muted">These Field Wise lines will not show as missing PO invoices in future audits.</p>
+        <div class="table-wrap" style="margin-top:10px"><table>${rows.length ? `<thead><tr><th>Ticket</th><th>Order #</th><th>Customer</th><th>Project</th><th>Item</th><th>Reason</th><th>Marked By</th><th>Date</th><th></th></tr></thead><tbody>${rows.map(r => `
+          <tr>
+            <td><strong>${htmlEscape(r.ticket_number || '')}</strong></td>
+            <td>${htmlEscape(r.order_number || '')}</td>
+            <td>${htmlEscape(r.customer || '')}</td>
+            <td>${htmlEscape(r.project_name || '')}</td>
+            <td>${htmlEscape(r.item || '')}</td>
+            <td>${htmlEscape(r.reason || '')}</td>
+            <td>${htmlEscape(r.omitted_by_username || '')}</td>
+            <td>${htmlEscape((r.created_at || '').replace('T', ' '))}</td>
+            <td><button class="btn danger" type="button" data-delete-po-invoice-omission="${r.id}">Remove</button></td>
+          </tr>`).join('')}</tbody>` : '<tbody><tr><td>No PO invoice audit lines have been marked OK to omit yet.</td></tr></tbody>'}</table></div>
+      </div>`;
+      document.querySelectorAll('[data-delete-po-invoice-omission]').forEach(btn => btn.onclick = async () => {
+        if (!window.confirm('Remove this OK-to-omit note? The line can show as missing again on future audits.')) return;
+        await api(`/api/po-invoice-audit-omissions/${btn.dataset.deletePoInvoiceOmission}`, { method: 'DELETE' });
+        await loadPoInvoiceAuditOmissions();
+      });
+    }
+
+    async function loadPoInvoiceAuditOmissions() {
+      poInvoiceAuditOmissions = await api('/api/po-invoice-audit-omissions');
+      renderPoInvoiceAuditOmissions();
+    }
+
+    async function markPoInvoiceLineOmitted(row) {
+      const reason = await requestAuditReason({
+        title: 'Mark PO Invoice Audit Line OK',
+        message: `Why is ticket ${row.ticket_number} / order ${row.order_number} OK without a PO invoice?`,
+        defaultReason: 'Valid material line, invoice not required in PO tracker'
+      });
+      if (reason === null) return;
+      await api('/api/po-invoice-audit-omissions', {
+        method: 'POST',
+        body: JSON.stringify({
+          ticket_number: row.ticket_number,
+          order_number: row.order_number,
+          customer: row.customer,
+          project_name: row.project_name,
+          item: row.item,
+          description: row.description,
+          reason
+        })
+      });
+      if (poInvoiceAuditData?.needs_invoice) {
+        poInvoiceAuditData.needs_invoice = poInvoiceAuditData.needs_invoice.filter(r => !(
+          String(r.ticket_number || '') === String(row.ticket_number || '')
+          && String(r.order_number || '') === String(row.order_number || '')
+          && String(r.item || '') === String(row.item || '')
+          && String(r.description || '') === String(row.description || '')
+        ));
+        if (poInvoiceAuditData.summary) {
+          poInvoiceAuditData.summary.needs_invoice_count = Math.max(0, Number(poInvoiceAuditData.summary.needs_invoice_count || 0) - 1);
+          poInvoiceAuditData.summary.omitted_count = Number(poInvoiceAuditData.summary.omitted_count || 0) + 1;
+        }
+        renderPoInvoiceAudit();
+      }
+      await loadPoInvoiceAuditOmissions();
+    }
+
+    function renderPoInvoiceAudit() {
+      const result = poInvoiceAuditData;
+      const summaryEl = document.getElementById('poInvoiceAuditSummary');
+      const tablesEl = document.getElementById('poInvoiceAuditTables');
+      const exportBtn = document.getElementById('exportPoInvoiceAuditMissing');
+      if (!result) {
+        summaryEl.innerHTML = '';
+        tablesEl.innerHTML = '';
+        exportBtn.disabled = true;
+        return;
+      }
+      const s = result.summary || {};
+      summaryEl.innerHTML = [
+        ['Material Lines', s.purchase_line_count || 0, `${s.export_line_count || 0} export line(s) scanned`],
+        ['Need PO Invoice', s.needs_invoice_count || 0, 'Tracked jobs without PO invoice upload'],
+        ['Covered', s.covered_count || 0, 'Job/order has PO vendor invoice'],
+        ['Marked OK', s.omitted_count || 0, 'Hidden from missing list']
+      ].map(([label, value, hint]) => `<div class="kpi"><div class="label">${htmlEscape(label)}</div><div class="value">${value}</div><div class="hint">${htmlEscape(hint)}</div></div>`).join('');
+      tablesEl.innerHTML = [
+        poInvoiceAuditRowsTable('Material Lines Missing A PO Vendor Invoice', result.needs_invoice || [], 'No tracked material lines are missing PO invoices.', { showOmitAction: true }),
+        poInvoiceAuditRowsTable('Marked OK To Omit In This Export', result.omitted || [], 'No previously omitted PO invoice audit lines were found in this export.'),
+        poInvoiceAuditRowsTable('Covered By PO Vendor Invoice Upload', result.covered || [], 'No covered lines found.'),
+        poInvoiceAuditRowsTable('Untracked Order Numbers', result.untracked || [], 'No untracked material lines found.')
+      ].join('');
+      document.querySelectorAll('[data-omit-po-invoice-row]').forEach(btn => btn.onclick = async () => {
+        try {
+          const row = JSON.parse(decodeURIComponent(escape(atob(btn.dataset.omitPoInvoiceRow || ''))));
+          if (!row?.ticket_number || !row?.order_number) {
+            throw new Error('This audit row is missing a ticket or order number.');
+          }
+          await markPoInvoiceLineOmitted(row);
+        } catch (err) {
+          alert(err.message || 'Could not mark this line OK.');
+        }
+      });
+      exportBtn.disabled = !(result.needs_invoice || []).length;
+      enableResizableTables(document.getElementById('poInvoiceAudit'));
+    }
+
+    function downloadPoInvoiceAuditCsv() {
+      if (!poInvoiceAuditData?.needs_invoice?.length) return;
+      const headers = ['Ticket Number','Order Number','Customer','Project','Type','Reference','Ticket Date','Item','Description','Quantity','Rate','Amount'];
+      const lines = [headers.map(csvCell).join(',')];
+      poInvoiceAuditData.needs_invoice.forEach(r => {
+        lines.push([
+          r.ticket_number,
+          r.order_number,
+          r.customer,
+          r.project_name,
+          r.item_type,
+          r.reference_code,
+          r.ticket_date,
+          r.item,
+          r.description,
+          r.quantity || 0,
+          r.rate || 0,
+          r.amount || 0
+        ].map(csvCell).join(','));
+      });
+      const blob = new Blob([lines.join('\r\n')], { type: 'text/csv' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `po-invoice-audit-missing-${new Date().toISOString().slice(0,10)}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    }
+
+    function renderVendorPriceCatalogs() {
+      const search = String(document.getElementById('vendorPriceCatalogSearch')?.value || '').trim().toLowerCase();
+      const status = String(document.getElementById('vendorPriceCatalogStatus')?.value || '');
+      let filtered = vendorPriceCatalogs.filter(catalog => {
+        if (status === 'active' && !Number(catalog.active || 0)) return false;
+        if (status === 'inactive' && Number(catalog.active || 0)) return false;
+        if (!search) return true;
+        return [
+          catalog.vendor,
+          catalog.source_file,
+          catalog.notes,
+          catalog.sample_items
+        ].some(value => String(value || '').toLowerCase().includes(search));
+      });
+      document.getElementById('vendorPriceCatalogCount').textContent = `${filtered.length} of ${vendorPriceCatalogs.length} catalog upload(s) shown`;
+      document.getElementById('vendorPriceCatalogTable').innerHTML = filtered.length
+        ? `<thead><tr><th>Vendor</th><th>Status</th><th>Effective</th><th>Received</th><th>Items</th><th>Sample Items</th><th>File</th><th>Uploaded</th><th>Notes</th><th></th></tr></thead><tbody>${filtered.map(catalog => `
+          <tr>
+            <td><strong>${htmlEscape(catalog.vendor || '')}</strong></td>
+            <td>${Number(catalog.active || 0) ? '<span class="good">Active</span>' : '<span class="muted">Inactive</span>'}</td>
+            <td>${htmlEscape(catalog.effective_date || '')}</td>
+            <td>${htmlEscape(catalog.received_date || '')}</td>
+            <td>${Number(catalog.item_count || 0).toLocaleString()}</td>
+            <td>${htmlEscape(catalog.sample_items || '')}</td>
+            <td>${catalog.source_file ? `<a class="pdf-link" href="/uploads/${encodeURIComponent(catalog.source_file)}" target="_blank" rel="noopener">Open Original</a>` : ''}</td>
+            <td>${htmlEscape((catalog.uploaded_at || '').replace('T', ' '))}<div class="muted">${htmlEscape(catalog.uploaded_by_username || '')}</div></td>
+            <td>${htmlEscape(catalog.notes || '')}</td>
+            <td class="actions-cell">${!Number(catalog.active || 0) ? `<button class="btn" data-activate-price-catalog="${catalog.id}" type="button">Make Active</button>` : ''}<button class="btn danger" data-delete-price-catalog="${catalog.id}" type="button">Delete</button></td>
+          </tr>`).join('')}</tbody>`
+        : '<tbody><tr><td>No vendor price catalogs match those filters.</td></tr></tbody>';
+      document.querySelectorAll('[data-activate-price-catalog]').forEach(btn => btn.onclick = async () => {
+        await api(`/api/vendor-price-catalogs/${btn.dataset.activatePriceCatalog}`, {
+          method: 'PUT',
+          body: JSON.stringify({ active: 1 })
+        });
+        await loadVendorPriceCatalogs();
+      });
+      document.querySelectorAll('[data-delete-price-catalog]').forEach(btn => btn.onclick = async () => {
+        if (!window.confirm('Delete this vendor price catalog upload and its parsed item rows?')) return;
+        await api(`/api/vendor-price-catalogs/${btn.dataset.deletePriceCatalog}`, { method: 'DELETE' });
+        await loadVendorPriceCatalogs();
+      });
+      enableResizableTables(document.getElementById('vendorPriceCatalog'));
+    }
+
+    async function loadVendorPriceCatalogs() {
+      vendorPriceCatalogs = await api('/api/vendor-price-catalogs');
+      renderVendorPriceCatalogs();
     }
 
     function invoiceKey(row) {
@@ -11770,11 +12529,21 @@ HTML = r"""
     function loadCogCategoryEditor() {
       const tableEl = document.getElementById('cogCategoryTable');
       if (!tableEl) return;
+      const userOptionsForCog = (c) => {
+        const allowed = new Set((c.allowed_user_ids || []).map(id => String(id)));
+        if (!state.cogAccessUsers.length) return '<div class="muted">No active users found.</div>';
+        return `<div class="cog-access-list">${state.cogAccessUsers.map(user => {
+          const label = [user.display_name, user.username].filter(Boolean).join(' - ');
+          return `<label class="checkline compact"><input data-cog="${c.id}" data-field="allowed_user_ids" data-cog-user="${user.id}" type="checkbox" value="${user.id}" ${allowed.has(String(user.id)) ? 'checked' : ''}> ${htmlEscape(label)}</label>`;
+        }).join('')}</div>`;
+      };
       tableEl.innerHTML = state.cogCategories.length
-        ? `<thead><tr><th>Name</th><th>Internal COG Code</th><th>Description</th><th></th></tr></thead><tbody>${state.cogCategories.map(c => `<tr>
+        ? `<thead><tr><th>Name</th><th>Internal COG Code</th><th>Description</th><th>Restricted</th><th>Allowed Users</th><th></th></tr></thead><tbody>${state.cogCategories.map(c => `<tr>
             <td><input data-cog="${c.id}" data-field="name" value="${htmlEscape(c.name || '')}"></td>
             <td><input data-cog="${c.id}" data-field="code" value="${htmlEscape(c.code || '')}"></td>
             <td><input data-cog="${c.id}" data-field="description" value="${htmlEscape(c.description || '')}"></td>
+            <td><label class="checkline"><input data-cog="${c.id}" data-field="restricted" type="checkbox" ${Number(c.restricted || 0) ? 'checked' : ''}> Restrict PO use</label><span class="access-rule-note">When checked, only selected users can create POs with this COG.</span></td>
+            <td>${userOptionsForCog(c)}</td>
             <td class="actions-cell"><button class="btn" data-save-cog="${c.id}" type="button">Save</button><button class="btn danger" data-delete-cog="${c.id}" type="button">Delete</button></td>
           </tr>`).join('')}</tbody>`
         : '<tbody><tr><td>No COG categories yet.</td></tr></tbody>';
@@ -11786,7 +12555,11 @@ HTML = r"""
       tableEl.querySelectorAll('[data-save-cog]').forEach(btn => btn.onclick = async () => {
         const id = btn.dataset.saveCog;
         const fields = {};
-        tableEl.querySelectorAll(`[data-cog="${id}"]`).forEach(el => fields[el.dataset.field] = el.value);
+        tableEl.querySelectorAll(`[data-cog="${id}"]`).forEach(el => {
+          if (el.dataset.field === 'allowed_user_ids') return;
+          fields[el.dataset.field] = el.type === 'checkbox' ? (el.checked ? '1' : '0') : el.value;
+        });
+        fields.allowed_user_ids = Array.from(tableEl.querySelectorAll(`[data-cog-user][data-cog="${id}"]:checked`)).map(el => el.value);
         await api(`/api/cog-categories/${id}`, { method:'PUT', body: JSON.stringify(fields) });
         btn.closest('tr')?.classList.remove('setup-dirty');
         markSaved();
@@ -14123,6 +14896,48 @@ HTML = r"""
     };
     document.getElementById('omitUntrackedAuditTickets').onchange = () => renderFieldWiseAudit();
     document.getElementById('exportMissingTickets').onclick = () => downloadMissingTicketCsv();
+    document.getElementById('poInvoiceAuditForm').onsubmit = async e => {
+      e.preventDefault();
+      const fileInput = e.target.querySelector('input[type="file"]');
+      const resultEl = document.getElementById('poInvoiceAuditResult');
+      if (!fileInput.files.length) {
+        resultEl.textContent = 'Choose the Field Wise ticket export first.';
+        return;
+      }
+      resultEl.textContent = 'Running PO invoice audit...';
+      const data = new FormData();
+      data.append('file', fileInput.files[0]);
+      try {
+        poInvoiceAuditData = await api('/api/po-invoice-audit', { method: 'POST', body: data });
+        const s = poInvoiceAuditData.summary || {};
+        resultEl.textContent = `Audit complete. Material lines needing PO invoice review: ${s.needs_invoice_count || 0}. Covered by PO invoice uploads: ${s.covered_count || 0}.`;
+        renderPoInvoiceAudit();
+      } catch (err) {
+        poInvoiceAuditData = null;
+        renderPoInvoiceAudit();
+        resultEl.textContent = `Audit failed: ${err.message}`;
+      }
+    };
+    document.getElementById('exportPoInvoiceAuditMissing').onclick = () => downloadPoInvoiceAuditCsv();
+    document.getElementById('vendorPriceCatalogForm').onsubmit = async e => {
+      e.preventDefault();
+      const resultEl = document.getElementById('vendorPriceCatalogResult');
+      resultEl.textContent = 'Uploading vendor price catalog...';
+      const data = new FormData(e.target);
+      try {
+        const result = await api('/api/vendor-price-catalogs', { method: 'POST', body: data });
+        resultEl.innerHTML = `<strong class="good">Uploaded ${Number(result.item_count || 0).toLocaleString()} price item(s) for ${htmlEscape(result.vendor || 'vendor')}.</strong>`;
+        e.target.reset();
+        e.target.querySelector('input[name="make_active"]').checked = true;
+        markSaved();
+        await loadVendorPriceCatalogs();
+      } catch (err) {
+        resultEl.innerHTML = `<span class="bad">${htmlEscape(err.message || 'Could not upload vendor price catalog.')}</span>`;
+      }
+    };
+    document.getElementById('refreshVendorPriceCatalogs').onclick = () => loadVendorPriceCatalogs();
+    document.getElementById('vendorPriceCatalogSearch').oninput = () => renderVendorPriceCatalogs();
+    document.getElementById('vendorPriceCatalogStatus').onchange = () => renderVendorPriceCatalogs();
     document.getElementById('addRate').onclick = async () => {
       await api('/api/internal-rates', {
         method: 'POST',
@@ -14144,10 +14959,12 @@ HTML = r"""
         body: JSON.stringify({
           code: document.getElementById('cogCode').value,
           name: document.getElementById('cogName').value,
-          description: document.getElementById('cogDescription').value
+          description: document.getElementById('cogDescription').value,
+          restricted: document.getElementById('cogRestricted')?.checked ? '1' : '0'
         })
       });
       ['cogCode','cogName','cogDescription'].forEach(id => document.getElementById(id).value = '');
+      if (document.getElementById('cogRestricted')) document.getElementById('cogRestricted').checked = false;
       markSaved();
       state.cogCategories = await api('/api/cog-categories');
       jobOrderReportRows = await api('/api/job-order-report');
@@ -14429,6 +15246,8 @@ class Handler(BaseHTTPRequestHandler):
                 content_types = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}
                 return file_response(self, path, content_types.get(path.suffix.lower(), "application/octet-stream"))
             if parsed.path == "/api/job-order-report":
+                user = current_user(self)
+                user_id = int(user["id"]) if user else 0
                 return json_response(
                     self,
                     rows(
@@ -14485,8 +15304,18 @@ class Handler(BaseHTTPRequestHandler):
                           'Active' AS status
                         FROM cog_categories cg
                         WHERE COALESCE(cg.active, 1) = 1
+                          AND (
+                            COALESCE(cg.restricted, 0) = 0
+                            OR EXISTS (
+                              SELECT 1
+                              FROM cog_category_user_access ca
+                              WHERE ca.cog_category_id = cg.id
+                                AND ca.user_id = ?
+                            )
+                          )
                         ORDER BY customer, project_name, job_number, item_type
-                        """
+                        """,
+                        (user_id,),
                     ),
                 )
             if parsed.path == "/api/fieldwise-audit-omissions":
@@ -14497,6 +15326,48 @@ class Handler(BaseHTTPRequestHandler):
                         SELECT *
                         FROM fieldwise_audit_omissions
                         ORDER BY created_at DESC, ticket_number, order_number
+                        """
+                    ),
+                )
+            if parsed.path == "/api/po-invoice-audit-omissions":
+                if not can_view_permission(user, "po_review"):
+                    return json_response(self, {"error": "PO review access required."}, 403)
+                return json_response(
+                    self,
+                    rows(
+                        """
+                        SELECT *
+                        FROM po_invoice_audit_omissions
+                        ORDER BY created_at DESC, ticket_number, order_number
+                        """
+                    ),
+                )
+            if parsed.path == "/api/vendor-price-catalogs":
+                if not can_view_permission(user, "vendor_price_catalog"):
+                    return json_response(self, {"error": "Vendor price catalog access required."}, 403)
+                return json_response(
+                    self,
+                    rows(
+                        """
+                        SELECT
+                          c.*,
+                          (SELECT COUNT(*) FROM vendor_price_items i WHERE i.catalog_id = c.id) AS item_count,
+                          (
+                            SELECT GROUP_CONCAT(label, '; ')
+                            FROM (
+                              SELECT
+                                CASE
+                                  WHEN i.item_number <> '' AND i.description <> '' THEN i.item_number || ' - ' || i.description
+                                  ELSE COALESCE(NULLIF(i.item_number, ''), i.description)
+                                END AS label
+                              FROM vendor_price_items i
+                              WHERE i.catalog_id = c.id
+                              ORDER BY i.id
+                              LIMIT 5
+                            )
+                          ) AS sample_items
+                        FROM vendor_price_catalogs c
+                        ORDER BY COALESCE(c.effective_date, c.uploaded_at) DESC, c.uploaded_at DESC, c.id DESC
                         """
                     ),
                 )
@@ -14513,6 +15384,10 @@ class Handler(BaseHTTPRequestHandler):
                 if not require_admin(self):
                     return json_response(self, {"error": "Admin required"}, 403)
                 return json_response(self, rows("SELECT id, username, display_name, role, active, COALESCE(po_auto_issue, 0) AS po_auto_issue, COALESCE(must_change_password, 0) AS must_change_password, created_at FROM users ORDER BY username"))
+            if parsed.path == "/api/cog-access-users":
+                if not require_admin(self):
+                    return json_response(self, {"error": "Admin required"}, 403)
+                return json_response(self, rows("SELECT id, username, display_name, role, active FROM users WHERE active = 1 ORDER BY COALESCE(display_name, username), username"))
             if parsed.path == "/api/admin/email-status":
                 if not require_admin(self):
                     return json_response(self, {"error": "Admin required"}, 403)
@@ -14717,7 +15592,17 @@ class Handler(BaseHTTPRequestHandler):
                     ),
                 )
             if parsed.path == "/api/cog-categories":
-                return json_response(self, rows("SELECT * FROM cog_categories WHERE COALESCE(active, 1) = 1 ORDER BY name, code"))
+                if not require_admin(self):
+                    return json_response(self, {"error": "Admin required"}, 403)
+                with db() as con:
+                    category_rows = [dict(r) for r in con.execute("SELECT *, COALESCE(restricted, 0) AS restricted FROM cog_categories WHERE COALESCE(active, 1) = 1 ORDER BY name, code").fetchall()]
+                    access_rows = con.execute("SELECT cog_category_id, user_id FROM cog_category_user_access").fetchall()
+                access_by_cog = {}
+                for access in access_rows:
+                    access_by_cog.setdefault(int(access["cog_category_id"]), []).append(int(access["user_id"]))
+                for category in category_rows:
+                    category["allowed_user_ids"] = sorted(access_by_cog.get(int(category["id"]), []))
+                return json_response(self, category_rows)
             if parsed.path == "/api/customer-invoices":
                 project_id = qs.get("project_id", [""])[0]
                 invoice_rows = rows(
@@ -15485,6 +16370,13 @@ class Handler(BaseHTTPRequestHandler):
                             except Exception:
                                 pass
                         return json_response(self, {"error": "That job/order is no longer available."}, 400)
+                    if job_ref["cog_category_id"] and not user_can_use_cog(con, user, job_ref["cog_category_id"]):
+                        if attachment_file:
+                            try:
+                                (UPLOAD_DIR / attachment_file).unlink()
+                            except Exception:
+                                pass
+                        return json_response(self, {"error": "You are not authorized to use that COG for PO creation."}, 403)
                     if po_customer_required_for_ref(job_ref) and not customer_name:
                         if attachment_file:
                             try:
@@ -15905,6 +16797,50 @@ class Handler(BaseHTTPRequestHandler):
                     )
                 log_activity(user, "marked ticket OK to omit", "Field Wise Audit", f"{ticket_number} / {order_number}", {"customer": data.get("customer"), "project_name": data.get("project_name"), "reason": data.get("reason")})
                 return json_response(self, {"ok": True})
+            if parsed.path == "/api/po-invoice-audit-omissions":
+                user = current_user(self)
+                if not can_edit_permission(user, "po_review"):
+                    return json_response(self, {"error": "PO review edit access required."}, 403)
+                data = parse_json(self)
+                ticket_number = str(data.get("ticket_number") or "").strip()
+                order_number = str(data.get("order_number") or "").strip()
+                item = str(data.get("item") or "").strip()
+                description = str(data.get("description") or "").strip()
+                if not ticket_number:
+                    return json_response(self, {"error": "Ticket number is required."}, 400)
+                if not order_number:
+                    return json_response(self, {"error": "Order number is required."}, 400)
+                with db() as con:
+                    con.execute(
+                        """
+                        INSERT INTO po_invoice_audit_omissions (
+                          ticket_number, order_number, customer, project_name, item, description, reason,
+                          omitted_by_user_id, omitted_by_username, created_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(ticket_number, order_number, item, description) DO UPDATE SET
+                          customer = excluded.customer,
+                          project_name = excluded.project_name,
+                          reason = excluded.reason,
+                          omitted_by_user_id = excluded.omitted_by_user_id,
+                          omitted_by_username = excluded.omitted_by_username,
+                          created_at = excluded.created_at
+                        """,
+                        (
+                            ticket_number,
+                            order_number,
+                            str(data.get("customer") or "").strip(),
+                            str(data.get("project_name") or "").strip(),
+                            item,
+                            description,
+                            str(data.get("reason") or "").strip(),
+                            user["id"],
+                            user["username"],
+                            datetime.now().isoformat(timespec="seconds"),
+                        ),
+                    )
+                log_activity(user, "marked PO invoice audit OK to omit", "Purchase Orders", f"{ticket_number} / {order_number}", {"item": item, "reason": data.get("reason")})
+                return json_response(self, {"ok": True})
             if parsed.path == "/api/fieldwise-audit":
                 form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": self.headers.get("Content-Type")})
                 file_item = form["file"] if "file" in form else None
@@ -15924,6 +16860,110 @@ class Handler(BaseHTTPRequestHandler):
                     except Exception:
                         pass
                 return json_response(self, result)
+            if parsed.path == "/api/po-invoice-audit":
+                user = current_user(self)
+                if not can_view_permission(user, "po_review"):
+                    return json_response(self, {"error": "PO review access required."}, 403)
+                form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": self.headers.get("Content-Type")})
+                file_item = form["file"] if "file" in form else None
+                if file_item is None or not getattr(file_item, "filename", ""):
+                    return json_response(self, {"error": "Choose a Field Wise ticket export."}, 400)
+                safe_name = Path(file_item.filename).name
+                if Path(safe_name).suffix.lower() not in (".xlsx", ".xlsm"):
+                    return json_response(self, {"error": "PO invoice audit export must be an Excel file."}, 400)
+                path = UPLOAD_DIR / f"{datetime.now().strftime('%Y%m%d%H%M%S')}-po-invoice-audit-{safe_name}"
+                with open(path, "wb") as f:
+                    f.write(file_item.file.read())
+                try:
+                    result = po_invoice_audit_result(path)
+                finally:
+                    try:
+                        path.unlink()
+                    except Exception:
+                        pass
+                log_activity(user, "ran PO invoice audit", "Purchase Orders", safe_name, result.get("summary", {}))
+                return json_response(self, result)
+            if parsed.path == "/api/vendor-price-catalogs":
+                actor = current_user(self)
+                if not can_edit_permission(actor, "vendor_price_catalog"):
+                    return json_response(self, {"error": "Vendor price catalog edit access required."}, 403)
+                form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": self.headers.get("Content-Type")})
+                file_item = form["file"] if "file" in form else None
+                if file_item is None or not getattr(file_item, "filename", ""):
+                    return json_response(self, {"error": "Choose a vendor price list file."}, 400)
+                vendor = str(form.getvalue("vendor") or "").strip()
+                if not vendor:
+                    return json_response(self, {"error": "Vendor is required."}, 400)
+                safe_name = Path(file_item.filename).name
+                suffix = Path(safe_name).suffix.lower()
+                if suffix not in (".xlsx", ".xlsm", ".csv"):
+                    return json_response(self, {"error": "Vendor price list must be Excel or CSV."}, 400)
+                saved_name = f"{datetime.now().strftime('%Y%m%d%H%M%S')}-vendor-price-{re.sub(r'[^A-Za-z0-9_.-]+', '-', vendor).strip('-')}-{safe_name}"
+                path = UPLOAD_DIR / saved_name
+                with open(path, "wb") as f:
+                    f.write(file_item.file.read())
+                try:
+                    parsed_items = parse_vendor_price_catalog(path)
+                except Exception as exc:
+                    try:
+                        path.unlink()
+                    except Exception:
+                        pass
+                    return json_response(self, {"error": str(exc)}, 400)
+                if not parsed_items:
+                    try:
+                        path.unlink()
+                    except Exception:
+                        pass
+                    return json_response(self, {"error": "No priced line items were found in that catalog."}, 400)
+                now = datetime.now().isoformat(timespec="seconds")
+                make_active = str(form.getvalue("make_active") or "").lower() in ("1", "true", "on", "yes")
+                with db() as con:
+                    if make_active:
+                        con.execute("UPDATE vendor_price_catalogs SET active = 0 WHERE lower(vendor) = lower(?)", (vendor,))
+                    catalog_id = con.execute(
+                        """
+                        INSERT INTO vendor_price_catalogs (
+                          vendor, effective_date, received_date, source_file, notes, active,
+                          uploaded_by_user_id, uploaded_by_username, uploaded_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            vendor,
+                            date_text(form.getvalue("effective_date")),
+                            date_text(form.getvalue("received_date")),
+                            saved_name,
+                            str(form.getvalue("notes") or "").strip(),
+                            1 if make_active else 0,
+                            actor["id"],
+                            actor["username"],
+                            now,
+                        ),
+                    ).lastrowid
+                    con.executemany(
+                        """
+                        INSERT INTO vendor_price_items (
+                          catalog_id, item_number, description, category, manufacturer, unit, unit_price, raw_row_json
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        [
+                            (
+                                catalog_id,
+                                item["item_number"],
+                                item["description"],
+                                item["category"],
+                                item["manufacturer"],
+                                item["unit"],
+                                item["unit_price"],
+                                item["raw_row_json"],
+                            )
+                            for item in parsed_items
+                        ],
+                    )
+                log_activity(actor, "uploaded vendor price catalog", "Vendor Price Catalog", vendor, {"item_count": len(parsed_items), "effective_date": form.getvalue("effective_date"), "active": make_active})
+                return json_response(self, {"ok": True, "id": catalog_id, "vendor": vendor, "item_count": len(parsed_items), "active": make_active})
             if parsed.path == "/api/import-fieldwise":
                 form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": self.headers.get("Content-Type")})
                 project_id = form.getvalue("project_id")
@@ -16340,9 +17380,14 @@ class Handler(BaseHTTPRequestHandler):
                         ensure_nte_defaults(con, data.get("project_id"), None, new_id)
                 return json_response(self, {"id": new_id})
             if parsed.path == "/api/cog-categories":
+                actor = current_user(self)
+                if not require_admin(self):
+                    return json_response(self, {"error": "Admin required"}, 403)
                 code = str(data.get("code") or "").strip().upper()
                 name = str(data.get("name") or "").strip()
                 description = str(data.get("description") or "").strip()
+                restricted = 1 if str(data.get("restricted") or "0") == "1" else 0
+                allowed_user_ids = data.get("allowed_user_ids") or []
                 if not code:
                     return json_response(self, {"error": "Internal COG code is required."}, 400)
                 if not name:
@@ -16351,16 +17396,18 @@ class Handler(BaseHTTPRequestHandler):
                     existing = con.execute("SELECT id FROM cog_categories WHERE lower(name) = lower(?)", (name,)).fetchone()
                     if existing:
                         con.execute(
-                            "UPDATE cog_categories SET code = ?, description = ?, active = 1 WHERE id = ?",
-                            (code, description, existing["id"]),
+                            "UPDATE cog_categories SET code = ?, description = ?, restricted = ?, active = 1 WHERE id = ?",
+                            (code, description, restricted, existing["id"]),
                         )
                         new_id = existing["id"]
                     else:
                         cur = con.execute(
-                            "INSERT INTO cog_categories (code, name, description, active, created_at) VALUES (?, ?, ?, 1, ?)",
-                            (code, name, description, datetime.now().isoformat(timespec="seconds")),
+                            "INSERT INTO cog_categories (code, name, description, restricted, active, created_at) VALUES (?, ?, ?, ?, 1, ?)",
+                            (code, name, description, restricted, datetime.now().isoformat(timespec="seconds")),
                         )
                         new_id = cur.lastrowid
+                    saved_access = set_cog_user_access(con, new_id, allowed_user_ids if restricted else [])
+                log_activity(actor, "saved COG category", "COG", name, {"code": code, "restricted": restricted, "allowed_user_ids": saved_access})
                 return json_response(self, {"id": new_id})
             if parsed.path == "/api/mcc-quote-items":
                 actor = current_user(self)
@@ -16892,6 +17939,21 @@ class Handler(BaseHTTPRequestHandler):
                     execute("UPDATE users SET po_auto_issue = ? WHERE id = ?", (1 if str(data.get("po_auto_issue")) == "1" else 0, user_id))
                 log_activity(current_user(self), "updated user", "User", target_user["username"], {"changed_fields": list(data.keys()), "new_username": str(data.get("username") or "").strip() if "username" in data else None, "new_role": clean_role(data.get("role")) if "role" in data else None, "active": data.get("active") if "active" in data else None, "po_auto_issue": data.get("po_auto_issue") if "po_auto_issue" in data else None})
                 return json_response(self, {"ok": True})
+            if parsed.path.startswith("/api/vendor-price-catalogs/"):
+                actor = current_user(self)
+                if not can_edit_permission(actor, "vendor_price_catalog"):
+                    return json_response(self, {"error": "Vendor price catalog edit access required."}, 403)
+                catalog_id = parsed.path.rsplit("/", 1)[-1]
+                with db() as con:
+                    catalog = con.execute("SELECT * FROM vendor_price_catalogs WHERE id = ?", (catalog_id,)).fetchone()
+                    if not catalog:
+                        return json_response(self, {"error": "Vendor price catalog not found."}, 404)
+                    active = 1 if str(data.get("active")) == "1" else 0
+                    if active:
+                        con.execute("UPDATE vendor_price_catalogs SET active = 0 WHERE lower(vendor) = lower(?) AND id <> ?", (catalog["vendor"], catalog_id))
+                    con.execute("UPDATE vendor_price_catalogs SET active = ? WHERE id = ?", (active, catalog_id))
+                log_activity(actor, "updated vendor price catalog", "Vendor Price Catalog", catalog["vendor"], {"catalog_id": catalog_id, "active": active})
+                return json_response(self, {"ok": True})
             if parsed.path.startswith("/api/purchase-orders/"):
                 po_id = parsed.path.rsplit("/", 1)[-1]
                 actor = current_user(self)
@@ -16912,6 +17974,8 @@ class Handler(BaseHTTPRequestHandler):
                     job_ref = job_reference_for_po(con, data.get("job_key"))
                     if not job_ref:
                         return json_response(self, {"error": "Choose a valid job/order number."}, 400)
+                    if job_ref["cog_category_id"] and not user_can_use_cog(con, actor, job_ref["cog_category_id"]):
+                        return json_response(self, {"error": "You are not authorized to use that COG on this PO."}, 403)
                     if po_customer_required_for_ref(job_ref) and not customer_name:
                         return json_response(self, {"error": "Customer is required for shop / COG POs."}, 400)
                     now = datetime.now().isoformat(timespec="seconds")
@@ -17741,10 +18805,15 @@ class Handler(BaseHTTPRequestHandler):
                 log_activity(actor, "updated VFD filter adder", "Quoting", "VFD Filter Adder", {"unit_price": new_unit_price, "markup_percent": new_markup_percent})
                 return json_response(self, {"ok": True})
             if parsed.path.startswith("/api/cog-categories/"):
+                actor = current_user(self)
+                if not require_admin(self):
+                    return json_response(self, {"error": "Admin required"}, 403)
                 category_id = parsed.path.rsplit("/", 1)[-1]
                 code = str(data.get("code") or "").strip().upper()
                 name = str(data.get("name") or "").strip()
                 description = str(data.get("description") or "").strip()
+                restricted = 1 if str(data.get("restricted") or "0") == "1" else 0
+                allowed_user_ids = data.get("allowed_user_ids") or []
                 if not code:
                     return json_response(self, {"error": "Internal COG code is required."}, 400)
                 if not name:
@@ -17754,11 +18823,14 @@ class Handler(BaseHTTPRequestHandler):
                     if duplicate:
                         return json_response(self, {"error": "That COG name already exists."}, 400)
                     updated = con.execute(
-                        "UPDATE cog_categories SET code = ?, name = ?, description = ?, active = 1 WHERE id = ?",
-                        (code, name, description, category_id),
+                        "UPDATE cog_categories SET code = ?, name = ?, description = ?, restricted = ?, active = 1 WHERE id = ?",
+                        (code, name, description, restricted, category_id),
                     ).rowcount
+                    if updated:
+                        saved_access = set_cog_user_access(con, category_id, allowed_user_ids if restricted else [])
                 if not updated:
                     return json_response(self, {"error": "COG category not found."}, 404)
+                log_activity(actor, "updated COG category access", "COG", name, {"code": code, "restricted": restricted, "allowed_user_ids": saved_access})
                 return json_response(self, {"ok": True})
             return json_response(self, {"error": "Not found"}, 404)
         except Exception as e:
@@ -17818,12 +18890,48 @@ class Handler(BaseHTTPRequestHandler):
                     return json_response(self, {"error": "Omission note not found."}, 404)
                 log_activity(current_user(self), "removed OK-to-omit note", "Field Wise Audit", f"{omission['ticket_number']} / {omission['order_number']}" if omission else omission_id)
                 return json_response(self, {"ok": True})
+            if parsed.path.startswith("/api/po-invoice-audit-omissions/"):
+                actor = current_user(self)
+                if not can_edit_permission(actor, "po_review"):
+                    return json_response(self, {"error": "PO review edit access required."}, 403)
+                omission_id = parsed.path.rsplit("/", 1)[-1]
+                with db() as con:
+                    omission = con.execute("SELECT * FROM po_invoice_audit_omissions WHERE id = ?", (omission_id,)).fetchone()
+                    deleted = con.execute("DELETE FROM po_invoice_audit_omissions WHERE id = ?", (omission_id,)).rowcount
+                if not deleted:
+                    return json_response(self, {"error": "PO invoice audit omission note not found."}, 404)
+                log_activity(actor, "removed PO invoice audit OK-to-omit note", "Purchase Orders", f"{omission['ticket_number']} / {omission['order_number']}" if omission else omission_id)
+                return json_response(self, {"ok": True})
+            if parsed.path.startswith("/api/vendor-price-catalogs/"):
+                actor = current_user(self)
+                if not can_edit_permission(actor, "vendor_price_catalog"):
+                    return json_response(self, {"error": "Vendor price catalog edit access required."}, 403)
+                catalog_id = parsed.path.rsplit("/", 1)[-1]
+                with db() as con:
+                    catalog = con.execute("SELECT * FROM vendor_price_catalogs WHERE id = ?", (catalog_id,)).fetchone()
+                    deleted = con.execute("DELETE FROM vendor_price_catalogs WHERE id = ?", (catalog_id,)).rowcount
+                if not deleted:
+                    return json_response(self, {"error": "Vendor price catalog not found."}, 404)
+                if catalog and catalog["source_file"]:
+                    try:
+                        (UPLOAD_DIR / catalog["source_file"]).unlink()
+                    except Exception:
+                        pass
+                log_activity(actor, "deleted vendor price catalog", "Vendor Price Catalog", catalog["vendor"] if catalog else catalog_id, {"catalog_id": catalog_id, "source_file": catalog["source_file"] if catalog else ""})
+                return json_response(self, {"ok": True})
             if parsed.path.startswith("/api/cog-categories/"):
+                actor = current_user(self)
+                if not require_admin(self):
+                    return json_response(self, {"error": "Admin required"}, 403)
                 category_id = parsed.path.rsplit("/", 1)[-1]
                 with db() as con:
+                    category = con.execute("SELECT * FROM cog_categories WHERE id = ?", (category_id,)).fetchone()
                     updated = con.execute("UPDATE cog_categories SET active = 0 WHERE id = ?", (category_id,)).rowcount
+                    if updated:
+                        con.execute("DELETE FROM cog_category_user_access WHERE cog_category_id = ?", (category_id,))
                 if not updated:
                     return json_response(self, {"error": "COG category not found."}, 404)
+                log_activity(actor, "deleted COG category", "COG", category["name"] if category else category_id, {"code": category["code"] if category else ""})
                 return json_response(self, {"ok": True})
             if parsed.path.startswith("/api/mcc-quote-items/"):
                 actor = current_user(self)
