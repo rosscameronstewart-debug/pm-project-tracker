@@ -6946,25 +6946,29 @@ def extract_vendor_invoice_total(path):
         return 0.0
     if not text:
         return 0.0
+    money_capture = r"(-?\$?\s*[0-9,]+\.[0-9]{2}-?|\(\$?\s*[0-9,]+\.[0-9]{2}\))"
     patterns = [
-        r"INVOICE\s+TOTAL\s+\$?([0-9,]+\.[0-9]{2})",
-        r"Amount Due\s+\$?([0-9,]+\.[0-9]{2})",
-        r"TOTAL\s+DUE\s*[-=]*>?\s*\$?([0-9,]+\.[0-9]{2})",
-        r"TOTALDUE\s*\n?\s*\$?([0-9,]+\.[0-9]{2})",
-        r"INVOICETOTAL\s*\n\s*\$?([0-9,]+\.[0-9]{2})",
-        r"Net Invoice Amount\s+\$\s*([0-9,]+\.[0-9]{2})",
-        r"BALANCE\s+DUE\s+\$?([0-9,]+\.[0-9]{2})",
-        r"Total\s+Invoice\s+Amount\s+\$?\s*([0-9,]+\.[0-9]{2})",
-        r"Total\s+Amount\s+\$?\s*([0-9,]+\.[0-9]{2})",
-        r"(?:Total|Amount Due)\s*:?\s*\$?\s*([0-9,]+\.[0-9]{2})",
-        r"Total\s*\n?\s*\$?([0-9,]+\.[0-9]{2})",
+        rf"INVOICE\s+TOTAL\s+{money_capture}",
+        rf"Amount Due\s+{money_capture}",
+        rf"TOTAL\s+DUE\s*[-=]*>?\s*{money_capture}",
+        rf"TOTALDUE\s*\n?\s*{money_capture}",
+        rf"INVOICETOTAL\s*\n\s*{money_capture}",
+        rf"Net Invoice Amount\s+{money_capture}",
+        rf"BALANCE\s+DUE\s+{money_capture}",
+        rf"Total\s+Invoice\s+Amount\s+{money_capture}",
+        rf"Total\s+Amount\s+{money_capture}",
+        rf"(?:Total|Amount Due)\s*:?\s*{money_capture}",
+        rf"Total\s*\n?\s*{money_capture}",
     ]
     amount = parse_money_text(first_regex(patterns, text, flags=re.IGNORECASE))
     if amount:
-        return amount
-    money_values = [parse_money_text(value) for value in re.findall(r"\b[0-9,]+\.[0-9]{2}\b", text)]
-    money_values = [value for value in money_values if value > 0]
-    return money_values[-1] if money_values else 0.0
+        return -abs(amount) if "credit memo" in text.lower() else amount
+    money_values = [parse_money_text(value) for value in re.findall(r"-?\$?\s*[0-9,]+\.[0-9]{2}-?|\(\$?\s*[0-9,]+\.[0-9]{2}\)", text)]
+    money_values = [value for value in money_values if value]
+    if not money_values:
+        return 0.0
+    fallback = money_values[-1]
+    return -abs(fallback) if "credit memo" in text.lower() else fallback
 
 
 def sync_po_invoice_cost_record(con, po, invoice_file, actor, invoice_amount=None, cost_record_id=None):
@@ -11144,7 +11148,7 @@ HTML = r"""
             po.voided_at ? `Voided ${String(po.voided_at).slice(0, 16).replace('T', ' ')}${po.voided_by_username ? ' by ' + po.voided_by_username : ''}` : ''
           ].filter(Boolean).map(line => `<div class="muted">${htmlEscape(line)}</div>`).join('');
           const invoiceBlock = invoiceRows.length
-            ? `<div class="po-invoice-list">${invoiceRows.map(inv => `<div class="po-invoice-line"><a class="pdf-link" href="/uploads/${encodeURIComponent(inv.invoice_file)}" target="_blank" rel="noopener">Vendor invoice</a> <span class="muted">${htmlEscape(String(inv.uploaded_at || '').slice(0, 16).replace('T', ' '))}</span><div class="inline-controls"><input data-office-po-invoice-edit="${inv.id}" type="number" min="0" step="0.01" value="${Number(inv.invoice_amount || 0)}" placeholder="Amount"><button class="btn" data-save-office-po-invoice="${inv.id}" type="button">Save Amount</button><button class="btn danger" data-delete-office-po-invoice="${inv.id}" type="button">Remove</button></div>${Number(inv.invoice_amount || 0) <= 0 ? '<div class="bad">Amount required</div>' : ''}</div>`).join('')}</div>`
+            ? `<div class="po-invoice-list">${invoiceRows.map(inv => `<div class="po-invoice-line"><a class="pdf-link" href="/uploads/${encodeURIComponent(inv.invoice_file)}" target="_blank" rel="noopener">Vendor invoice</a> <span class="muted">${htmlEscape(String(inv.uploaded_at || '').slice(0, 16).replace('T', ' '))}</span><div class="inline-controls"><input data-office-po-invoice-edit="${inv.id}" type="number" step="0.01" value="${Number(inv.invoice_amount || 0)}" placeholder="Amount"><button class="btn" data-save-office-po-invoice="${inv.id}" type="button">Save Amount</button><button class="btn danger" data-delete-office-po-invoice="${inv.id}" type="button">Remove</button></div>${Number(inv.invoice_amount || 0) === 0 ? '<div class="bad">Amount required</div>' : ''}</div>`).join('')}</div>`
             : po.invoice_file
               ? `<div><a class="pdf-link" href="/uploads/${encodeURIComponent(po.invoice_file)}" target="_blank" rel="noopener">Vendor invoice</a></div>`
               : '<div class="muted">No vendor invoice</div>';
@@ -11189,7 +11193,7 @@ HTML = r"""
         const data = new FormData();
         data.append('invoice_file', invoiceInput.files[0]);
         const result = await api(`/api/purchase-orders/${id}/invoice`, { method: 'POST', body: data });
-        if (Number(result.invoice_amount || 0) > 0) {
+        if (Number(result.invoice_amount || 0) !== 0) {
           window.alert(`Invoice uploaded. I found an invoice total of ${money(result.invoice_amount)}. Please verify it in the invoice list.`);
         } else {
           const entered = window.prompt('Invoice uploaded, but I could not read the total automatically. Enter the vendor invoice amount now:');
@@ -17307,7 +17311,7 @@ class Handler(BaseHTTPRequestHandler):
                         except OSError:
                             pass
                         return json_response(self, {"error": "Cannot upload an invoice to a void PO."}, 400)
-                    cost_record_id = sync_po_invoice_cost_record(con, po, saved_name, actor, invoice_amount) if invoice_amount > 0 else None
+                    cost_record_id = sync_po_invoice_cost_record(con, po, saved_name, actor, invoice_amount) if invoice_amount else None
                     invoice_cur = con.execute(
                         """
                         INSERT INTO purchase_order_invoices (
@@ -17338,7 +17342,7 @@ class Handler(BaseHTTPRequestHandler):
                         po["po_number"],
                         {"invoice_file": saved_name, "invoice_amount": invoice_amount, "uploaded_at": now, "cost_record_id": cost_record_id},
                     )
-                return json_response(self, {"ok": True, "invoice_id": invoice_cur.lastrowid, "invoice_file": saved_name, "invoice_amount": invoice_amount, "needs_amount": invoice_amount <= 0, "cost_record_id": cost_record_id})
+                return json_response(self, {"ok": True, "invoice_id": invoice_cur.lastrowid, "invoice_file": saved_name, "invoice_amount": invoice_amount, "needs_amount": invoice_amount == 0, "cost_record_id": cost_record_id})
             if parsed.path == "/api/role-permissions":
                 if not require_admin(self):
                     return json_response(self, {"error": "Admin required"}, 403)
@@ -18615,8 +18619,6 @@ class Handler(BaseHTTPRequestHandler):
                     return json_response(self, {"error": "Office PO access required."}, 403)
                 invoice_id = parsed.path.rsplit("/", 1)[-1]
                 invoice_amount = money(data.get("invoice_amount"))
-                if invoice_amount < 0:
-                    return json_response(self, {"error": "Invoice amount cannot be negative."}, 400)
                 with db() as con:
                     invoice = con.execute("SELECT * FROM purchase_order_invoices WHERE id = ?", (invoice_id,)).fetchone()
                     if not invoice:
@@ -18625,7 +18627,7 @@ class Handler(BaseHTTPRequestHandler):
                     if not po:
                         return json_response(self, {"error": "PO not found."}, 404)
                     cost_record_id = invoice["cost_record_id"]
-                    if invoice_amount > 0:
+                    if invoice_amount:
                         cost_record_id = sync_po_invoice_cost_record(
                             con,
                             po,
