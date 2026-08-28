@@ -1,5 +1,6 @@
 import cgi
 import csv
+import difflib
 import hashlib
 import hmac
 import json
@@ -63,6 +64,7 @@ DEFAULT_NEW_USER_PASSWORD = "TPE1776"
 CO_MATERIAL_MARGIN = 0.35
 CO_MATERIAL_COST_FACTOR = 1 - CO_MATERIAL_MARGIN
 COG_CUSTOMER_OPTIONAL_NAMES = {"expenses", "truck & auto expense", "truck and auto expense"}
+INVENTORY_PO_VENDOR_NAMES = {"warehouse inventory", "panel shop inventory", "panelshop inventory"}
 ROLE_NAMES = ("Admin", "User", "Read Only", "TX/Read Only", "Field PO")
 MCC_FEATURE_ENABLED = True
 HIDDEN_PERMISSION_KEYS = set() if MCC_FEATURE_ENABLED else {"mcc_quotes", "mcc_quote_setup"}
@@ -137,6 +139,10 @@ def po_customer_required_for_ref(job_ref):
     if not job_ref or not job_ref.get("cog_category_id"):
         return False
     return normalize_cog_name(job_ref.get("job_number")) not in COG_CUSTOMER_OPTIONAL_NAMES
+
+
+def is_inventory_po_vendor(vendor):
+    return normalize_cog_name(vendor) in INVENTORY_PO_VENDOR_NAMES
 
 
 def app_revision_info():
@@ -2025,6 +2031,38 @@ def init_db():
               uploaded_by_username TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS inventory_pick_tickets (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              po_id INTEGER NOT NULL UNIQUE REFERENCES purchase_orders(id) ON DELETE CASCADE,
+              inventory_source TEXT NOT NULL,
+              customer TEXT,
+              location_name TEXT,
+              afe_number TEXT,
+              notes TEXT,
+              status TEXT DEFAULT 'Draft',
+              created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+              created_by_username TEXT,
+              created_at TEXT NOT NULL,
+              updated_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+              updated_by_username TEXT,
+              updated_at TEXT,
+              closed_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+              closed_by_username TEXT,
+              closed_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS inventory_pick_ticket_lines (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              pick_ticket_id INTEGER NOT NULL REFERENCES inventory_pick_tickets(id) ON DELETE CASCADE,
+              fieldwise_part_id INTEGER REFERENCES fieldwise_parts(id) ON DELETE SET NULL,
+              qty REAL DEFAULT 0,
+              description TEXT,
+              part_number TEXT,
+              price REAL DEFAULT 0,
+              sort_order INTEGER DEFAULT 0,
+              created_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS cog_categories (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               code TEXT NOT NULL,
@@ -2070,6 +2108,22 @@ def init_db():
               UNIQUE(ticket_number, order_number, item, description)
             );
 
+            CREATE TABLE IF NOT EXISTS po_invoice_audit_acceptances (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              audit_run_id TEXT NOT NULL,
+              ticket_number TEXT NOT NULL,
+              order_number TEXT NOT NULL,
+              customer TEXT,
+              project_name TEXT,
+              item TEXT,
+              description TEXT,
+              reason TEXT,
+              accepted_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+              accepted_by_username TEXT,
+              created_at TEXT NOT NULL,
+              UNIQUE(audit_run_id, ticket_number, order_number, item, description)
+            );
+
             CREATE TABLE IF NOT EXISTS vendor_price_catalogs (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               vendor TEXT NOT NULL,
@@ -2093,6 +2147,28 @@ def init_db():
               unit TEXT,
               unit_price REAL DEFAULT 0,
               raw_row_json TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS fieldwise_parts_catalogs (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              source_file TEXT NOT NULL,
+              effective_date TEXT,
+              notes TEXT,
+              item_count INTEGER DEFAULT 0,
+              active INTEGER DEFAULT 1,
+              uploaded_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+              uploaded_by_username TEXT,
+              uploaded_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS fieldwise_parts (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              catalog_id INTEGER NOT NULL REFERENCES fieldwise_parts_catalogs(id) ON DELETE CASCADE,
+              tablet_label TEXT,
+              invoice_description TEXT,
+              part_number TEXT,
+              price REAL DEFAULT 0,
+              search_text TEXT
             );
             """
         )
@@ -2905,6 +2981,53 @@ def normalized_order_key(value):
     return str(value or "").strip().upper()
 
 
+def material_match_words(value):
+    stop_words = {
+        "the", "and", "for", "with", "from", "field", "ticket", "material",
+        "invoice", "vendor", "po", "tpe", "each", "misc", "miscellaneous",
+    }
+    words = re.findall(r"[a-z0-9]+", str(value or "").lower())
+    return {w for w in words if len(w) >= 3 and w not in stop_words}
+
+
+def possible_fieldwise_material_matches(invoice, purchase_lines, limit=3):
+    invoice_text = " ".join(
+        str(invoice.get(k) or "")
+        for k in ("vendor", "description")
+    )
+    invoice_words = material_match_words(invoice_text)
+    if not invoice_words:
+        return []
+    invoice_norm = " ".join(sorted(invoice_words))
+    invoice_order_key = normalized_order_key(invoice.get("job_number"))
+    candidates = []
+    for line in purchase_lines:
+        if normalized_order_key(line.get("order_number")) == invoice_order_key:
+            continue
+        line_text = " ".join(str(line.get(k) or "") for k in ("item", "description"))
+        line_words = material_match_words(line_text)
+        if not line_words:
+            continue
+        shared = invoice_words & line_words
+        overlap = len(shared) / max(1, min(len(invoice_words), len(line_words)))
+        similarity = difflib.SequenceMatcher(None, invoice_norm, " ".join(sorted(line_words))).ratio()
+        amount_score = 0
+        invoice_amount = money(invoice.get("invoice_amount"))
+        line_amount = money(line.get("amount"))
+        if invoice_amount > 0 and line_amount > 0:
+            amount_score = max(0, 1 - abs(invoice_amount - line_amount) / max(invoice_amount, line_amount))
+        score = (overlap * 0.55) + (similarity * 0.35) + (amount_score * 0.10)
+        if score < 0.42 and len(shared) < 2:
+            continue
+        candidates.append({
+            **line,
+            "match_score": round(score, 3),
+            "shared_terms": ", ".join(sorted(shared)[:6]),
+        })
+    candidates.sort(key=lambda r: (r["match_score"], money(r.get("amount"))), reverse=True)
+    return candidates[:limit]
+
+
 def looks_like_purchase_material_line(item, description):
     text = f"{item or ''} {description or ''}".lower()
     if not text.strip():
@@ -2980,111 +3103,157 @@ def parse_fieldwise_po_invoice_export(path):
     return {"line_count": line_count, "purchase_lines": purchase_lines}
 
 
-def po_invoice_audit_result(path):
+def po_invoice_audit_result(path, audit_run_id=None):
+    audit_run_id = audit_run_id or f"po-invoice-audit-{datetime.now().strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(4)}"
     export = parse_fieldwise_po_invoice_export(path)
     purchase_lines = export.get("purchase_lines", [])
     with db() as con:
-        omission_rows = con.execute(
+        acceptance_rows = con.execute(
             """
             SELECT *
-            FROM po_invoice_audit_omissions
+            FROM po_invoice_audit_acceptances
+            WHERE audit_run_id = ?
             ORDER BY created_at DESC, ticket_number, order_number
-            """
-        ).fetchall()
-        tracked_rows = con.execute(
-            """
-            SELECT
-              'Subproject' AS item_type,
-              sp.job_number,
-              p.name AS project_name,
-              p.customer,
-              sp.code AS reference_code
-            FROM subprojects sp
-            JOIN projects p ON p.id = sp.project_id
-            WHERE COALESCE(p.status, 'Active') <> 'Archived'
-              AND TRIM(COALESCE(sp.job_number, '')) <> ''
-            UNION ALL
-            SELECT
-              COALESCE(co.order_type, 'Change Order') AS item_type,
-              co.job_number,
-              p.name AS project_name,
-              p.customer,
-              co.co_number AS reference_code
-            FROM change_orders co
-            JOIN projects p ON p.id = co.project_id
-            WHERE COALESCE(p.status, 'Active') <> 'Archived'
-              AND TRIM(COALESCE(co.job_number, '')) <> ''
-            """
+            """,
+            (audit_run_id,),
         ).fetchall()
         invoice_rows = con.execute(
             """
             SELECT
+              poi.id AS po_invoice_id,
+              poi.po_id,
+              poi.invoice_file,
+              COALESCE(poi.invoice_amount, 0) AS invoice_amount,
+              poi.uploaded_at,
+              po.po_number,
               TRIM(COALESCE(po.job_number, '')) AS job_number,
-              COUNT(poi.id) AS invoice_count,
-              COALESCE(SUM(poi.invoice_amount), 0) AS invoice_total,
-              MAX(poi.uploaded_at) AS last_invoice_at
+              po.job_label,
+              COALESCE(NULLIF(po.customer_name, ''), p.customer, '') AS customer,
+              COALESCE(p.name, po.job_label, '') AS project_name,
+              po.vendor,
+              po.description,
+              po.status,
+              COALESCE(sp.code, co.co_number, cg.name, '') AS reference_code,
+              CASE
+                WHEN sp.id IS NOT NULL THEN 'Subproject'
+                WHEN co.id IS NOT NULL THEN COALESCE(co.order_type, 'Change Order')
+                WHEN cg.id IS NOT NULL THEN 'COG'
+                ELSE 'PO'
+              END AS item_type
             FROM purchase_orders po
             JOIN purchase_order_invoices poi ON poi.po_id = po.id
-            WHERE TRIM(COALESCE(po.job_number, '')) <> ''
-            GROUP BY TRIM(COALESCE(po.job_number, ''))
+            LEFT JOIN projects p ON p.id = po.project_id
+            LEFT JOIN subprojects sp ON sp.id = po.subproject_id
+            LEFT JOIN change_orders co ON co.id = po.change_order_id
+            LEFT JOIN cog_categories cg ON cg.id = po.cog_category_id
+            WHERE COALESCE(poi.invoice_amount, 0) > 0
+              AND COALESCE(po.status, '') <> 'Voided'
+            ORDER BY poi.uploaded_at DESC, poi.id DESC
             """
         ).fetchall()
 
-    tracked_jobs = {normalized_order_key(r["job_number"]): dict(r) for r in tracked_rows}
-    invoices_by_job = {normalized_order_key(r["job_number"]): dict(r) for r in invoice_rows}
-    omissions_by_key = {
+    fieldwise_by_order = {}
+    for line in purchase_lines:
+        order_key = normalized_order_key(line.get("order_number"))
+        if not order_key:
+            continue
+        bucket = fieldwise_by_order.setdefault(order_key, {"count": 0, "amount": 0, "tickets": set(), "latest_date": ""})
+        bucket["count"] += 1
+        bucket["amount"] += money(line.get("amount"))
+        if line.get("ticket_number"):
+            bucket["tickets"].add(str(line.get("ticket_number")))
+        if str(line.get("ticket_date") or "") > bucket["latest_date"]:
+            bucket["latest_date"] = str(line.get("ticket_date") or "")
+    acceptances_by_key = {
         "|".join([
             normalized_order_key(r["ticket_number"]),
             normalized_order_key(r["order_number"]),
             str(r["item"] or "").strip().lower(),
             str(r["description"] or "").strip().lower(),
         ]): dict(r)
-        for r in omission_rows
+        for r in acceptance_rows
     }
 
     needs_invoice = []
     covered = []
     omitted = []
-    untracked = []
-    for line in purchase_lines:
-        order_key = normalized_order_key(line["order_number"])
-        job = tracked_jobs.get(order_key)
-        if not job:
-            untracked.append(line)
-            continue
-        invoice = invoices_by_job.get(order_key)
+    po_job_keys = set()
+    for invoice_row in invoice_rows:
+        invoice = dict(invoice_row)
+        order_key = normalized_order_key(invoice.get("job_number"))
+        if order_key:
+            po_job_keys.add(order_key)
+        matched = fieldwise_by_order.get(order_key)
+        audit_ticket_number = f"{invoice.get('po_number') or ''}#{invoice.get('po_invoice_id') or ''}"
+        invoice_file = invoice.get("invoice_file") or ""
         audit_row = {
-            **line,
-            **job,
-            "po_invoice_count": invoice["invoice_count"] if invoice else 0,
-            "po_invoice_total": money(invoice["invoice_total"]) if invoice else 0,
-            "last_invoice_at": invoice["last_invoice_at"] if invoice else "",
+            "ticket_number": audit_ticket_number,
+            "display_ticket_number": invoice.get("po_number") or audit_ticket_number,
+            "order_number": invoice.get("job_number") or "",
+            "customer": invoice.get("customer") or "",
+            "project_name": invoice.get("project_name") or "",
+            "item_type": invoice.get("item_type") or "PO Invoice",
+            "reference_code": invoice.get("reference_code") or invoice_file,
+            "status": invoice.get("status") or "",
+            "ticket_date": str(invoice.get("uploaded_at") or "")[:10],
+            "item": invoice.get("vendor") or "",
+            "description": invoice.get("description") or invoice_file,
+            "quantity": int(matched["count"]) if matched else 0,
+            "rate": 0,
+            "amount": money(invoice.get("invoice_amount")),
+            "po_id": invoice.get("po_id"),
+            "po_invoice_id": invoice.get("po_invoice_id"),
+            "po_number": invoice.get("po_number") or "",
+            "po_invoice_file": invoice_file,
+            "po_uploaded_at": invoice.get("uploaded_at") or "",
+            "matched_fieldwise_count": int(matched["count"]) if matched else 0,
+            "matched_fieldwise_amount": money(matched["amount"]) if matched else 0,
+            "matched_fieldwise_tickets": ", ".join(sorted(matched["tickets"])) if matched else "",
+            "last_fieldwise_ticket_date": matched["latest_date"] if matched else "",
         }
-        if invoice and int(invoice["invoice_count"] or 0) > 0:
+        if matched:
             covered.append(audit_row)
             continue
+        possible_matches = possible_fieldwise_material_matches(invoice, purchase_lines)
+        audit_row["possible_fieldwise_matches"] = possible_matches
+        audit_row["possible_fieldwise_match_count"] = len(possible_matches)
+        if possible_matches:
+            audit_row["possible_fieldwise_match_summary"] = "; ".join(
+                [
+                    "Ticket {ticket} / Order {order} / {date} / {amount} ({terms})".format(
+                        ticket=m.get("ticket_number") or "",
+                        order=m.get("order_number") or "",
+                        date=m.get("ticket_date") or "",
+                        amount=f"${money(m.get('amount')):,.2f}",
+                        terms=m.get("shared_terms") or "similar text",
+                    )
+                    for m in possible_matches
+                ]
+            )
         omit_key = "|".join([
-            normalized_order_key(line["ticket_number"]),
+            normalized_order_key(audit_ticket_number),
             order_key,
-            str(line["item"] or "").strip().lower(),
-            str(line["description"] or "").strip().lower(),
+            str(audit_row["item"] or "").strip().lower(),
+            str(audit_row["description"] or "").strip().lower(),
         ])
-        omission = omissions_by_key.get(omit_key)
-        if omission:
-            omitted.append({**audit_row, "omission_id": omission["id"], "omission_reason": omission["reason"] or "", "omitted_by_username": omission["omitted_by_username"] or "", "omitted_at": omission["created_at"] or ""})
+        acceptance = acceptances_by_key.get(omit_key)
+        if acceptance:
+            omitted.append({**audit_row, "acceptance_id": acceptance["id"], "omission_reason": acceptance["reason"] or "", "omitted_by_username": acceptance["accepted_by_username"] or "", "omitted_at": acceptance["created_at"] or ""})
         else:
             needs_invoice.append(audit_row)
 
+    untracked = [line for line in purchase_lines if normalized_order_key(line.get("order_number")) not in po_job_keys]
     sort_key = lambda r: (str(r.get("project_name") or ""), str(r.get("order_number") or ""), str(r.get("ticket_number") or ""), str(r.get("item") or ""))
     needs_invoice.sort(key=sort_key)
     covered.sort(key=sort_key)
     omitted.sort(key=sort_key)
     untracked.sort(key=lambda r: (str(r.get("order_number") or ""), str(r.get("ticket_number") or "")))
     return {
+        "audit_run_id": audit_run_id,
         "summary": {
             "export_line_count": export.get("line_count", 0),
             "purchase_line_count": len(purchase_lines),
-            "tracked_job_count": len(tracked_jobs),
+            "po_invoice_count": len(invoice_rows),
             "needs_invoice_count": len(needs_invoice),
             "covered_count": len(covered),
             "omitted_count": len(omitted),
@@ -3199,6 +3368,72 @@ def parse_vendor_price_catalog(path):
             "unit": str(row_value(row, unit_idx) or "").strip(),
             "unit_price": unit_price,
             "raw_row_json": json.dumps([str(v or "") for v in row], default=str),
+        })
+    return parsed
+
+
+def parse_fieldwise_parts_database(path):
+    suffix = Path(path).suffix.lower()
+    if suffix in (".xlsx", ".xlsm"):
+        if openpyxl is None:
+            raise RuntimeError("Excel import needs openpyxl, but it is not available.")
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        ws = wb[wb.sheetnames[0]]
+        raw_rows = list(ws.iter_rows(values_only=True))
+    elif suffix == ".csv":
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            raw_rows = list(csv.reader(f))
+    else:
+        raise RuntimeError("Field Wise parts database must be an Excel or CSV file.")
+    if not raw_rows:
+        return []
+
+    header_row_index = None
+    headers = []
+    for idx, row in enumerate(raw_rows[:25]):
+        row_headers = [str(v or "").strip() for v in row]
+        has_tablet_label = first_matching_header_index(row_headers, ("DoForms- what the guys will see in tablets", "DoForms", "tablet", "tablet label", "fieldwise label")) is not None
+        has_invoice_desc = first_matching_header_index(row_headers, ("Part- what the invoices will show", "invoice description", "part description", "description")) is not None
+        has_part_number = first_matching_header_index(row_headers, ("Part #", "part number", "item number", "sku")) is not None
+        if has_tablet_label and (has_invoice_desc or has_part_number):
+            header_row_index = idx
+            headers = row_headers
+            break
+    if header_row_index is None:
+        raise RuntimeError("Could not find the Field Wise parts header row.")
+
+    tablet_idx = first_matching_header_index(headers, ("DoForms- what the guys will see in tablets", "DoForms", "tablet", "tablet label", "fieldwise label"))
+    invoice_idx = first_matching_header_index(headers, ("Part- what the invoices will show", "invoice description", "part description", "description"))
+    price_idx = first_matching_header_index(headers, ("Price", "unit price", "cost"))
+    part_idx = first_matching_header_index(headers, ("Part #", "part number", "item number", "sku"))
+
+    def row_value(row, idx):
+        if idx is None or idx >= len(row):
+            return ""
+        return row[idx]
+
+    parsed = []
+    seen = set()
+    for row in raw_rows[header_row_index + 1:]:
+        if not row or not any(str(v or "").strip() for v in row):
+            continue
+        tablet_label = str(row_value(row, tablet_idx) or "").strip()
+        invoice_description = str(row_value(row, invoice_idx) or "").strip()
+        part_number = str(row_value(row, part_idx) or "").strip()
+        price = parse_money_text(row_value(row, price_idx))
+        if not tablet_label and not invoice_description and not part_number:
+            continue
+        dedupe_key = "|".join([tablet_label.lower(), invoice_description.lower(), part_number.lower()])
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        search_text = " ".join([tablet_label, invoice_description, part_number]).lower()
+        parsed.append({
+            "tablet_label": tablet_label,
+            "invoice_description": invoice_description,
+            "part_number": part_number,
+            "price": price,
+            "search_text": search_text,
         })
     return parsed
 
@@ -6840,8 +7075,37 @@ def purchase_orders_with_invoices(sql, params=()):
     invoices_by_po = {}
     for invoice in invoice_rows:
         invoices_by_po.setdefault(invoice["po_id"], []).append(invoice)
+    pick_ticket_rows = rows(
+        f"""
+        SELECT *
+        FROM inventory_pick_tickets
+        WHERE po_id IN ({placeholders})
+        ORDER BY id
+        """,
+        po_ids,
+    )
+    pick_tickets_by_po = {ticket["po_id"]: ticket for ticket in pick_ticket_rows}
+    if pick_ticket_rows:
+        pick_ticket_ids = [ticket["id"] for ticket in pick_ticket_rows]
+        line_placeholders = ",".join("?" for _ in pick_ticket_ids)
+        line_rows = rows(
+            f"""
+            SELECT *
+            FROM inventory_pick_ticket_lines
+            WHERE pick_ticket_id IN ({line_placeholders})
+            ORDER BY sort_order, id
+            """,
+            pick_ticket_ids,
+        )
+        lines_by_ticket = {}
+        for line in line_rows:
+            lines_by_ticket.setdefault(line["pick_ticket_id"], []).append(line)
+        for ticket in pick_ticket_rows:
+            ticket["lines"] = lines_by_ticket.get(ticket["id"], [])
     for po in po_rows:
         po["invoices"] = invoices_by_po.get(po["id"], [])
+        po["pick_ticket"] = pick_tickets_by_po.get(po["id"])
+        po["requires_pick_ticket"] = 1 if is_inventory_po_vendor(po.get("vendor")) else 0
     return po_rows
 
 
@@ -7824,6 +8088,7 @@ HTML = r"""
     .field-po-panel select,
     .field-po-panel textarea { font-size: 18px; padding: 14px 13px; min-height: 52px; }
     .field-po-panel textarea { min-height: 132px; }
+    .field-po-vendor-list { max-height: 130px; }
     .field-po-submit { width: 100%; min-height: 58px; font-size: 18px; }
     .field-po-list { display: grid; gap: 12px; }
     .field-po-card { border: 1px solid var(--line); border-radius: 8px; background: var(--panel); padding: 14px; display: grid; gap: 10px; }
@@ -7839,6 +8104,30 @@ HTML = r"""
     .pickup-upload { border: 1px dashed color-mix(in srgb, var(--blue) 45%, var(--line)); background: color-mix(in srgb, var(--blue) 7%, var(--panel)); border-radius: 8px; padding: 12px; }
     .pickup-upload input { width: 100%; min-height: 48px; }
     .pickup-upload .btn { width: 100%; min-height: 48px; justify-content: center; margin-top: 8px; }
+    .pick-ticket-form { border: 1px dashed color-mix(in srgb, var(--green) 45%, var(--line)); background: color-mix(in srgb, var(--green) 7%, var(--panel)); border-radius: 8px; padding: 12px; display: grid; gap: 10px; }
+    .pick-ticket-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    .pick-ticket-form label { font-size: 12px; margin: 0 0 4px; color: var(--muted); }
+    .pick-ticket-form input, .pick-ticket-form textarea { font-size: 15px; min-height: 42px; padding: 9px 10px; }
+    .pick-ticket-form textarea { min-height: 72px; }
+    .pick-ticket-form .actions { margin: 0; }
+    .pick-ticket-status { font-weight: 800; }
+    .pick-ticket-lines { display: grid; gap: 8px; }
+    .pick-ticket-line-head, .pick-ticket-line { display: grid; grid-template-columns: 110px minmax(220px, 1.4fr) minmax(170px, 0.8fr) 86px; gap: 8px; align-items: start; }
+    .pick-ticket-line-head { color: var(--muted); font-size: 12px; font-weight: 800; text-transform: uppercase; }
+    .pick-ticket-line input { width: 100%; }
+    .mobile-only { display: none; }
+    .pick-part-combo { position: relative; }
+    .pick-part-results { position: absolute; z-index: 35; top: calc(100% + 4px); left: 0; right: 0; max-height: 240px; overflow: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 14px 30px rgba(15, 23, 42, 0.22); }
+    .pick-part-option { display: block; width: 100%; text-align: left; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: transparent; color: var(--text); padding: 9px 10px; cursor: pointer; }
+    .pick-part-option:hover, .pick-part-option:focus { background: color-mix(in srgb, var(--blue) 12%, transparent); outline: none; }
+    .pick-part-option strong { display: block; }
+    .pick-part-option span { display: block; color: var(--muted); font-size: 12px; margin-top: 2px; }
+    .combo-empty { padding: 10px; color: var(--muted); }
+    @media (max-width: 820px) {
+      .pick-ticket-line-head { display: none; }
+      .pick-ticket-line { grid-template-columns: 1fr; border: 1px solid var(--line); border-radius: 8px; padding: 8px; }
+      .mobile-only { display: block; }
+    }
     .combo-wrap { position: relative; }
     .combo-list {
       position: absolute;
@@ -8087,7 +8376,10 @@ HTML = r"""
             <input name="customer_name" id="fieldPoCustomer" placeholder="Customer name" autocomplete="organization" disabled>
           </div>
           <label>Vendor <span class="bad">*</span></label>
-          <input name="vendor" id="fieldPoVendor" placeholder="Vendor name" autocomplete="organization" required>
+          <div class="combo-wrap">
+            <input name="vendor" id="fieldPoVendor" placeholder="Vendor name or inventory..." autocomplete="organization" required>
+            <div id="fieldPoVendorList" class="combo-list field-po-vendor-list hidden"></div>
+          </div>
           <label>What are you buying?</label>
           <textarea name="description" id="fieldPoDescription" placeholder="Example: 2 boxes 3/4 EMT, 20 couplings, lift rental" required></textarea>
           <label>Estimated Amount</label>
@@ -8148,12 +8440,12 @@ HTML = r"""
     <section id="poInvoiceAudit" class="tab hidden">
       <form class="panel" id="poInvoiceAuditForm">
         <h2>PO Invoice Audit</h2>
-        <p class="muted">Upload the all-customer Field Wise line export to find tracked job/order material lines that do not have a PO vendor invoice uploaded yet.</p>
+        <p class="muted">Upload the all-customer Field Wise line export to find uploaded PO vendor invoices that do not appear on Field Wise material lines yet.</p>
         <label>Field Wise Ticket Export</label>
         <input id="poInvoiceAuditFile" type="file" accept=".xlsx,.xlsm" required>
         <div class="actions">
           <button class="btn primary" type="submit">Run Audit</button>
-          <button class="btn" id="exportPoInvoiceAuditMissing" type="button" disabled>Export Missing Invoice Lines</button>
+          <button class="btn" id="exportPoInvoiceAuditMissing" type="button" disabled>Export Missing Field Wise Lines</button>
         </div>
         <p id="poInvoiceAuditResult" class="muted"></p>
         <div id="poInvoiceAuditSummary" class="grid cols-4" style="margin-top:12px"></div>
@@ -8193,6 +8485,28 @@ HTML = r"""
         </div>
         <div class="muted" id="vendorPriceCatalogCount" style="margin-top:8px"></div>
         <div class="table-wrap" style="margin-top:10px"><table id="vendorPriceCatalogTable"></table></div>
+      </div>
+      <div class="panel" style="margin-top:14px">
+        <h2>Field Wise Parts Database</h2>
+        <p class="muted">Upload the current Field Wise material list here. The newest active upload will be used for inventory Pick Tickets.</p>
+        <form id="fieldwisePartsCatalogForm" enctype="multipart/form-data">
+          <div class="grid cols-4">
+            <div><label>Effective Date</label><input name="effective_date" type="date"></div>
+            <div style="grid-column:span 3"><label>Parts Database File</label><input name="file" type="file" accept=".xlsx,.xlsm,.csv" required></div>
+            <div style="grid-column:span 4"><label>Notes</label><input name="notes" placeholder="Upload note, Field Wise export date, or change summary"></div>
+          </div>
+          <div class="actions"><button class="btn primary" type="submit">Upload Parts Database</button></div>
+          <p id="fieldwisePartsCatalogResult" class="muted"></p>
+        </form>
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-top:14px">
+          <div>
+            <h2>Parts Database History</h2>
+            <p class="muted">Prior uploads stay available for reference. Only the latest active list feeds Pick Tickets.</p>
+          </div>
+          <button class="btn" id="refreshFieldwisePartsCatalogs" type="button">Refresh</button>
+        </div>
+        <div class="muted" id="fieldwisePartsCatalogCount" style="margin-top:8px"></div>
+        <div class="table-wrap" style="margin-top:10px"><table id="fieldwisePartsCatalogTable"></table></div>
       </div>
     </section>
 
@@ -9156,6 +9470,7 @@ HTML = r"""
     let poInvoiceAuditData = null;
     let poInvoiceAuditOmissions = [];
     let vendorPriceCatalogs = [];
+    let fieldwisePartsCatalogs = [];
     const collapsedHierarchyNodes = new Set();
     const initializedHierarchyNodes = new Set();
     const money = v => Number(v || 0).toLocaleString(undefined, { style: 'currency', currency: 'USD' });
@@ -10563,6 +10878,151 @@ HTML = r"""
       }).join('');
     }
 
+    function pickTicketLineHtml(line = {}, disabled = '') {
+      const isDisabled = Boolean(disabled);
+      return `<div class="pick-ticket-line" data-pick-ticket-line>
+        <div>
+          <label class="mobile-only">Quantity</label>
+          <input data-pick-line-field="qty" type="number" min="0" step="0.01" value="${htmlEscape(line.qty ?? '')}" placeholder="Qty" ${disabled}>
+        </div>
+        <div class="pick-part-combo">
+          <label class="mobile-only">Description</label>
+          <input data-pick-line-field="description" value="${htmlEscape(line.description || '')}" placeholder="Search description or part #" autocomplete="off" ${disabled}>
+          <input data-pick-line-field="fieldwise_part_id" type="hidden" value="${htmlEscape(line.fieldwise_part_id || '')}">
+          <input data-pick-line-field="price" type="hidden" value="${htmlEscape(line.price || '')}">
+          <div class="pick-part-results hidden" data-pick-part-results></div>
+        </div>
+        <div class="pick-part-combo">
+          <label class="mobile-only">Part Number</label>
+          <input data-pick-line-field="part_number" value="${htmlEscape(line.part_number || '')}" placeholder="Part number" autocomplete="off" ${disabled}>
+          <div class="pick-part-results hidden" data-pick-part-results></div>
+        </div>
+        <div>${isDisabled ? '' : '<button class="btn danger" data-remove-pick-line type="button">Remove</button>'}</div>
+      </div>`;
+    }
+
+    function inventoryPickTicketHtml(po) {
+      if (!Number(po.requires_pick_ticket || 0)) return '';
+      const ticket = po.pick_ticket || {};
+      const closed = ticket.status === 'Closed';
+      const disabled = closed ? 'disabled' : '';
+      const lines = Array.isArray(ticket.lines) && ticket.lines.length ? ticket.lines : [{}];
+      const closeAction = state.currentUser?.role === 'Admin' && !closed
+        ? `<button class="btn danger" data-close-pick-ticket="${po.id}" type="button">Close Pick Ticket</button>`
+        : '';
+      const statusText = closed
+        ? `<span class="pick-ticket-status good">Pick Ticket Closed</span><span class="muted"> ${htmlEscape(String(ticket.closed_at || '').slice(0, 16).replace('T', ' '))}</span>`
+        : '<span class="pick-ticket-status warn">Pick Ticket Draft</span>';
+      return `<form class="pick-ticket-form" data-pick-ticket-form="${po.id}">
+        <div>${statusText}</div>
+        <div class="pick-ticket-grid">
+          <div>
+            <label>Customer <span class="bad">*</span></label>
+            <input name="customer" value="${htmlEscape(ticket.customer || po.customer_name || '')}" placeholder="Customer" ${disabled} required>
+          </div>
+          <div>
+            <label>Location Name <span class="bad">*</span></label>
+            <input name="location_name" value="${htmlEscape(ticket.location_name || '')}" placeholder="Location name" ${disabled} required>
+          </div>
+          <div>
+            <label>AFE #</label>
+            <input name="afe_number" value="${htmlEscape(ticket.afe_number || '')}" placeholder="Optional" ${disabled}>
+          </div>
+          <div>
+            <label>PO Number</label>
+            <input value="${htmlEscape(po.po_number || '')}" disabled>
+          </div>
+        </div>
+        <div>
+          <label>Notes</label>
+          <textarea name="notes" placeholder="Parts pulled, field ticket reference, or internal note" ${disabled}>${htmlEscape(ticket.notes || '')}</textarea>
+        </div>
+        <div class="pick-ticket-lines">
+          <div class="pick-ticket-line-head"><div>Quantity</div><div>Description</div><div>Part Number</div><div></div></div>
+          <div data-pick-ticket-lines>${lines.map(line => pickTicketLineHtml(line, disabled)).join('')}</div>
+          ${closed ? '' : '<div><button class="btn" data-add-pick-line type="button">Add Line</button></div>'}
+        </div>
+        ${closed ? '' : `<div class="actions"><button class="btn primary" type="submit">Save Pick Ticket</button>${closeAction}</div>`}
+      </form>`;
+    }
+
+    function collectPickTicketLines(form) {
+      return Array.from(form.querySelectorAll('[data-pick-ticket-line]')).map((row, index) => {
+        const value = field => row.querySelector(`[data-pick-line-field="${field}"]`)?.value || '';
+        return {
+          qty: value('qty'),
+          description: value('description').trim(),
+          part_number: value('part_number').trim(),
+          fieldwise_part_id: value('fieldwise_part_id'),
+          price: value('price'),
+          sort_order: index
+        };
+      }).filter(line => line.qty || line.description || line.part_number || line.fieldwise_part_id);
+    }
+
+    function applyPickPartToLine(row, part) {
+      row.querySelector('[data-pick-line-field="description"]').value = part.tablet_label || part.invoice_description || '';
+      row.querySelector('[data-pick-line-field="part_number"]').value = part.part_number || '';
+      row.querySelector('[data-pick-line-field="fieldwise_part_id"]').value = part.id || '';
+      row.querySelector('[data-pick-line-field="price"]').value = part.price || '';
+      row.querySelectorAll('[data-pick-part-results]').forEach(el => {
+        el.classList.add('hidden');
+        el.innerHTML = '';
+      });
+    }
+
+    function bindPickTicketLineSearch(form) {
+      const linesContainer = form.querySelector('[data-pick-ticket-lines]');
+      form.querySelectorAll('[data-add-pick-line]').forEach(btn => btn.onclick = () => {
+        linesContainer.insertAdjacentHTML('beforeend', pickTicketLineHtml());
+        bindPickTicketLineSearch(form);
+      });
+      form.querySelectorAll('[data-remove-pick-line]').forEach(btn => btn.onclick = () => {
+        const rows = Array.from(form.querySelectorAll('[data-pick-ticket-line]'));
+        if (rows.length <= 1) {
+          rows[0].querySelectorAll('input').forEach(input => input.value = '');
+          return;
+        }
+        btn.closest('[data-pick-ticket-line]')?.remove();
+      });
+      form.querySelectorAll('[data-pick-line-field="description"], [data-pick-line-field="part_number"]').forEach(input => {
+        if (input.dataset.searchBound) return;
+        input.dataset.searchBound = '1';
+        input.addEventListener('input', async () => {
+          const row = input.closest('[data-pick-ticket-line]');
+          row.querySelector('[data-pick-line-field="fieldwise_part_id"]').value = '';
+          row.querySelector('[data-pick-line-field="price"]').value = '';
+          const results = input.parentElement.querySelector('[data-pick-part-results]');
+          const term = input.value.trim();
+          if (term.length < 2) {
+            results.classList.add('hidden');
+            results.innerHTML = '';
+            return;
+          }
+          const seq = String(Date.now());
+          input.dataset.searchSeq = seq;
+          try {
+            const parts = await api(`/api/fieldwise-parts?search=${encodeURIComponent(term)}`);
+            if (input.dataset.searchSeq !== seq) return;
+            results.innerHTML = parts.length
+              ? parts.map(part => `<button class="pick-part-option" type="button" data-pick-part-id="${part.id}">
+                  <strong>${htmlEscape(part.tablet_label || part.invoice_description || '')}</strong>
+                  <span>${htmlEscape(part.part_number || 'No part number')}${part.price ? ` - ${money(part.price)}` : ''}</span>
+                </button>`).join('')
+              : '<div class="combo-empty">No matching parts found.</div>';
+            results.classList.remove('hidden');
+            results.querySelectorAll('[data-pick-part-id]').forEach(btn => btn.onclick = () => {
+              const part = parts.find(item => String(item.id) === String(btn.dataset.pickPartId));
+              if (part) applyPickPartToLine(row, part);
+            });
+          } catch (err) {
+            results.innerHTML = `<div class="combo-empty">${htmlEscape(err.message || 'Could not search parts.')}</div>`;
+            results.classList.remove('hidden');
+          }
+        });
+      });
+    }
+
     async function loadFieldPos() {
       const poRows = await api('/api/purchase-orders');
       const target = document.getElementById('fieldPoList');
@@ -10595,6 +11055,7 @@ HTML = r"""
             <div class="actions" style="margin-top:0">
               <a class="btn" href="/po/${po.id}" target="_blank" rel="noopener">Open PO</a>
             </div>
+            ${inventoryPickTicketHtml(po)}
             ${pickup}
           </div>`;
         }).join('')
@@ -10610,6 +11071,34 @@ HTML = r"""
           await loadFieldPos();
         } catch (err) {
           window.alert(err.message || 'Could not upload pickup ticket.');
+        }
+      });
+      document.querySelectorAll('[data-pick-ticket-form]').forEach(form => form.onsubmit = async event => {
+        event.preventDefault();
+        const poId = form.dataset.pickTicketForm;
+        const payload = Object.fromEntries(new FormData(form).entries());
+        payload.lines = collectPickTicketLines(form);
+        try {
+          await api(`/api/purchase-orders/${poId}/pick-ticket`, {
+            method: 'POST',
+            body: JSON.stringify(payload)
+          });
+          await loadFieldPos();
+        } catch (err) {
+          window.alert(err.message || 'Could not save Pick Ticket.');
+        }
+      });
+      document.querySelectorAll('[data-pick-ticket-form]').forEach(form => bindPickTicketLineSearch(form));
+      document.querySelectorAll('[data-close-pick-ticket]').forEach(btn => btn.onclick = async () => {
+        if (!window.confirm('Close this Pick Ticket? Field users will not be able to edit it after closing.')) return;
+        try {
+          await api(`/api/purchase-orders/${btn.dataset.closePickTicket}/pick-ticket/close`, {
+            method: 'POST',
+            body: JSON.stringify({})
+          });
+          await loadFieldPos();
+        } catch (err) {
+          window.alert(err.message || 'Could not close Pick Ticket.');
         }
       });
     }
@@ -11381,18 +11870,19 @@ HTML = r"""
       return `<div class="panel" style="margin-top:14px">
         <h2>${htmlEscape(title)}</h2>
         <div class="muted">${rows.length} line(s)${rows.length > shown.length ? `, showing first ${shown.length}` : ''}</div>
-        <div class="table-wrap" style="margin-top:10px"><table>${shown.length ? `<thead><tr><th>Ticket</th><th>Order #</th><th>Customer</th><th>Project</th><th>Item</th><th>Description</th><th>Date</th><th>Qty</th><th>Amount</th>${actionHeader}</tr></thead><tbody>${shown.map(r => `
+        <div class="table-wrap" style="margin-top:10px"><table>${shown.length ? `<thead><tr><th>PO / Ticket</th><th>Job / Order</th><th>Customer</th><th>Project</th><th>Vendor / Item</th><th>Description</th><th>Date</th><th>Matches</th><th>Possible Elsewhere</th><th>Amount</th>${actionHeader}</tr></thead><tbody>${shown.map(r => `
           <tr>
-            <td><strong>${htmlEscape(r.ticket_number || '')}</strong></td>
+            <td><strong>${htmlEscape(r.display_ticket_number || r.po_number || r.ticket_number || '')}</strong>${r.po_invoice_file ? `<div><a class="pdf-link" href="/uploads/${encodeURIComponent(r.po_invoice_file)}" target="_blank" rel="noopener">Open Invoice</a></div>` : ''}</td>
             <td>${htmlEscape(r.order_number || '')}</td>
             <td>${htmlEscape(r.customer || '')}</td>
             <td>${htmlEscape(r.project_name || '')}<div class="muted">${htmlEscape(r.reference_code || '')}</div></td>
             <td>${htmlEscape(r.item || '')}</td>
             <td>${htmlEscape(r.description || '')}</td>
             <td>${htmlEscape(r.ticket_date || '')}</td>
-            <td>${Number(r.quantity || 0).toLocaleString()}</td>
+            <td>${Number(r.matched_fieldwise_count ?? r.quantity ?? 0).toLocaleString()}${r.matched_fieldwise_tickets ? `<div class="muted">${htmlEscape(r.matched_fieldwise_tickets)}</div>` : ''}</td>
+            <td>${r.possible_fieldwise_match_summary ? `<span class="warn">Maybe</span><div class="muted">${htmlEscape(r.possible_fieldwise_match_summary)}</div>` : '<span class="muted">None</span>'}</td>
             <td>${money(r.amount || 0)}</td>
-            ${showOmitAction ? `<td><button class="btn" type="button" data-omit-po-invoice-row="${omitRowPayload(r)}">Mark OK</button></td>` : ''}
+            ${showOmitAction ? `<td><button class="btn" type="button" data-omit-po-invoice-row="${omitRowPayload(r)}">Accept For This Audit</button></td>` : ''}
           </tr>`).join('')}</tbody>` : `<tbody><tr><td>${htmlEscape(emptyText)}</td></tr></tbody>`}</table></div>
       </div>`;
     }
@@ -11402,23 +11892,24 @@ HTML = r"""
       if (!el) return;
       const rows = poInvoiceAuditOmissions || [];
       el.innerHTML = `<div class="panel">
-        <h2>Lines Marked OK To Omit</h2>
-        <p class="muted">These Field Wise lines will not show as missing PO invoices in future audits.</p>
-        <div class="table-wrap" style="margin-top:10px"><table>${rows.length ? `<thead><tr><th>Ticket</th><th>Order #</th><th>Customer</th><th>Project</th><th>Item</th><th>Reason</th><th>Marked By</th><th>Date</th><th></th></tr></thead><tbody>${rows.map(r => `
+        <h2>Accepted PO Invoice Audit Lines</h2>
+        <p class="muted">These PO invoice lines are accepted only for the audit run they were marked in. Future imports can flag the same PO again.</p>
+        <div class="table-wrap" style="margin-top:10px"><table>${rows.length ? `<thead><tr><th>Audit Run</th><th>PO</th><th>Job / Order</th><th>Customer</th><th>Project</th><th>Vendor</th><th>Reason</th><th>Accepted By</th><th>Date</th><th></th></tr></thead><tbody>${rows.map(r => `
           <tr>
+            <td>${htmlEscape(r.audit_run_id || '')}</td>
             <td><strong>${htmlEscape(r.ticket_number || '')}</strong></td>
             <td>${htmlEscape(r.order_number || '')}</td>
             <td>${htmlEscape(r.customer || '')}</td>
             <td>${htmlEscape(r.project_name || '')}</td>
             <td>${htmlEscape(r.item || '')}</td>
             <td>${htmlEscape(r.reason || '')}</td>
-            <td>${htmlEscape(r.omitted_by_username || '')}</td>
+            <td>${htmlEscape(r.accepted_by_username || r.omitted_by_username || '')}</td>
             <td>${htmlEscape((r.created_at || '').replace('T', ' '))}</td>
             <td><button class="btn danger" type="button" data-delete-po-invoice-omission="${r.id}">Remove</button></td>
-          </tr>`).join('')}</tbody>` : '<tbody><tr><td>No PO invoice audit lines have been marked OK to omit yet.</td></tr></tbody>'}</table></div>
+          </tr>`).join('')}</tbody>` : '<tbody><tr><td>No PO invoice audit lines have been accepted yet.</td></tr></tbody>'}</table></div>
       </div>`;
       document.querySelectorAll('[data-delete-po-invoice-omission]').forEach(btn => btn.onclick = async () => {
-        if (!window.confirm('Remove this OK-to-omit note? The line can show as missing again on future audits.')) return;
+        if (!window.confirm('Remove this accepted audit note? The line can show as missing again if this audit is reviewed.')) return;
         await api(`/api/po-invoice-audit-omissions/${btn.dataset.deletePoInvoiceOmission}`, { method: 'DELETE' });
         await loadPoInvoiceAuditOmissions();
       });
@@ -11431,14 +11922,15 @@ HTML = r"""
 
     async function markPoInvoiceLineOmitted(row) {
       const reason = await requestAuditReason({
-        title: 'Mark PO Invoice Audit Line OK',
-        message: `Why is ticket ${row.ticket_number} / order ${row.order_number} OK without a PO invoice?`,
-        defaultReason: 'Valid material line, invoice not required in PO tracker'
+        title: 'Accept For This Audit',
+        message: `Why is PO ${row.display_ticket_number || row.po_number || row.ticket_number} / job ${row.order_number} OK for this audit without a matching Field Wise material line?`,
+        defaultReason: 'Not billable on this audit period'
       });
       if (reason === null) return;
       await api('/api/po-invoice-audit-omissions', {
         method: 'POST',
         body: JSON.stringify({
+          audit_run_id: poInvoiceAuditData?.audit_run_id || '',
           ticket_number: row.ticket_number,
           order_number: row.order_number,
           customer: row.customer,
@@ -11477,16 +11969,16 @@ HTML = r"""
       }
       const s = result.summary || {};
       summaryEl.innerHTML = [
-        ['Material Lines', s.purchase_line_count || 0, `${s.export_line_count || 0} export line(s) scanned`],
-        ['Need PO Invoice', s.needs_invoice_count || 0, 'Tracked jobs without PO invoice upload'],
-        ['Covered', s.covered_count || 0, 'Job/order has PO vendor invoice'],
-        ['Marked OK', s.omitted_count || 0, 'Hidden from missing list']
+        ['PO Invoices', s.po_invoice_count || 0, 'Uploaded PO vendor invoices scanned'],
+        ['Missing Field Wise', s.needs_invoice_count || 0, 'PO invoices not found on Field Wise material lines'],
+        ['Covered', s.covered_count || 0, 'Job/order found on Field Wise export'],
+        ['Accepted', s.omitted_count || 0, 'Accepted for this audit only']
       ].map(([label, value, hint]) => `<div class="kpi"><div class="label">${htmlEscape(label)}</div><div class="value">${value}</div><div class="hint">${htmlEscape(hint)}</div></div>`).join('');
       tablesEl.innerHTML = [
-        poInvoiceAuditRowsTable('Material Lines Missing A PO Vendor Invoice', result.needs_invoice || [], 'No tracked material lines are missing PO invoices.', { showOmitAction: true }),
-        poInvoiceAuditRowsTable('Marked OK To Omit In This Export', result.omitted || [], 'No previously omitted PO invoice audit lines were found in this export.'),
-        poInvoiceAuditRowsTable('Covered By PO Vendor Invoice Upload', result.covered || [], 'No covered lines found.'),
-        poInvoiceAuditRowsTable('Untracked Order Numbers', result.untracked || [], 'No untracked material lines found.')
+        poInvoiceAuditRowsTable('PO Vendor Invoices Missing Field Wise Material', result.needs_invoice || [], 'No PO vendor invoices are missing from Field Wise material lines.', { showOmitAction: true }),
+        poInvoiceAuditRowsTable('Accepted In This Audit', result.omitted || [], 'No lines have been accepted for this audit yet.'),
+        poInvoiceAuditRowsTable('PO Vendor Invoices Found On Field Wise', result.covered || [], 'No covered PO invoices found.'),
+        poInvoiceAuditRowsTable('Field Wise Material Without Matching PO', result.untracked || [], 'No Field Wise material lines are missing a matching PO.')
       ].join('');
       document.querySelectorAll('[data-omit-po-invoice-row]').forEach(btn => btn.onclick = async () => {
         try {
@@ -11505,11 +11997,11 @@ HTML = r"""
 
     function downloadPoInvoiceAuditCsv() {
       if (!poInvoiceAuditData?.needs_invoice?.length) return;
-      const headers = ['Ticket Number','Order Number','Customer','Project','Type','Reference','Ticket Date','Item','Description','Quantity','Rate','Amount'];
+      const headers = ['PO Number','Job / Order','Customer','Project','Type','Reference','Invoice Date','Vendor','Description','Invoice File','Invoice Amount','Field Wise Matches','Field Wise Tickets','Field Wise Amount','Possible Field Wise Match'];
       const lines = [headers.map(csvCell).join(',')];
       poInvoiceAuditData.needs_invoice.forEach(r => {
         lines.push([
-          r.ticket_number,
+          r.display_ticket_number || r.po_number || r.ticket_number,
           r.order_number,
           r.customer,
           r.project_name,
@@ -11518,9 +12010,12 @@ HTML = r"""
           r.ticket_date,
           r.item,
           r.description,
-          r.quantity || 0,
-          r.rate || 0,
-          r.amount || 0
+          r.po_invoice_file || '',
+          r.amount || 0,
+          r.matched_fieldwise_count || 0,
+          r.matched_fieldwise_tickets || '',
+          r.matched_fieldwise_amount || 0,
+          r.possible_fieldwise_match_summary || ''
         ].map(csvCell).join(','));
       });
       const blob = new Blob([lines.join('\r\n')], { type: 'text/csv' });
@@ -11582,6 +12077,32 @@ HTML = r"""
     async function loadVendorPriceCatalogs() {
       vendorPriceCatalogs = await api('/api/vendor-price-catalogs');
       renderVendorPriceCatalogs();
+      await loadFieldwisePartsCatalogs();
+    }
+
+    function renderFieldwisePartsCatalogs() {
+      const countEl = document.getElementById('fieldwisePartsCatalogCount');
+      const tableEl = document.getElementById('fieldwisePartsCatalogTable');
+      if (!countEl || !tableEl) return;
+      countEl.textContent = `${fieldwisePartsCatalogs.length} Field Wise parts database upload(s)`;
+      tableEl.innerHTML = fieldwisePartsCatalogs.length
+        ? `<thead><tr><th>Status</th><th>Effective</th><th>Items</th><th>Sample Parts</th><th>File</th><th>Uploaded</th><th>Notes</th></tr></thead><tbody>${fieldwisePartsCatalogs.map(catalog => `
+          <tr>
+            <td>${Number(catalog.active || 0) ? '<span class="good">Active</span>' : '<span class="muted">Inactive</span>'}</td>
+            <td>${htmlEscape(catalog.effective_date || '')}</td>
+            <td>${Number(catalog.item_count || 0).toLocaleString()}</td>
+            <td>${htmlEscape(catalog.sample_items || '')}</td>
+            <td>${catalog.source_file ? `<a class="pdf-link" href="/uploads/${encodeURIComponent(catalog.source_file)}" target="_blank" rel="noopener">Open Original</a>` : ''}</td>
+            <td>${htmlEscape((catalog.uploaded_at || '').replace('T', ' '))}<div class="muted">${htmlEscape(catalog.uploaded_by_username || '')}</div></td>
+            <td>${htmlEscape(catalog.notes || '')}</td>
+          </tr>`).join('')}</tbody>`
+        : '<tbody><tr><td>No Field Wise parts database has been uploaded yet.</td></tr></tbody>';
+      enableResizableTables(document.getElementById('vendorPriceCatalog'));
+    }
+
+    async function loadFieldwisePartsCatalogs() {
+      fieldwisePartsCatalogs = await api('/api/fieldwise-parts-catalogs');
+      renderFieldwisePartsCatalogs();
     }
 
     function invoiceKey(row) {
@@ -14660,8 +15181,37 @@ HTML = r"""
     document.addEventListener('click', event => {
       if (!event.target.closest('.combo-wrap')) {
         document.getElementById('fieldPoJobList')?.classList.add('hidden');
+        document.getElementById('fieldPoVendorList')?.classList.add('hidden');
       }
     });
+    const FIELD_PO_VENDOR_OPTIONS = ['Warehouse Inventory', 'Panel Shop Inventory'];
+    function renderFieldPoVendorChoices(query='') {
+      const list = document.getElementById('fieldPoVendorList');
+      if (!list) return;
+      const needle = String(query || '').trim().toLowerCase();
+      const matches = FIELD_PO_VENDOR_OPTIONS.filter(vendor => !needle || vendor.toLowerCase().includes(needle));
+      list.innerHTML = matches.length
+        ? matches.map(vendor => `<button class="combo-option" type="button" data-field-po-vendor-option="${htmlEscape(vendor)}"><strong>${htmlEscape(vendor)}</strong><span>Use this inventory source as the PO vendor</span></button>`).join('')
+        : '<div class="combo-option"><strong>No inventory option found</strong><span>Keep typing to enter a regular vendor.</span></div>';
+      list.classList.remove('hidden');
+      list.querySelectorAll('[data-field-po-vendor-option]').forEach(btn => {
+        btn.onclick = () => {
+          const vendorInput = document.getElementById('fieldPoVendor');
+          vendorInput.value = btn.dataset.fieldPoVendorOption || '';
+          list.classList.add('hidden');
+          vendorInput.focus();
+        };
+      });
+    }
+    document.getElementById('fieldPoVendor').oninput = event => {
+      renderFieldPoVendorChoices(event.target.value);
+    };
+    document.getElementById('fieldPoVendor').onfocus = event => {
+      renderFieldPoVendorChoices(event.target.value);
+    };
+    document.getElementById('fieldPoVendor').onclick = event => {
+      renderFieldPoVendorChoices(event.target.value);
+    };
     document.getElementById('fieldPoForm').onsubmit = async e => {
       e.preventDefault();
       const resultEl = document.getElementById('fieldPoResult');
@@ -14688,6 +15238,7 @@ HTML = r"""
         form.reset();
         document.getElementById('fieldPoJobKey').value = '';
         updateFieldPoCustomerRequirement();
+        document.getElementById('fieldPoVendorList')?.classList.add('hidden');
         await loadFieldPoJobs();
         await loadFieldPos();
         markSaved();
@@ -14938,6 +15489,22 @@ HTML = r"""
     document.getElementById('refreshVendorPriceCatalogs').onclick = () => loadVendorPriceCatalogs();
     document.getElementById('vendorPriceCatalogSearch').oninput = () => renderVendorPriceCatalogs();
     document.getElementById('vendorPriceCatalogStatus').onchange = () => renderVendorPriceCatalogs();
+    document.getElementById('fieldwisePartsCatalogForm').onsubmit = async e => {
+      e.preventDefault();
+      const resultEl = document.getElementById('fieldwisePartsCatalogResult');
+      resultEl.textContent = 'Uploading Field Wise parts database...';
+      const data = new FormData(e.target);
+      try {
+        const result = await api('/api/fieldwise-parts-catalogs', { method: 'POST', body: data });
+        resultEl.innerHTML = `<strong class="good">Uploaded ${Number(result.item_count || 0).toLocaleString()} Field Wise part(s).</strong>`;
+        e.target.reset();
+        markSaved();
+        await loadFieldwisePartsCatalogs();
+      } catch (err) {
+        resultEl.innerHTML = `<span class="bad">${htmlEscape(err.message || 'Could not upload Field Wise parts database.')}</span>`;
+      }
+    };
+    document.getElementById('refreshFieldwisePartsCatalogs').onclick = () => loadFieldwisePartsCatalogs();
     document.getElementById('addRate').onclick = async () => {
       await api('/api/internal-rates', {
         method: 'POST',
@@ -15337,8 +15904,9 @@ class Handler(BaseHTTPRequestHandler):
                     rows(
                         """
                         SELECT *
-                        FROM po_invoice_audit_omissions
+                        FROM po_invoice_audit_acceptances
                         ORDER BY created_at DESC, ticket_number, order_number
+                        LIMIT 500
                         """
                     ),
                 )
@@ -15369,6 +15937,73 @@ class Handler(BaseHTTPRequestHandler):
                         FROM vendor_price_catalogs c
                         ORDER BY COALESCE(c.effective_date, c.uploaded_at) DESC, c.uploaded_at DESC, c.id DESC
                         """
+                    ),
+                )
+            if parsed.path == "/api/fieldwise-parts-catalogs":
+                if not can_view_permission(user, "vendor_price_catalog"):
+                    return json_response(self, {"error": "Vendor price catalog access required."}, 403)
+                return json_response(
+                    self,
+                    rows(
+                        """
+                        SELECT
+                          c.*,
+                          (
+                            SELECT GROUP_CONCAT(label, '; ')
+                            FROM (
+                              SELECT
+                                CASE
+                                  WHEN i.part_number <> '' AND i.tablet_label <> '' THEN i.part_number || ' - ' || i.tablet_label
+                                  ELSE COALESCE(NULLIF(i.tablet_label, ''), i.invoice_description, i.part_number)
+                                END AS label
+                              FROM fieldwise_parts i
+                              WHERE i.catalog_id = c.id
+                              ORDER BY i.id
+                              LIMIT 5
+                            )
+                          ) AS sample_items
+                        FROM fieldwise_parts_catalogs c
+                        ORDER BY c.active DESC, COALESCE(c.effective_date, c.uploaded_at) DESC, c.uploaded_at DESC, c.id DESC
+                        """
+                    ),
+                )
+            if parsed.path == "/api/fieldwise-parts":
+                if not (can_use_field_po(user) or can_view_permission(user, "vendor_price_catalog")):
+                    return json_response(self, {"error": "PO access required."}, 403)
+                search = str(qs.get("search", [""])[0] or "").strip().lower()
+                if len(search) < 2:
+                    return json_response(self, [])
+                needle = f"%{search}%"
+                return json_response(
+                    self,
+                    rows(
+                        """
+                        SELECT
+                          p.id,
+                          p.tablet_label,
+                          p.invoice_description,
+                          p.part_number,
+                          p.price
+                        FROM fieldwise_parts p
+                        JOIN fieldwise_parts_catalogs c ON c.id = p.catalog_id
+                        WHERE COALESCE(c.active, 0) = 1
+                          AND (
+                            LOWER(COALESCE(p.search_text, '')) LIKE ?
+                            OR LOWER(COALESCE(p.tablet_label, '')) LIKE ?
+                            OR LOWER(COALESCE(p.part_number, '')) LIKE ?
+                          )
+                        ORDER BY
+                          CASE
+                            WHEN LOWER(COALESCE(p.part_number, '')) = ? THEN 0
+                            WHEN LOWER(COALESCE(p.part_number, '')) LIKE ? THEN 1
+                            WHEN LOWER(COALESCE(p.tablet_label, '')) LIKE ? THEN 2
+                            ELSE 3
+                          END,
+                          p.tablet_label,
+                          p.part_number
+                        LIMIT 30
+                        """,
+                        (needle, needle, needle, search, f"{search}%", f"{search}%"),
                     ),
                 )
             if parsed.path == "/api/projects":
@@ -16415,8 +17050,187 @@ class Handler(BaseHTTPRequestHandler):
                             now,
                         ),
                     )
+                    po_id = cur.lastrowid
+                    if is_inventory_po_vendor(vendor):
+                        con.execute(
+                            """
+                            INSERT OR IGNORE INTO inventory_pick_tickets (
+                              po_id, inventory_source, customer, status,
+                              created_by_user_id, created_by_username, created_at, updated_at
+                            )
+                            VALUES (?, ?, ?, 'Draft', ?, ?, ?, ?)
+                            """,
+                            (
+                                po_id,
+                                vendor,
+                                customer_name or job_ref["customer"] or "",
+                                user["id"],
+                                user["username"],
+                                now,
+                                now,
+                            ),
+                        )
                     log_activity(user, "created PO", "Purchase Order", po_number, {"status": initial_status, "vendor": vendor, "estimated_amount": estimated_amount})
-                    return json_response(self, {"id": cur.lastrowid, "po_number": po_number, "status": initial_status})
+                    return json_response(self, {"id": po_id, "po_number": po_number, "status": initial_status})
+            if parsed.path.startswith("/api/purchase-orders/") and parsed.path.endswith("/pick-ticket/close"):
+                actor = current_user(self)
+                if not require_admin(self):
+                    return json_response(self, {"error": "Admin required."}, 403)
+                po_id = parsed.path.split("/")[-3]
+                now = datetime.now().isoformat(timespec="seconds")
+                with db() as con:
+                    po = con.execute("SELECT * FROM purchase_orders WHERE id = ?", (po_id,)).fetchone()
+                    if not po or not is_inventory_po_vendor(po["vendor"]):
+                        return json_response(self, {"error": "Inventory PO not found."}, 404)
+                    ticket = con.execute("SELECT * FROM inventory_pick_tickets WHERE po_id = ?", (po_id,)).fetchone()
+                    if not ticket:
+                        return json_response(self, {"error": "Save the Pick Ticket before closing it."}, 400)
+                    missing = []
+                    if not str(ticket["customer"] or "").strip():
+                        missing.append("customer")
+                    if not str(ticket["location_name"] or "").strip():
+                        missing.append("location name")
+                    if missing:
+                        return json_response(self, {"error": f"Pick Ticket needs {', '.join(missing)} before it can be closed."}, 400)
+                    line_count = con.execute(
+                        """
+                        SELECT COUNT(*) AS count
+                        FROM inventory_pick_ticket_lines
+                        WHERE pick_ticket_id = ?
+                          AND COALESCE(qty, 0) > 0
+                          AND TRIM(COALESCE(description, '')) <> ''
+                          AND TRIM(COALESCE(part_number, '')) <> ''
+                        """,
+                        (ticket["id"],),
+                    ).fetchone()["count"]
+                    if not line_count:
+                        return json_response(self, {"error": "Pick Ticket needs at least one completed material line before it can be closed."}, 400)
+                    con.execute(
+                        """
+                        UPDATE inventory_pick_tickets
+                        SET status = 'Closed',
+                            closed_by_user_id = ?,
+                            closed_by_username = ?,
+                            closed_at = ?,
+                            updated_by_user_id = ?,
+                            updated_by_username = ?,
+                            updated_at = ?
+                        WHERE po_id = ?
+                        """,
+                        (actor["id"], actor["username"], now, actor["id"], actor["username"], now, po_id),
+                    )
+                log_activity(actor, "closed inventory pick ticket", "Purchase Order", po["po_number"], {"vendor": po["vendor"]})
+                return json_response(self, {"ok": True, "status": "Closed"})
+            if parsed.path.startswith("/api/purchase-orders/") and parsed.path.endswith("/pick-ticket"):
+                actor = current_user(self)
+                if not can_use_field_po(actor):
+                    return json_response(self, {"error": "PO access required."}, 403)
+                po_id = parsed.path.split("/")[-2]
+                data = parse_json(self)
+                customer = str(data.get("customer") or "").strip()
+                location_name = str(data.get("location_name") or "").strip()
+                afe_number = str(data.get("afe_number") or "").strip()
+                notes = str(data.get("notes") or "").strip()
+                line_payload = data.get("lines") if isinstance(data.get("lines"), list) else []
+                clean_lines = []
+                for index, line in enumerate(line_payload):
+                    if not isinstance(line, dict):
+                        continue
+                    qty = money(line.get("qty"))
+                    description = str(line.get("description") or "").strip()
+                    part_number = str(line.get("part_number") or "").strip()
+                    raw_part_id = line.get("fieldwise_part_id")
+                    try:
+                        fieldwise_part_id = int(raw_part_id) if str(raw_part_id or "").strip() else None
+                    except Exception:
+                        fieldwise_part_id = None
+                    price = money(line.get("price"))
+                    if not qty and not description and not part_number and not fieldwise_part_id:
+                        continue
+                    if qty <= 0 or not description or not part_number:
+                        return json_response(self, {"error": "Each Pick Ticket line needs quantity, description, and part number."}, 400)
+                    try:
+                        sort_order = int(line.get("sort_order"))
+                    except Exception:
+                        sort_order = index
+                    clean_lines.append({
+                        "qty": qty,
+                        "description": description,
+                        "part_number": part_number,
+                        "fieldwise_part_id": fieldwise_part_id,
+                        "price": price,
+                        "sort_order": sort_order,
+                    })
+                if not customer:
+                    return json_response(self, {"error": "Customer is required on the Pick Ticket."}, 400)
+                if not location_name:
+                    return json_response(self, {"error": "Location Name is required on the Pick Ticket."}, 400)
+                now = datetime.now().isoformat(timespec="seconds")
+                with db() as con:
+                    po = con.execute("SELECT * FROM purchase_orders WHERE id = ?", (po_id,)).fetchone()
+                    if not po or not is_inventory_po_vendor(po["vendor"]):
+                        return json_response(self, {"error": "Inventory PO not found."}, 404)
+                    if is_field_po_only(actor) and po["requested_by_user_id"] != actor["id"]:
+                        return json_response(self, {"error": "PO not found."}, 404)
+                    existing = con.execute("SELECT * FROM inventory_pick_tickets WHERE po_id = ?", (po_id,)).fetchone()
+                    if existing and existing["status"] == "Closed":
+                        return json_response(self, {"error": "This Pick Ticket is closed and can only be changed by reopening it later."}, 400)
+                    con.execute(
+                        """
+                        INSERT INTO inventory_pick_tickets (
+                          po_id, inventory_source, customer, location_name, afe_number, notes, status,
+                          created_by_user_id, created_by_username, created_at,
+                          updated_by_user_id, updated_by_username, updated_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, 'Draft', ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(po_id) DO UPDATE SET
+                          inventory_source = excluded.inventory_source,
+                          customer = excluded.customer,
+                          location_name = excluded.location_name,
+                          afe_number = excluded.afe_number,
+                          notes = excluded.notes,
+                          updated_by_user_id = excluded.updated_by_user_id,
+                          updated_by_username = excluded.updated_by_username,
+                          updated_at = excluded.updated_at
+                        """,
+                        (
+                            po_id,
+                            po["vendor"],
+                            customer,
+                            location_name,
+                            afe_number,
+                            notes,
+                            actor["id"],
+                            actor["username"],
+                            now,
+                            actor["id"],
+                            actor["username"],
+                            now,
+                        ),
+                    )
+                    ticket = con.execute("SELECT * FROM inventory_pick_tickets WHERE po_id = ?", (po_id,)).fetchone()
+                    con.execute("DELETE FROM inventory_pick_ticket_lines WHERE pick_ticket_id = ?", (ticket["id"],))
+                    for line in clean_lines:
+                        con.execute(
+                            """
+                            INSERT INTO inventory_pick_ticket_lines (
+                              pick_ticket_id, fieldwise_part_id, qty, description, part_number, price, sort_order, created_at
+                            )
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                ticket["id"],
+                                line["fieldwise_part_id"],
+                                line["qty"],
+                                line["description"],
+                                line["part_number"],
+                                line["price"],
+                                line["sort_order"],
+                                now,
+                            ),
+                        )
+                log_activity(actor, "saved inventory pick ticket", "Purchase Order", po["po_number"], {"vendor": po["vendor"], "customer": customer, "location_name": location_name, "afe_number": afe_number, "lines": len(clean_lines)})
+                return json_response(self, {"ok": True, "status": "Draft"})
             if parsed.path.startswith("/api/purchase-orders/") and parsed.path.endswith("/pickup"):
                 user = current_user(self)
                 if not can_use_field_po(user):
@@ -16802,10 +17616,13 @@ class Handler(BaseHTTPRequestHandler):
                 if not can_edit_permission(user, "po_review"):
                     return json_response(self, {"error": "PO review edit access required."}, 403)
                 data = parse_json(self)
+                audit_run_id = str(data.get("audit_run_id") or "").strip()
                 ticket_number = str(data.get("ticket_number") or "").strip()
                 order_number = str(data.get("order_number") or "").strip()
                 item = str(data.get("item") or "").strip()
                 description = str(data.get("description") or "").strip()
+                if not audit_run_id:
+                    return json_response(self, {"error": "Run the audit again before accepting a line."}, 400)
                 if not ticket_number:
                     return json_response(self, {"error": "Ticket number is required."}, 400)
                 if not order_number:
@@ -16813,20 +17630,21 @@ class Handler(BaseHTTPRequestHandler):
                 with db() as con:
                     con.execute(
                         """
-                        INSERT INTO po_invoice_audit_omissions (
-                          ticket_number, order_number, customer, project_name, item, description, reason,
-                          omitted_by_user_id, omitted_by_username, created_at
+                        INSERT INTO po_invoice_audit_acceptances (
+                          audit_run_id, ticket_number, order_number, customer, project_name, item, description, reason,
+                          accepted_by_user_id, accepted_by_username, created_at
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(ticket_number, order_number, item, description) DO UPDATE SET
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(audit_run_id, ticket_number, order_number, item, description) DO UPDATE SET
                           customer = excluded.customer,
                           project_name = excluded.project_name,
                           reason = excluded.reason,
-                          omitted_by_user_id = excluded.omitted_by_user_id,
-                          omitted_by_username = excluded.omitted_by_username,
+                          accepted_by_user_id = excluded.accepted_by_user_id,
+                          accepted_by_username = excluded.accepted_by_username,
                           created_at = excluded.created_at
                         """,
                         (
+                            audit_run_id,
                             ticket_number,
                             order_number,
                             str(data.get("customer") or "").strip(),
@@ -16839,7 +17657,7 @@ class Handler(BaseHTTPRequestHandler):
                             datetime.now().isoformat(timespec="seconds"),
                         ),
                     )
-                log_activity(user, "marked PO invoice audit OK to omit", "Purchase Orders", f"{ticket_number} / {order_number}", {"item": item, "reason": data.get("reason")})
+                log_activity(user, "accepted PO invoice audit line", "Purchase Orders", f"{ticket_number} / {order_number}", {"audit_run_id": audit_run_id, "item": item, "reason": data.get("reason")})
                 return json_response(self, {"ok": True})
             if parsed.path == "/api/fieldwise-audit":
                 form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": self.headers.get("Content-Type")})
@@ -16875,13 +17693,14 @@ class Handler(BaseHTTPRequestHandler):
                 with open(path, "wb") as f:
                     f.write(file_item.file.read())
                 try:
-                    result = po_invoice_audit_result(path)
+                    audit_run_id = f"{datetime.now().strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(4)}"
+                    result = po_invoice_audit_result(path, audit_run_id)
                 finally:
                     try:
                         path.unlink()
                     except Exception:
                         pass
-                log_activity(user, "ran PO invoice audit", "Purchase Orders", safe_name, result.get("summary", {}))
+                log_activity(user, "ran PO invoice audit", "Purchase Orders", safe_name, {**result.get("summary", {}), "audit_run_id": result.get("audit_run_id")})
                 return json_response(self, result)
             if parsed.path == "/api/vendor-price-catalogs":
                 actor = current_user(self)
@@ -16964,6 +17783,78 @@ class Handler(BaseHTTPRequestHandler):
                     )
                 log_activity(actor, "uploaded vendor price catalog", "Vendor Price Catalog", vendor, {"item_count": len(parsed_items), "effective_date": form.getvalue("effective_date"), "active": make_active})
                 return json_response(self, {"ok": True, "id": catalog_id, "vendor": vendor, "item_count": len(parsed_items), "active": make_active})
+            if parsed.path == "/api/fieldwise-parts-catalogs":
+                actor = current_user(self)
+                if not can_edit_permission(actor, "vendor_price_catalog"):
+                    return json_response(self, {"error": "Vendor price catalog edit access required."}, 403)
+                form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": self.headers.get("Content-Type")})
+                file_item = form["file"] if "file" in form else None
+                if file_item is None or not getattr(file_item, "filename", ""):
+                    return json_response(self, {"error": "Choose the Field Wise parts database file."}, 400)
+                safe_name = Path(file_item.filename).name
+                suffix = Path(safe_name).suffix.lower()
+                if suffix not in (".xlsx", ".xlsm", ".csv"):
+                    return json_response(self, {"error": "Field Wise parts database must be Excel or CSV."}, 400)
+                saved_name = f"{datetime.now().strftime('%Y%m%d%H%M%S')}-fieldwise-parts-{safe_name}"
+                path = UPLOAD_DIR / saved_name
+                with open(path, "wb") as f:
+                    f.write(file_item.file.read())
+                try:
+                    parsed_parts = parse_fieldwise_parts_database(path)
+                except Exception as exc:
+                    try:
+                        path.unlink()
+                    except Exception:
+                        pass
+                    return json_response(self, {"error": str(exc)}, 400)
+                if not parsed_parts:
+                    try:
+                        path.unlink()
+                    except Exception:
+                        pass
+                    return json_response(self, {"error": "No Field Wise parts were found in that file."}, 400)
+                now = datetime.now().isoformat(timespec="seconds")
+                with db() as con:
+                    con.execute("UPDATE fieldwise_parts_catalogs SET active = 0")
+                    catalog_id = con.execute(
+                        """
+                        INSERT INTO fieldwise_parts_catalogs (
+                          source_file, effective_date, notes, item_count, active,
+                          uploaded_by_user_id, uploaded_by_username, uploaded_at
+                        )
+                        VALUES (?, ?, ?, ?, 1, ?, ?, ?)
+                        """,
+                        (
+                            saved_name,
+                            date_text(form.getvalue("effective_date")),
+                            str(form.getvalue("notes") or "").strip(),
+                            len(parsed_parts),
+                            actor["id"],
+                            actor["username"],
+                            now,
+                        ),
+                    ).lastrowid
+                    con.executemany(
+                        """
+                        INSERT INTO fieldwise_parts (
+                          catalog_id, tablet_label, invoice_description, part_number, price, search_text
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        [
+                            (
+                                catalog_id,
+                                part["tablet_label"],
+                                part["invoice_description"],
+                                part["part_number"],
+                                part["price"],
+                                part["search_text"],
+                            )
+                            for part in parsed_parts
+                        ],
+                    )
+                log_activity(actor, "uploaded Field Wise parts database", "Field Wise Parts", safe_name, {"item_count": len(parsed_parts), "effective_date": form.getvalue("effective_date")})
+                return json_response(self, {"ok": True, "id": catalog_id, "item_count": len(parsed_parts), "source_file": saved_name})
             if parsed.path == "/api/import-fieldwise":
                 form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": self.headers.get("Content-Type")})
                 project_id = form.getvalue("project_id")
@@ -18074,6 +18965,25 @@ class Handler(BaseHTTPRequestHandler):
                     ).rowcount
                     if not updated:
                         return json_response(self, {"error": "PO not found."}, 404)
+                    if is_inventory_po_vendor(vendor):
+                        con.execute(
+                            """
+                            INSERT OR IGNORE INTO inventory_pick_tickets (
+                              po_id, inventory_source, customer, status,
+                              created_by_user_id, created_by_username, created_at, updated_at
+                            )
+                            VALUES (?, ?, ?, 'Draft', ?, ?, ?, ?)
+                            """,
+                            (
+                                po_id,
+                                vendor,
+                                customer_name or job_ref["customer"] or "",
+                                actor["id"],
+                                actor["username"],
+                                now,
+                                now,
+                            ),
+                        )
                 if action_detail:
                     log_activity(actor, action_detail[0], "Purchase Order", current_po["po_number"], action_detail[1])
                 log_activity(actor, "updated PO", "Purchase Order", current_po["po_number"], {"status": status, "vendor": vendor, "estimated_amount": money(data.get("estimated_amount"))})
@@ -18896,11 +19806,11 @@ class Handler(BaseHTTPRequestHandler):
                     return json_response(self, {"error": "PO review edit access required."}, 403)
                 omission_id = parsed.path.rsplit("/", 1)[-1]
                 with db() as con:
-                    omission = con.execute("SELECT * FROM po_invoice_audit_omissions WHERE id = ?", (omission_id,)).fetchone()
-                    deleted = con.execute("DELETE FROM po_invoice_audit_omissions WHERE id = ?", (omission_id,)).rowcount
+                    omission = con.execute("SELECT * FROM po_invoice_audit_acceptances WHERE id = ?", (omission_id,)).fetchone()
+                    deleted = con.execute("DELETE FROM po_invoice_audit_acceptances WHERE id = ?", (omission_id,)).rowcount
                 if not deleted:
-                    return json_response(self, {"error": "PO invoice audit omission note not found."}, 404)
-                log_activity(actor, "removed PO invoice audit OK-to-omit note", "Purchase Orders", f"{omission['ticket_number']} / {omission['order_number']}" if omission else omission_id)
+                    return json_response(self, {"error": "PO invoice audit acceptance note not found."}, 404)
+                log_activity(actor, "removed PO invoice audit acceptance", "Purchase Orders", f"{omission['ticket_number']} / {omission['order_number']}" if omission else omission_id)
                 return json_response(self, {"ok": True})
             if parsed.path.startswith("/api/vendor-price-catalogs/"):
                 actor = current_user(self)
