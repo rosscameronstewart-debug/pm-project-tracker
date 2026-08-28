@@ -22,6 +22,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 try:
     import openpyxl
@@ -59,6 +61,10 @@ SMTP_USERNAME = os.environ.get("PM_TRACKER_SMTP_USERNAME", "")
 SMTP_PASSWORD = os.environ.get("PM_TRACKER_SMTP_PASSWORD", "")
 SMTP_FROM = os.environ.get("PM_TRACKER_SMTP_FROM", SMTP_USERNAME)
 SMTP_USE_TLS = os.environ.get("PM_TRACKER_SMTP_TLS", "1").lower() not in ("0", "false", "no")
+INVENTORYCLOUD_BASE_URL = os.environ.get("PM_TRACKER_INVENTORYCLOUD_BASE_URL", "https://twinpeakselectrical.waspinventorycloud.com").rstrip("/")
+INVENTORYCLOUD_API_TOKEN = os.environ.get("PM_TRACKER_INVENTORYCLOUD_API_TOKEN", "")
+INVENTORYCLOUD_USER_AGENT = os.environ.get("PM_TRACKER_INVENTORYCLOUD_USER_AGENT", "TwinPeaksProjectDashboard/1.0")
+INVENTORYCLOUD_ITEM_TYPE = int(os.environ.get("PM_TRACKER_INVENTORYCLOUD_ITEM_TYPE", "2147483635"))
 SESSION_IDLE_TIMEOUT_MINUTES = 30
 DEFAULT_NEW_USER_PASSWORD = "TPE1776"
 CO_MATERIAL_MARGIN = 0.35
@@ -5901,6 +5907,87 @@ def smtp_status():
     }
 
 
+def inventorycloud_status():
+    return {
+        "configured": bool(INVENTORYCLOUD_BASE_URL and INVENTORYCLOUD_API_TOKEN),
+        "base_url": INVENTORYCLOUD_BASE_URL,
+        "token_set": bool(INVENTORYCLOUD_API_TOKEN),
+        "user_agent": INVENTORYCLOUD_USER_AGENT,
+    }
+
+
+def inventorycloud_item_search(search):
+    search = str(search or "").strip()
+    if len(search) < 2:
+        return []
+    if not INVENTORYCLOUD_BASE_URL or not INVENTORYCLOUD_API_TOKEN:
+        return []
+    url = f"{INVENTORYCLOUD_BASE_URL}/public-api/ic/item/infosearch"
+    body = json.dumps({"SearchPattern": search, "ItemType": INVENTORYCLOUD_ITEM_TYPE}).encode("utf-8")
+    req = Request(
+        url,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {INVENTORYCLOUD_API_TOKEN}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": INVENTORYCLOUD_USER_AGENT,
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(req, timeout=20) as response:
+            payload = json.loads(response.read().decode("utf-8") or "{}")
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:300]
+        raise RuntimeError(f"InventoryCloud search failed with HTTP {exc.code}: {detail or exc.reason}")
+    except URLError as exc:
+        raise RuntimeError(f"InventoryCloud search failed: {exc.reason}")
+    def find_item_list(value, depth=0):
+        if depth > 4:
+            return []
+        if isinstance(value, list):
+            return value
+        if not isinstance(value, dict):
+            return []
+        for key in ("Items", "items", "Results", "results", "Data", "data", "Result", "result"):
+            found = find_item_list(value.get(key), depth + 1)
+            if found:
+                return found
+        for child in value.values():
+            found = find_item_list(child, depth + 1)
+            if found:
+                return found
+        return []
+
+    items = find_item_list(payload)
+    if not isinstance(items, list):
+        return []
+    mapped = []
+    for item in items[:30]:
+        if not isinstance(item, dict):
+            continue
+        part_number = str(item.get("ItemNumber") or item.get("itemNumber") or item.get("AlternateItemNumber") or item.get("alternateItemNumber") or "").strip()
+        description = str(item.get("ItemDescription") or item.get("itemDescription") or item.get("Description") or item.get("description") or "").strip()
+        if not part_number and not description:
+            continue
+        mapped.append({
+            "id": f"inventorycloud:{part_number or len(mapped)}",
+            "source": "InventoryCloud",
+            "tablet_label": description,
+            "invoice_description": description,
+            "part_number": part_number,
+            "price": money(item.get("Cost") or item.get("cost") or item.get("SalesPrice") or item.get("salesPrice") or item.get("ListPrice") or item.get("listPrice")),
+            "cost": money(item.get("Cost") or item.get("cost")),
+            "sales_price": money(item.get("SalesPrice") or item.get("salesPrice")),
+            "list_price": money(item.get("ListPrice") or item.get("listPrice")),
+            "stocking_unit": item.get("StockingUnit") or item.get("stockingUnit") or "",
+            "category": item.get("CategoryDescription") or item.get("categoryDescription") or "",
+            "manufacturer": item.get("ManufacturerName") or item.get("manufacturerName") or "",
+        })
+    return mapped
+
+
 def log_texas_upload_reminder(reminder_date, recipient, subject, status, error=""):
     execute(
         """
@@ -9421,6 +9508,14 @@ HTML = r"""
           <div class="actions"><button class="btn primary" id="sendTestEmail" type="button">Send Test Email</button></div>
           <div id="testEmailResult" class="muted" style="margin-top:10px"></div>
         </div>
+        <div class="panel" id="inventoryCloudTestPanel">
+          <h2>InventoryCloud Test</h2>
+          <p class="muted">Confirm the read-only inventory lookup can search Wasp InventoryCloud before using it on Pick Tickets.</p>
+          <div id="inventoryCloudStatus" class="muted">Checking InventoryCloud setup...</div>
+          <label>Search Test</label><input id="inventoryCloudTestSearch" placeholder="Part number or description">
+          <div class="actions"><button class="btn primary" id="runInventoryCloudTest" type="button">Test Inventory Search</button></div>
+          <div id="inventoryCloudTestResult" class="muted" style="margin-top:10px"></div>
+        </div>
         <div class="panel">
           <h2>Activity Log</h2>
           <p class="muted">Review sensitive changes such as deletes, user updates, reminder changes, and audit exceptions.</p>
@@ -10089,7 +10184,7 @@ HTML = r"""
       if (tabName === 'projectPo') loadProjectPos();
       if (tabName === 'newMasterProject') loadNewMasterProjectForm();
       if (tabName === 'bids') loadBidDashboard();
-      if (tabName === 'admin') { loadUsers(); loadEmailStatus(); }
+      if (tabName === 'admin') { loadUsers(); loadEmailStatus(); loadInventoryCloudStatus(); }
       if (tabName === 'activity') loadActivityLog();
       if (tabName === 'texasOps') loadTexasOpsDashboard();
       if (tabName === 'texasReminders') loadTexasReminderSetup();
@@ -11136,7 +11231,7 @@ HTML = r"""
     function applyPickPartToLine(row, part) {
       row.querySelector('[data-pick-line-field="description"]').value = part.tablet_label || part.invoice_description || '';
       row.querySelector('[data-pick-line-field="part_number"]').value = part.part_number || '';
-      row.querySelector('[data-pick-line-field="fieldwise_part_id"]').value = part.id || '';
+      row.querySelector('[data-pick-line-field="fieldwise_part_id"]').value = String(part.source || '') === 'Field Wise' ? (part.id || '') : '';
       row.querySelector('[data-pick-line-field="price"]').value = part.price || '';
       row.querySelectorAll('[data-pick-part-results]').forEach(el => {
         el.classList.add('hidden');
@@ -11178,9 +11273,11 @@ HTML = r"""
             const parts = await api(`/api/fieldwise-parts?search=${encodeURIComponent(term)}`);
             if (input.dataset.searchSeq !== seq) return;
             results.innerHTML = parts.length
-              ? parts.map(part => `<button class="pick-part-option" type="button" data-pick-part-id="${part.id}">
+              ? parts.map(part => part.error
+                ? `<div class="combo-empty">${htmlEscape(part.source || 'Inventory lookup')}: ${htmlEscape(part.error)}</div>`
+                : `<button class="pick-part-option" type="button" data-pick-part-id="${htmlEscape(part.id)}">
                   <strong>${htmlEscape(part.tablet_label || part.invoice_description || '')}</strong>
-                  <span>${htmlEscape(part.part_number || 'No part number')}${part.price ? ` - ${money(part.price)}` : ''}</span>
+                  <span>${htmlEscape(part.part_number || 'No part number')}${part.price ? ` - ${money(part.price)}` : ''}${part.source ? ` - ${htmlEscape(part.source)}` : ''}</span>
                 </button>`).join('')
               : '<div class="combo-empty">No matching parts found.</div>';
             results.classList.remove('hidden');
@@ -15273,6 +15370,20 @@ HTML = r"""
       }
     }
 
+    async function loadInventoryCloudStatus() {
+      if (state.currentUser?.role !== 'Admin') return;
+      const target = document.getElementById('inventoryCloudStatus');
+      if (!target) return;
+      try {
+        const status = await api('/api/admin/inventorycloud-status');
+        target.innerHTML = status.configured
+          ? `<strong class="good">Configured</strong><br>${htmlEscape(status.base_url || '')} with server-held token`
+          : `<strong class="warn">Not configured</strong><br>Add the InventoryCloud token on the server. Base URL: ${htmlEscape(status.base_url || '')}`;
+      } catch (err) {
+        target.innerHTML = `<span class="bad">${htmlEscape(err.message || 'Could not check InventoryCloud setup.')}</span>`;
+      }
+    }
+
     document.getElementById('projectForm').onsubmit = async e => {
       e.preventDefault();
       const data = formDataObj(e.target);
@@ -15319,6 +15430,20 @@ HTML = r"""
         resultEl.innerHTML = '<strong class="good">Test email sent.</strong>';
       } catch (err) {
         resultEl.innerHTML = `<span class="bad">${htmlEscape(err.message || 'Could not send test email.')}</span>`;
+      }
+    };
+    document.getElementById('runInventoryCloudTest').onclick = async () => {
+      const resultEl = document.getElementById('inventoryCloudTestResult');
+      const search = document.getElementById('inventoryCloudTestSearch').value;
+      resultEl.textContent = 'Searching InventoryCloud...';
+      try {
+        const result = await api('/api/admin/inventorycloud-test', { method:'POST', body: JSON.stringify({ search }) });
+        const items = result.items || [];
+        resultEl.innerHTML = items.length
+          ? `<strong class="good">Found ${items.length} item(s).</strong><br>${items.slice(0, 5).map(item => `${htmlEscape(item.part_number || 'No part #')} - ${htmlEscape(item.tablet_label || item.invoice_description || '')}`).join('<br>')}`
+          : '<strong class="warn">Connection worked, but no items matched that search.</strong>';
+      } catch (err) {
+        resultEl.innerHTML = `<span class="bad">${htmlEscape(err.message || 'Could not search InventoryCloud.')}</span>`;
       }
     };
     document.getElementById('refreshOfficePos').onclick = () => loadOfficePos();
@@ -16163,38 +16288,47 @@ class Handler(BaseHTTPRequestHandler):
                 if len(search) < 2:
                     return json_response(self, [])
                 needle = f"%{search}%"
-                return json_response(
-                    self,
-                    rows(
-                        """
-                        SELECT
-                          p.id,
-                          p.tablet_label,
-                          p.invoice_description,
-                          p.part_number,
-                          p.price
-                        FROM fieldwise_parts p
-                        JOIN fieldwise_parts_catalogs c ON c.id = p.catalog_id
-                        WHERE COALESCE(c.active, 0) = 1
-                          AND (
-                            LOWER(COALESCE(p.search_text, '')) LIKE ?
-                            OR LOWER(COALESCE(p.tablet_label, '')) LIKE ?
-                            OR LOWER(COALESCE(p.part_number, '')) LIKE ?
-                          )
-                        ORDER BY
-                          CASE
-                            WHEN LOWER(COALESCE(p.part_number, '')) = ? THEN 0
-                            WHEN LOWER(COALESCE(p.part_number, '')) LIKE ? THEN 1
-                            WHEN LOWER(COALESCE(p.tablet_label, '')) LIKE ? THEN 2
-                            ELSE 3
-                          END,
-                          p.tablet_label,
-                          p.part_number
-                        LIMIT 30
-                        """,
-                        (needle, needle, needle, search, f"{search}%", f"{search}%"),
-                    ),
+                local_parts = rows(
+                    """
+                    SELECT
+                      p.id,
+                      'Field Wise' AS source,
+                      p.tablet_label,
+                      p.invoice_description,
+                      p.part_number,
+                      p.price
+                    FROM fieldwise_parts p
+                    JOIN fieldwise_parts_catalogs c ON c.id = p.catalog_id
+                    WHERE COALESCE(c.active, 0) = 1
+                      AND (
+                        LOWER(COALESCE(p.search_text, '')) LIKE ?
+                        OR LOWER(COALESCE(p.tablet_label, '')) LIKE ?
+                        OR LOWER(COALESCE(p.part_number, '')) LIKE ?
+                      )
+                    ORDER BY
+                      CASE
+                        WHEN LOWER(COALESCE(p.part_number, '')) = ? THEN 0
+                        WHEN LOWER(COALESCE(p.part_number, '')) LIKE ? THEN 1
+                        WHEN LOWER(COALESCE(p.tablet_label, '')) LIKE ? THEN 2
+                        ELSE 3
+                      END,
+                      p.tablet_label,
+                      p.part_number
+                    LIMIT 30
+                    """,
+                    (needle, needle, needle, search, f"{search}%", f"{search}%"),
                 )
+                live_parts = []
+                inventorycloud_error = ""
+                if INVENTORYCLOUD_API_TOKEN:
+                    try:
+                        live_parts = inventorycloud_item_search(search)
+                    except Exception as exc:
+                        inventorycloud_error = str(exc)
+                combined = local_parts[:20] + live_parts[:20]
+                if inventorycloud_error:
+                    combined.append({"id": "inventorycloud-error", "source": "InventoryCloud", "error": inventorycloud_error})
+                return json_response(self, combined[:40])
             if parsed.path == "/api/projects":
                 status_filter = (qs.get("status", ["active"])[0] or "active").lower()
                 if status_filter == "all":
@@ -16216,6 +16350,10 @@ class Handler(BaseHTTPRequestHandler):
                 if not require_admin(self):
                     return json_response(self, {"error": "Admin required"}, 403)
                 return json_response(self, smtp_status())
+            if parsed.path == "/api/admin/inventorycloud-status":
+                if not require_admin(self):
+                    return json_response(self, {"error": "Admin required"}, 403)
+                return json_response(self, inventorycloud_status())
             if parsed.path == "/api/role-permissions":
                 if not require_admin(self):
                     return json_response(self, {"error": "Admin required"}, 403)
@@ -16611,6 +16749,19 @@ class Handler(BaseHTTPRequestHandler):
                 send_email(to_address, subject, body)
                 log_activity(actor, "sent test email", "Admin", to_address, {"smtp_from": SMTP_FROM, "smtp_host": SMTP_HOST})
                 return json_response(self, {"ok": True})
+            if parsed.path == "/api/admin/inventorycloud-test":
+                actor = current_user(self)
+                if not require_admin(self):
+                    return json_response(self, {"error": "Admin required"}, 403)
+                data = parse_json(self)
+                search = str(data.get("search") or "").strip()
+                if len(search) < 2:
+                    return json_response(self, {"error": "Enter at least 2 characters to search."}, 400)
+                if not INVENTORYCLOUD_API_TOKEN:
+                    return json_response(self, {"error": "InventoryCloud token is not configured on the server."}, 400)
+                items = inventorycloud_item_search(search)
+                log_activity(actor, "tested InventoryCloud lookup", "Admin", search, {"result_count": len(items)})
+                return json_response(self, {"ok": True, "items": items[:20]})
             if parsed.path == "/api/change-password":
                 data = parse_json(self)
                 user = current_user(self)
