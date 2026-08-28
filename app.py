@@ -1989,6 +1989,7 @@ def init_db():
               subproject_id INTEGER REFERENCES subprojects(id) ON DELETE SET NULL,
               change_order_id INTEGER REFERENCES change_orders(id) ON DELETE SET NULL,
               cog_category_id INTEGER REFERENCES cog_categories(id) ON DELETE SET NULL,
+              external_job_order_id INTEGER REFERENCES external_job_orders(id) ON DELETE SET NULL,
               job_number TEXT NOT NULL,
               job_label TEXT,
               customer_name TEXT,
@@ -2018,6 +2019,20 @@ def init_db():
               requested_by_username TEXT,
               created_at TEXT NOT NULL,
               updated_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS external_job_orders (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              order_number TEXT NOT NULL UNIQUE,
+              customer TEXT,
+              project_name TEXT,
+              location TEXT,
+              first_seen_ticket_date TEXT,
+              last_seen_ticket_date TEXT,
+              source TEXT DEFAULT 'Field Wise PO Invoice Audit',
+              first_seen_at TEXT NOT NULL,
+              last_seen_at TEXT NOT NULL,
+              active INTEGER DEFAULT 1
             );
 
             CREATE TABLE IF NOT EXISTS purchase_order_invoices (
@@ -2373,6 +2388,8 @@ def init_db():
             con.execute("ALTER TABLE purchase_orders ADD COLUMN pickup_file TEXT")
         if "cog_category_id" not in po_cols:
             con.execute("ALTER TABLE purchase_orders ADD COLUMN cog_category_id INTEGER REFERENCES cog_categories(id) ON DELETE SET NULL")
+        if "external_job_order_id" not in po_cols:
+            con.execute("ALTER TABLE purchase_orders ADD COLUMN external_job_order_id INTEGER REFERENCES external_job_orders(id) ON DELETE SET NULL")
         if "customer_name" not in po_cols:
             con.execute("ALTER TABLE purchase_orders ADD COLUMN customer_name TEXT")
         po_extra_columns = {
@@ -2805,6 +2822,15 @@ def parse_fieldwise_audit_export(path):
             return ""
         return row[idx]
 
+    def optional_cell(row, names):
+        for name in names:
+            idx = header_map.get(name.lower())
+            if idx is not None and idx < len(row):
+                value = str(row[idx] or "").strip()
+                if value:
+                    return value
+        return ""
+
     tickets = {}
     line_count = 0
     for row in rows_iter:
@@ -3060,7 +3086,7 @@ def parse_fieldwise_po_invoice_export(path):
     try:
         headers = [str(v or "").strip() for v in next(rows_iter)]
     except StopIteration:
-        return {"line_count": 0, "purchase_lines": []}
+        return {"line_count": 0, "purchase_lines": [], "job_orders": []}
     header_map = {h.lower(): i for i, h in enumerate(headers)}
     required = ["customer name", "ticket date", "ticket number", "order number", "item", "description", "quantity", "rate", "sub total"]
     missing = [h for h in required if h not in header_map]
@@ -3073,8 +3099,18 @@ def parse_fieldwise_po_invoice_export(path):
             return ""
         return row[idx]
 
+    def optional_cell(row, names):
+        for name in names:
+            idx = header_map.get(name.lower())
+            if idx is not None and idx < len(row):
+                value = str(row[idx] or "").strip()
+                if value:
+                    return value
+        return ""
+
     line_count = 0
     purchase_lines = []
+    job_orders_by_number = {}
     for row in rows_iter:
         if not row or not any(row):
             continue
@@ -3084,6 +3120,31 @@ def parse_fieldwise_po_invoice_export(path):
         order_number = str(cell(row, "order number") or "").strip()
         item = str(cell(row, "item") or "").strip()
         description = str(cell(row, "description") or "").strip()
+        customer = str(cell(row, "customer name") or "").strip()
+        ticket_date = date_text(cell(row, "ticket date"))
+        project_name = optional_cell(row, ("project name", "project", "location name", "job name"))
+        location = optional_cell(row, ("location", "location name", "ship to", "site"))
+        if order_number:
+            normalized_order = normalized_order_key(order_number)
+            existing = job_orders_by_number.setdefault(normalized_order, {
+                "order_number": order_number,
+                "customer": customer,
+                "project_name": project_name,
+                "location": location,
+                "first_seen_ticket_date": ticket_date,
+                "last_seen_ticket_date": ticket_date,
+            })
+            if customer and not existing["customer"]:
+                existing["customer"] = customer
+            if project_name and not existing["project_name"]:
+                existing["project_name"] = project_name
+            if location and not existing["location"]:
+                existing["location"] = location
+            if ticket_date:
+                if not existing["first_seen_ticket_date"] or ticket_date < existing["first_seen_ticket_date"]:
+                    existing["first_seen_ticket_date"] = ticket_date
+                if not existing["last_seen_ticket_date"] or ticket_date > existing["last_seen_ticket_date"]:
+                    existing["last_seen_ticket_date"] = ticket_date
         if not ticket_number or not order_number or amount <= 0:
             continue
         if not looks_like_purchase_material_line(item, description):
@@ -3091,8 +3152,8 @@ def parse_fieldwise_po_invoice_export(path):
         purchase_lines.append({
             "ticket_number": ticket_number,
             "order_number": order_number,
-            "customer": str(cell(row, "customer name") or "").strip(),
-            "ticket_date": date_text(cell(row, "ticket date")),
+            "customer": customer,
+            "ticket_date": ticket_date,
             "status": str(cell(row, "status") or "").strip() if "status" in header_map else "",
             "item": item,
             "description": description,
@@ -3100,7 +3161,81 @@ def parse_fieldwise_po_invoice_export(path):
             "rate": money(cell(row, "rate")),
             "amount": amount,
         })
-    return {"line_count": line_count, "purchase_lines": purchase_lines}
+    return {"line_count": line_count, "purchase_lines": purchase_lines, "job_orders": list(job_orders_by_number.values())}
+
+
+def upsert_external_job_orders(con, job_orders):
+    now = datetime.now().isoformat(timespec="seconds")
+    added = 0
+    updated = 0
+    skipped_tracked = 0
+    for job in job_orders or []:
+        order_number = str(job.get("order_number") or "").strip()
+        if not order_number:
+            continue
+        tracked = con.execute(
+            """
+            SELECT 1
+            FROM (
+              SELECT job_number FROM subprojects
+              UNION ALL
+              SELECT job_number FROM change_orders
+            )
+            WHERE UPPER(TRIM(COALESCE(job_number, ''))) = ?
+            LIMIT 1
+            """,
+            (normalized_order_key(order_number),),
+        ).fetchone()
+        if tracked:
+            skipped_tracked += 1
+            continue
+        existing_external = con.execute(
+            "SELECT id FROM external_job_orders WHERE order_number = ?",
+            (order_number,),
+        ).fetchone()
+        con.execute(
+            """
+            INSERT INTO external_job_orders (
+              order_number, customer, project_name, location,
+              first_seen_ticket_date, last_seen_ticket_date,
+              first_seen_at, last_seen_at, active
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+            ON CONFLICT(order_number) DO UPDATE SET
+              customer = COALESCE(NULLIF(excluded.customer, ''), external_job_orders.customer),
+              project_name = COALESCE(NULLIF(excluded.project_name, ''), external_job_orders.project_name),
+              location = COALESCE(NULLIF(excluded.location, ''), external_job_orders.location),
+              first_seen_ticket_date = CASE
+                WHEN external_job_orders.first_seen_ticket_date IS NULL OR external_job_orders.first_seen_ticket_date = '' THEN excluded.first_seen_ticket_date
+                WHEN excluded.first_seen_ticket_date IS NULL OR excluded.first_seen_ticket_date = '' THEN external_job_orders.first_seen_ticket_date
+                WHEN excluded.first_seen_ticket_date < external_job_orders.first_seen_ticket_date THEN excluded.first_seen_ticket_date
+                ELSE external_job_orders.first_seen_ticket_date
+              END,
+              last_seen_ticket_date = CASE
+                WHEN excluded.last_seen_ticket_date IS NULL OR excluded.last_seen_ticket_date = '' THEN external_job_orders.last_seen_ticket_date
+                WHEN external_job_orders.last_seen_ticket_date IS NULL OR external_job_orders.last_seen_ticket_date = '' THEN excluded.last_seen_ticket_date
+                WHEN excluded.last_seen_ticket_date > external_job_orders.last_seen_ticket_date THEN excluded.last_seen_ticket_date
+                ELSE external_job_orders.last_seen_ticket_date
+              END,
+              last_seen_at = excluded.last_seen_at,
+              active = 1
+            """,
+            (
+                order_number,
+                str(job.get("customer") or "").strip(),
+                str(job.get("project_name") or "").strip(),
+                str(job.get("location") or "").strip(),
+                str(job.get("first_seen_ticket_date") or "").strip(),
+                str(job.get("last_seen_ticket_date") or "").strip(),
+                now,
+                now,
+            ),
+        )
+        if existing_external:
+            updated += 1
+        else:
+            added += 1
+    return {"added": added, "updated": updated, "count": added + updated, "skipped_tracked": skipped_tracked}
 
 
 def po_invoice_audit_result(path, audit_run_id=None):
@@ -3108,6 +3243,7 @@ def po_invoice_audit_result(path, audit_run_id=None):
     export = parse_fieldwise_po_invoice_export(path)
     purchase_lines = export.get("purchase_lines", [])
     with db() as con:
+        imported_job_orders = upsert_external_job_orders(con, export.get("job_orders", []))
         acceptance_rows = con.execute(
             """
             SELECT *
@@ -3258,6 +3394,10 @@ def po_invoice_audit_result(path, audit_run_id=None):
             "covered_count": len(covered),
             "omitted_count": len(omitted),
             "untracked_count": len(untracked),
+            "external_job_order_count": imported_job_orders["count"],
+            "external_job_order_added": imported_job_orders["added"],
+            "external_job_order_updated": imported_job_orders["updated"],
+            "external_job_order_skipped_tracked": imported_job_orders["skipped_tracked"],
         },
         "needs_invoice": needs_invoice,
         "covered": covered[:250],
@@ -3516,6 +3656,7 @@ def job_reference_for_po(con, job_key):
               NULL AS subproject_id,
               NULL AS change_order_id,
               id AS cog_category_id,
+              NULL AS external_job_order_id,
               NULL AS project_id,
               name AS job_number,
               'COG' AS item_type,
@@ -3525,6 +3666,28 @@ def job_reference_for_po(con, job_key):
               code AS reference_code,
               description
             FROM cog_categories
+            WHERE id = ?
+              AND COALESCE(active, 1) = 1
+            """,
+            (item_id,),
+        ).fetchone()
+    elif kind == "external_job":
+        row = con.execute(
+            """
+            SELECT
+              NULL AS subproject_id,
+              NULL AS change_order_id,
+              NULL AS cog_category_id,
+              id AS external_job_order_id,
+              NULL AS project_id,
+              order_number AS job_number,
+              'Imported Job Order' AS item_type,
+              customer,
+              COALESCE(NULLIF(project_name, ''), 'Field Wise Import') AS project_name,
+              '' AS project_code,
+              source AS reference_code,
+              'Imported from daily Field Wise PO Invoice Audit export' AS description
+            FROM external_job_orders
             WHERE id = ?
               AND COALESCE(active, 1) = 1
             """,
@@ -3543,6 +3706,7 @@ def job_reference_for_po(con, job_key):
     ]
     result = dict(row)
     result.setdefault("cog_category_id", None)
+    result.setdefault("external_job_order_id", None)
     result["job_label"] = " - ".join(str(part or "").strip() for part in label_parts if str(part or "").strip())
     return result
 
@@ -10875,7 +11039,7 @@ HTML = r"""
     }
 
     function officePoJobOptions(po) {
-      const currentValue = po.cog_category_id ? `cog:${po.cog_category_id}` : (po.change_order_id ? `change_order:${po.change_order_id}` : (po.subproject_id ? `subproject:${po.subproject_id}` : ''));
+      const currentValue = po.external_job_order_id ? `external_job:${po.external_job_order_id}` : (po.cog_category_id ? `cog:${po.cog_category_id}` : (po.change_order_id ? `change_order:${po.change_order_id}` : (po.subproject_id ? `subproject:${po.subproject_id}` : '')));
       return '<option value="">Choose job/order...</option>' + jobOrderReportRows.filter(row => row.job_key).map(row => {
         const label = [row.job_number, row.customer, row.project_name, row.reference_code].filter(Boolean).join(' - ');
         return `<option value="${htmlEscape(row.job_key)}" ${row.job_key === currentValue ? 'selected' : ''}>${htmlEscape(label)}</option>`;
@@ -15465,7 +15629,7 @@ HTML = r"""
       try {
         poInvoiceAuditData = await api('/api/po-invoice-audit', { method: 'POST', body: data });
         const s = poInvoiceAuditData.summary || {};
-        resultEl.textContent = `Audit complete. Material lines needing PO invoice review: ${s.needs_invoice_count || 0}. Covered by PO invoice uploads: ${s.covered_count || 0}.`;
+        resultEl.textContent = `Audit complete. Material lines needing PO invoice review: ${s.needs_invoice_count || 0}. Covered by PO invoice uploads: ${s.covered_count || 0}. Imported job orders: ${s.external_job_order_added || 0} new, ${s.external_job_order_updated || 0} updated.`;
         renderPoInvoiceAudit();
       } catch (err) {
         poInvoiceAuditData = null;
@@ -15884,6 +16048,22 @@ class Handler(BaseHTTPRequestHandler):
                                 AND ca.user_id = ?
                             )
                           )
+                        UNION ALL
+                        SELECT
+                          'external_job:' || ejo.id AS job_key,
+                          ejo.order_number AS job_number,
+                          'Imported Job Order' AS item_type,
+                          ejo.customer,
+                          COALESCE(NULLIF(ejo.project_name, ''), 'Field Wise Import') AS project_name,
+                          '' AS project_code,
+                          ejo.source AS reference_code,
+                          'Imported from daily Field Wise PO Invoice Audit export' AS description,
+                          '' AS project_description,
+                          ejo.location,
+                          'Imported' AS status
+                        FROM external_job_orders ejo
+                        WHERE COALESCE(ejo.active, 1) = 1
+                          AND TRIM(COALESCE(ejo.order_number, '')) <> ''
                         ORDER BY customer, project_name, job_number, item_type
                         """,
                         (user_id,),
@@ -17023,16 +17203,17 @@ class Handler(BaseHTTPRequestHandler):
                             except Exception:
                                 pass
                         return json_response(self, {"error": "Enter the customer for this shop / COG PO."}, 400)
+                    effective_customer_name = customer_name or job_ref["customer"] or ""
                     po_number = next_po_number(con)
                     initial_status = "Issued" if can_auto_issue_po(user) else "Pending Approval"
                     cur = con.execute(
                         """
                         INSERT INTO purchase_orders (
-                          po_number, project_id, subproject_id, change_order_id, cog_category_id, job_number, job_label, customer_name,
+                          po_number, project_id, subproject_id, change_order_id, cog_category_id, external_job_order_id, job_number, job_label, customer_name,
                           vendor, description, estimated_amount, attachment_file, status,
                           requested_by_user_id, requested_by_username, created_at, updated_at
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             po_number,
@@ -17040,9 +17221,10 @@ class Handler(BaseHTTPRequestHandler):
                             job_ref["subproject_id"],
                             job_ref["change_order_id"],
                             job_ref["cog_category_id"],
+                            job_ref["external_job_order_id"],
                             job_ref["job_number"],
                             job_ref["job_label"],
-                            customer_name,
+                            effective_customer_name,
                             vendor,
                             description,
                             estimated_amount,
@@ -17067,7 +17249,7 @@ class Handler(BaseHTTPRequestHandler):
                             (
                                 po_id,
                                 vendor,
-                                customer_name or job_ref["customer"] or "",
+                                effective_customer_name,
                                 user["id"],
                                 user["username"],
                                 now,
@@ -18871,6 +19053,7 @@ class Handler(BaseHTTPRequestHandler):
                         return json_response(self, {"error": "You are not authorized to use that COG on this PO."}, 403)
                     if po_customer_required_for_ref(job_ref) and not customer_name:
                         return json_response(self, {"error": "Customer is required for shop / COG POs."}, 400)
+                    effective_customer_name = customer_name or job_ref["customer"] or ""
                     now = datetime.now().isoformat(timespec="seconds")
                     close_reason = str(data.get("close_reason") or current_po["close_reason"] or "").strip()
                     void_reason = str(data.get("void_reason") or current_po["void_reason"] or "").strip()
@@ -18923,6 +19106,7 @@ class Handler(BaseHTTPRequestHandler):
                             subproject_id = ?,
                             change_order_id = ?,
                             cog_category_id = ?,
+                            external_job_order_id = ?,
                             job_number = ?,
                             job_label = ?,
                             customer_name = ?,
@@ -18946,9 +19130,10 @@ class Handler(BaseHTTPRequestHandler):
                             job_ref["subproject_id"],
                             job_ref["change_order_id"],
                             job_ref["cog_category_id"],
+                            job_ref["external_job_order_id"],
                             job_ref["job_number"],
                             job_ref["job_label"],
-                            customer_name,
+                            effective_customer_name,
                             vendor,
                             description,
                             money(data.get("estimated_amount")),
@@ -18979,7 +19164,7 @@ class Handler(BaseHTTPRequestHandler):
                             (
                                 po_id,
                                 vendor,
-                                customer_name or job_ref["customer"] or "",
+                                effective_customer_name,
                                 actor["id"],
                                 actor["username"],
                                 now,
