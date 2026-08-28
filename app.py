@@ -2572,7 +2572,7 @@ def bid_price_value(estimated_cost, target_margin, explicit_bid_price=0):
     if explicit_bid_price:
         return money(explicit_bid_price)
     cost = money(estimated_cost)
-    margin = money(target_margin)
+    margin = percent_input_value(target_margin)
     return cost / (1 - margin) if cost and margin < 1 else 0
 
 
@@ -2582,7 +2582,12 @@ def weighted_bid_value(outcome, bid_price, probability):
         return money(bid_price)
     if outcome == "Lost":
         return 0
-    return money(bid_price) * money(probability)
+    return money(bid_price) * percent_input_value(probability)
+
+
+def percent_input_value(value):
+    pct = money(value)
+    return pct / 100 if abs(pct) > 1 else pct
 
 
 def next_bid_rfq_no():
@@ -3778,9 +3783,9 @@ def seed_bid_tracker_from_workbook():
                     continue
                 rfq_no = str(row[0] or "").strip()
                 estimated_cost = money(row[8] if len(row) > 8 else 0)
-                target_margin = money(row[9] if len(row) > 9 else 0)
+                target_margin = percent_input_value(row[9] if len(row) > 9 else 0)
                 bid_price = bid_price_value(estimated_cost, target_margin, money(row[10] if len(row) > 10 else 0))
-                probability = money(row[11] if len(row) > 11 else 0)
+                probability = percent_input_value(row[11] if len(row) > 11 else 0)
                 outcome = str(row[14] if len(row) > 14 and row[14] else "Pending")
                 weighted = weighted_bid_value(outcome, bid_price, probability)
                 con.execute(
@@ -9369,8 +9374,8 @@ HTML = r"""
         </div>
         <div class="grid cols-4">
           <div><label>Estimated Cost</label><input name="estimated_cost" type="number" step="0.01" value="0"></div>
-          <div><label>Target Margin</label><input name="target_margin" type="number" step="0.01" value="0.25"></div>
-          <div><label>Probability</label><input name="probability" type="number" step="0.01" value="0.25"></div>
+          <div><label>Target Margin %</label><input name="target_margin" type="number" step="0.01" value="25"></div>
+          <div><label>Probability %</label><input name="probability" type="number" step="0.01" value="25"></div>
           <div><label>Outcome</label><select name="outcome"><option>Pending</option><option>Won</option><option>Lost</option></select></div>
         </div>
         <label>Notes</label><textarea name="notes"></textarea>
@@ -12647,7 +12652,7 @@ HTML = r"""
       const stageOptions = ['New RFQ','Go/No-Go','Estimating','Submitted','Award Pending','Closed'];
       const goNoGoOptions = ['Go','No Go','Review'];
       const outcomeOptions = ['Pending','Won','Lost'];
-      return `<thead><tr><th>RFQ</th><th>Received</th><th>Customer</th><th>Project</th><th>Estimator</th><th>Stage</th><th>Due</th><th>Go / No-Go</th><th>Est. Cost</th><th>Margin</th><th>Bid Price</th><th>Prob.</th><th>Weighted</th><th>Outcome</th><th>Notes</th><th></th></tr></thead>
+      return `<thead><tr><th>RFQ</th><th>Received</th><th>Customer</th><th>Project</th><th>Estimator</th><th>Stage</th><th>Due</th><th>Go / No-Go</th><th>Est. Cost</th><th>Margin %</th><th>Bid Price</th><th>Prob. %</th><th>Weighted</th><th>Outcome</th><th>Notes</th><th></th></tr></thead>
         <tbody>${bids.map(b => `<tr class="${isBidStale(b) ? 'bid-stale' : ''}" title="${isBidStale(b) ? 'No update in 5 or more days' : ''}">
           <td><input data-bid="${b.id}" data-field="rfq_no" value="${htmlEscape(b.rfq_no || '')}"></td>
           <td><input data-bid="${b.id}" data-field="date_received" type="date" value="${htmlEscape(b.date_received || '')}"></td>
@@ -12658,9 +12663,9 @@ HTML = r"""
           <td><input data-bid="${b.id}" data-field="bid_due_date" type="date" value="${htmlEscape(b.bid_due_date || '')}"></td>
           <td><select data-bid="${b.id}" data-field="go_no_go">${optionList(goNoGoOptions, b.go_no_go)}</select></td>
           <td><input data-bid="${b.id}" data-field="estimated_cost" type="number" step="0.01" value="${Number(b.estimated_cost || 0).toFixed(2)}"></td>
-          <td><input data-bid="${b.id}" data-field="target_margin" type="number" step="0.01" value="${Number(b.target_margin || 0).toFixed(2)}"></td>
+          <td><input data-bid="${b.id}" data-field="target_margin" type="number" step="0.01" value="${(Number(b.target_margin || 0) * 100).toFixed(2)}"></td>
           <td><input data-bid="${b.id}" data-field="bid_price" type="number" step="0.01" value="${Number(b.bid_price || 0).toFixed(2)}"></td>
-          <td><input data-bid="${b.id}" data-field="probability" type="number" step="0.01" value="${Number(b.probability || 0).toFixed(2)}"></td>
+          <td><input data-bid="${b.id}" data-field="probability" type="number" step="0.01" value="${(Number(b.probability || 0) * 100).toFixed(2)}"></td>
           <td>${money(b.weighted_value)}</td>
           <td><select data-bid="${b.id}" data-field="outcome">${optionList(outcomeOptions, b.outcome)}</select></td>
           <td><input data-bid="${b.id}" data-field="notes" value="${htmlEscape(b.notes || '')}"></td>
@@ -18309,8 +18314,8 @@ class Handler(BaseHTTPRequestHandler):
                 return json_response(self, {"id": new_id})
             if parsed.path == "/api/bids":
                 estimated_cost = money(data.get("estimated_cost"))
-                target_margin = money(data.get("target_margin"))
-                probability = money(data.get("probability"))
+                target_margin = percent_input_value(data.get("target_margin"))
+                probability = percent_input_value(data.get("probability"))
                 bid_price = bid_price_value(estimated_cost, target_margin)
                 outcome = data.get("outcome") or "Pending"
                 weighted = weighted_bid_value(outcome, bid_price, probability)
@@ -19443,8 +19448,8 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path.startswith("/api/bids/"):
                 bid_id = parsed.path.rsplit("/", 1)[-1]
                 estimated_cost = money(data.get("estimated_cost"))
-                target_margin = money(data.get("target_margin"))
-                probability = money(data.get("probability"))
+                target_margin = percent_input_value(data.get("target_margin"))
+                probability = percent_input_value(data.get("probability"))
                 bid_price = bid_price_value(estimated_cost, target_margin, data.get("bid_price"))
                 outcome = data.get("outcome") or "Pending"
                 weighted = weighted_bid_value(outcome, bid_price, probability)
