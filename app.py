@@ -11294,7 +11294,7 @@ HTML = r"""
     }
 
     async function loadFieldPos() {
-      const poRows = await api('/api/purchase-orders');
+      const poRows = await api('/api/purchase-orders?mine=1');
       const target = document.getElementById('fieldPoList');
       target.innerHTML = poRows.length
         ? poRows.map(po => {
@@ -16387,7 +16387,8 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/api/purchase-orders":
                 if not can_use_field_po(user):
                     return json_response(self, {"error": "PO access required."}, 403)
-                if is_field_po_only(user):
+                mine_only = qs.get("mine", [""])[0] == "1"
+                if mine_only or is_field_po_only(user):
                     return json_response(
                         self,
                         purchase_orders_with_invoices("SELECT * FROM purchase_orders WHERE requested_by_user_id = ? ORDER BY created_at DESC, id DESC", (user["id"],)),
