@@ -3722,6 +3722,35 @@ def job_reference_for_po(con, job_key):
     return result
 
 
+def create_manual_external_job_order(con, job_number, customer="", project_name="Manual PO Entry"):
+    job_number = str(job_number or "").strip()
+    if not job_number:
+        return None
+    now = datetime.now().isoformat(timespec="seconds")
+    con.execute(
+        """
+        INSERT INTO external_job_orders (
+          order_number, customer, project_name, location,
+          first_seen_ticket_date, last_seen_ticket_date, source,
+          first_seen_at, last_seen_at, active
+        )
+        VALUES (?, ?, ?, '', '', '', 'Manual PO Entry', ?, ?, 1)
+        ON CONFLICT(order_number) DO UPDATE SET
+          customer = COALESCE(NULLIF(excluded.customer, ''), external_job_orders.customer),
+          project_name = COALESCE(NULLIF(excluded.project_name, ''), external_job_orders.project_name),
+          source = CASE
+            WHEN COALESCE(external_job_orders.source, '') = '' THEN excluded.source
+            ELSE external_job_orders.source
+          END,
+          last_seen_at = excluded.last_seen_at,
+          active = 1
+        """,
+        (job_number, str(customer or "").strip(), str(project_name or "").strip() or "Manual PO Entry", now, now),
+    )
+    row = con.execute("SELECT id FROM external_job_orders WHERE order_number = ?", (job_number,)).fetchone()
+    return job_reference_for_po(con, f"external_job:{row['id']}") if row else None
+
+
 def cog_allowed_user_ids(con, cog_category_id):
     return [
         int(r["user_id"])
@@ -15513,8 +15542,9 @@ HTML = r"""
     document.getElementById('fieldPoForm').onsubmit = async e => {
       e.preventDefault();
       const resultEl = document.getElementById('fieldPoResult');
-      if (!document.getElementById('fieldPoJobKey').value) {
-        resultEl.innerHTML = '<span class="bad">Choose a matching Job / Order # / COG from the list.</span>';
+      const jobSearchValue = String(document.getElementById('fieldPoJobSearch').value || '').trim();
+      if (!document.getElementById('fieldPoJobKey').value && !jobSearchValue) {
+        resultEl.innerHTML = '<span class="bad">Enter a job/order number or choose a matching COG from the list.</span>';
         document.getElementById('fieldPoJobSearch').focus();
         document.getElementById('fieldPoJobList').classList.remove('hidden');
         return;
@@ -15530,6 +15560,7 @@ HTML = r"""
       resultEl.textContent = 'Creating PO...';
       const form = e.target;
       const data = new FormData(form);
+      if (!data.get('job_key')) data.set('manual_job_number', jobSearchValue);
       try {
         const saved = await api('/api/purchase-orders', { method:'POST', body: data });
         resultEl.innerHTML = `<strong class="good">PO Created: ${htmlEscape(saved.po_number)}</strong><div class="muted">Status: ${htmlEscape(saved.status || '')}</div>`;
@@ -17315,12 +17346,15 @@ class Handler(BaseHTTPRequestHandler):
                     return json_response(self, {"error": "PO access required."}, 403)
                 form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": self.headers.get("Content-Type")})
                 job_key = form.getvalue("job_key")
+                manual_job_number = str(form.getvalue("manual_job_number") or "").strip()
                 customer_name = str(form.getvalue("customer_name") or "").strip()
                 vendor = str(form.getvalue("vendor") or "").strip()
                 description = str(form.getvalue("description") or "").strip()
                 estimated_amount = money(form.getvalue("estimated_amount"))
-                if not job_key:
-                    return json_response(self, {"error": "Choose a job/order number."}, 400)
+                if not job_key and not manual_job_number:
+                    return json_response(self, {"error": "Enter a job/order number or choose one from the list."}, 400)
+                if manual_job_number and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._/#-]{0,39}", manual_job_number):
+                    return json_response(self, {"error": "Manual job/order number can use letters, numbers, spaces, dashes, periods, slashes, and # only."}, 400)
                 if not vendor:
                     return json_response(self, {"error": "Enter the vendor."}, 400)
                 if not description:
@@ -17338,7 +17372,7 @@ class Handler(BaseHTTPRequestHandler):
                         f.write(file_item.file.read())
                 now = datetime.now().isoformat(timespec="seconds")
                 with db() as con:
-                    job_ref = job_reference_for_po(con, job_key)
+                    job_ref = job_reference_for_po(con, job_key) if job_key else create_manual_external_job_order(con, manual_job_number, customer_name)
                     if not job_ref:
                         if attachment_file:
                             try:
