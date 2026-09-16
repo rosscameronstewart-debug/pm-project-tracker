@@ -6767,7 +6767,8 @@ def import_vendor_invoice_pdf(path, project_id):
         invoice_number = first_regex([r"Invoice\s+No\.\s*([A-Za-z0-9\-]+)"], text, flags=re.IGNORECASE)
         invoice_date = first_regex([r"\bDate:\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4})"], text, flags=re.IGNORECASE)
         order_number = first_regex([r"Purchase Order:\s*(.+)"], text, flags=re.IGNORECASE)
-        total_due = parse_money_text(first_regex([r"Sales Total USD\s+([0-9,]+\.[0-9]{2})"], text))
+        vega_totals = re.findall(r"Sales\s+Total\s+USD:?\s+([0-9,]+\.[0-9]{2})", text, flags=re.IGNORECASE)
+        total_due = parse_money_text(vega_totals[-1] if vega_totals else "")
         item_lines = []
         current = None
         stop_prefixes = (
@@ -7232,6 +7233,12 @@ def extract_vendor_invoice_total(path):
     if not text:
         return 0.0
     money_capture = r"(-?\$?\s*[0-9,]+\.[0-9]{2}-?|\(\$?\s*[0-9,]+\.[0-9]{2}\))"
+    lower = text.lower()
+    if "vega americas" in lower:
+        vega_totals = re.findall(rf"Sales\s+Total\s+USD:?\s+{money_capture}", text, flags=re.IGNORECASE)
+        amount = parse_money_text(vega_totals[-1] if vega_totals else "")
+        if amount:
+            return -abs(amount) if "credit memo" in lower else amount
     patterns = [
         rf"INVOICE\s+TOTAL\s+{money_capture}",
         rf"Amount Due\s+{money_capture}",
@@ -7247,13 +7254,13 @@ def extract_vendor_invoice_total(path):
     ]
     amount = parse_money_text(first_regex(patterns, text, flags=re.IGNORECASE))
     if amount:
-        return -abs(amount) if "credit memo" in text.lower() else amount
+        return -abs(amount) if "credit memo" in lower else amount
     money_values = [parse_money_text(value) for value in re.findall(r"-?\$?\s*[0-9,]+\.[0-9]{2}-?|\(\$?\s*[0-9,]+\.[0-9]{2}\)", text)]
     money_values = [value for value in money_values if value]
     if not money_values:
         return 0.0
     fallback = money_values[-1]
-    return -abs(fallback) if "credit memo" in text.lower() else fallback
+    return -abs(fallback) if "credit memo" in lower else fallback
 
 
 def sync_po_invoice_cost_record(con, po, invoice_file, actor, invoice_amount=None, cost_record_id=None):
@@ -11116,6 +11123,7 @@ HTML = r"""
           primary,
           secondary,
           label: [primary, secondary].filter(Boolean).join(' - '),
+          customer: row.customer || '',
           search: (isCog
             ? [row.job_number, row.description]
             : [row.job_number, row.reference_code, row.customer, row.project_name, row.item_type, row.description, row.project_description]
@@ -11139,12 +11147,16 @@ HTML = r"""
       const choice = fieldPoJobChoices.find(item => item.key === jobKey);
       const selectedCogName = String(choice?.primary || '').trim().toLowerCase().replace(/\s+/g, ' ');
       const requiresCustomer = jobKey.startsWith('cog:') && !COG_CUSTOMER_OPTIONAL_NAMES.has(selectedCogName);
-      if (customerWrap) customerWrap.classList.toggle('hidden', !requiresCustomer);
+      const selectedCustomer = String(choice?.customer || '').trim();
+      const showCustomer = requiresCustomer || Boolean(selectedCustomer);
+      if (customerWrap) customerWrap.classList.toggle('hidden', !showCustomer);
       if (customerInput) {
         customerInput.required = requiresCustomer;
-        customerInput.disabled = !requiresCustomer;
+        customerInput.disabled = !showCustomer;
+        customerInput.readOnly = Boolean(selectedCustomer) && !requiresCustomer;
         customerInput.setAttribute('aria-required', requiresCustomer ? 'true' : 'false');
-        if (!requiresCustomer) customerInput.value = '';
+        if (selectedCustomer) customerInput.value = selectedCustomer;
+        if (!showCustomer) customerInput.value = '';
       }
     }
 
