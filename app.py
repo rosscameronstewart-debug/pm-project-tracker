@@ -11455,7 +11455,7 @@ HTML = r"""
             po.voided_at ? `Voided ${String(po.voided_at).slice(0, 16).replace('T', ' ')}${po.voided_by_username ? ' by ' + po.voided_by_username : ''}` : ''
           ].filter(Boolean).map(line => `<div class="muted">${htmlEscape(line)}</div>`).join('');
           const invoiceBlock = invoiceRows.length
-            ? `<div class="po-invoice-list">${invoiceRows.map(inv => `<div class="po-invoice-line"><a class="pdf-link" href="/uploads/${encodeURIComponent(inv.invoice_file)}" target="_blank" rel="noopener">Vendor invoice</a> <span class="muted">${htmlEscape(String(inv.uploaded_at || '').slice(0, 16).replace('T', ' '))}</span><div class="inline-controls"><input data-office-po-invoice-edit="${inv.id}" type="number" step="0.01" value="${Number(inv.invoice_amount || 0)}" placeholder="Amount"><button class="btn" data-save-office-po-invoice="${inv.id}" type="button">Save Amount</button><button class="btn danger" data-delete-office-po-invoice="${inv.id}" type="button">Remove</button></div>${Number(inv.invoice_amount || 0) === 0 ? '<div class="bad">Amount required</div>' : ''}</div>`).join('')}</div>`
+            ? `<div class="po-invoice-list">${invoiceRows.map(inv => `<div class="po-invoice-line"><a class="pdf-link" href="/uploads/${encodeURIComponent(inv.invoice_file)}" target="_blank" rel="noopener">Vendor invoice</a> <span class="muted">${htmlEscape(String(inv.uploaded_at || '').slice(0, 16).replace('T', ' '))}</span><div class="inline-controls"><input data-office-po-invoice-edit="${inv.id}" data-office-po-invoice-po="${po.id}" type="number" step="0.01" value="${Number(inv.invoice_amount || 0)}" placeholder="Amount"><button class="btn" data-save-office-po-invoice="${inv.id}" type="button">Save Amount</button><button class="btn danger" data-delete-office-po-invoice="${inv.id}" type="button">Remove</button></div>${Number(inv.invoice_amount || 0) === 0 ? '<div class="bad">Amount required</div>' : ''}</div>`).join('')}</div>`
             : po.invoice_file
               ? `<div><a class="pdf-link" href="/uploads/${encodeURIComponent(po.invoice_file)}" target="_blank" rel="noopener">Vendor invoice</a></div>`
               : '<div class="muted">No vendor invoice</div>';
@@ -11515,6 +11515,20 @@ HTML = r"""
         }
         return true;
       }
+      async function saveOfficePoInvoiceAmounts(poId) {
+        const inputs = Array.from(document.querySelectorAll(`#${config.tableId} [data-office-po-invoice-po="${poId}"]`));
+        for (const input of inputs) {
+          const rawAmount = String(input.value || '').trim();
+          const invoiceAmount = Number(rawAmount);
+          if (!rawAmount || !Number.isFinite(invoiceAmount) || invoiceAmount < 0) {
+            throw new Error('Enter a valid vendor invoice amount.');
+          }
+          await api(`/api/purchase-order-invoices/${input.dataset.officePoInvoiceEdit}`, {
+            method: 'PUT',
+            body: JSON.stringify({ invoice_amount: rawAmount })
+          });
+        }
+      }
       document.querySelectorAll(`#${config.tableId} [data-save-office-po]`).forEach(btn => btn.onclick = async () => {
         const id = btn.dataset.saveOfficePo;
         const fields = collectOfficePoFields(id);
@@ -11522,6 +11536,7 @@ HTML = r"""
           method: 'PUT',
           body: JSON.stringify(fields)
         });
+        await saveOfficePoInvoiceAmounts(id);
         await uploadOfficePoInvoiceIfSelected(id);
         await config.reload();
       });
@@ -11550,9 +11565,15 @@ HTML = r"""
       document.querySelectorAll(`#${config.tableId} [data-save-office-po-invoice]`).forEach(btn => btn.onclick = async () => {
         const id = btn.dataset.saveOfficePoInvoice;
         const amountInput = document.querySelector(`#${config.tableId} [data-office-po-invoice-edit="${id}"]`);
+        const rawAmount = String(amountInput?.value || '').trim();
+        const invoiceAmount = Number(rawAmount);
+        if (!rawAmount || !Number.isFinite(invoiceAmount) || invoiceAmount < 0) {
+          window.alert('Enter a valid vendor invoice amount.');
+          return;
+        }
         await api(`/api/purchase-order-invoices/${id}`, {
           method: 'PUT',
-          body: JSON.stringify({ invoice_amount: amountInput?.value || 0 })
+          body: JSON.stringify({ invoice_amount: rawAmount })
         });
         await config.reload();
       });
