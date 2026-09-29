@@ -2326,6 +2326,18 @@ def init_db():
         con.execute(
             """
             UPDATE cost_records
+            SET sales_amount = ABS(sales_amount)
+            WHERE source = 'Field Wise PDF'
+              AND cost_type = 'Field Ticket Material'
+              AND COALESCE(qty, 0) > 0
+              AND COALESCE(sales_rate, 0) > 0
+              AND COALESCE(sales_amount, 0) < 0
+              AND instr(COALESCE(notes, ''), '(T)') > 0
+            """
+        )
+        con.execute(
+            """
+            UPDATE cost_records
             SET amount = CASE
                   WHEN change_order_id IS NOT NULL OR COALESCE((SELECT pricing_type FROM subprojects WHERE id = cost_records.subproject_id), 'Fixed') IN ('T&M', 'T&M NTE')
                     THEN COALESCE(sales_amount, 0) * ?
@@ -3915,7 +3927,7 @@ def parse_money_text(value):
         return 0.0
     text = str(value).strip()
     negative = bool(
-        re.search(r"\([^)]+\)", text)
+        re.match(r"^\s*\(\s*\$?\s*[0-9,]+(?:\.[0-9]+)?\s*\)\s*$", text)
         or re.search(r"-\s*$", text)
         or re.search(r"^\s*-", text)
     )
@@ -14174,6 +14186,7 @@ HTML = r"""
 
     function nteCostRowHtml(r) {
       const suggested = r.suggested_subbucket_id && !r.nte_subbucket_id ? `<div class="muted">Suggested: ${htmlEscape(r.suggested_label || '')}</div>` : '';
+      const nteAmount = Number(r.sales_amount || 0) !== 0 ? r.sales_amount : r.amount;
       return `<tr>
         <td>${htmlEscape(r.record_date || '')}</td>
         <td>${htmlEscape(r.ticket_or_invoice || '')}</td>
@@ -14181,7 +14194,7 @@ HTML = r"""
         <td>${htmlEscape(r.cost_type || '')}</td>
         <td>${htmlEscape(r.item || '')}</td>
         <td>${htmlEscape(r.description || '')}${suggested}</td>
-        <td>${money(r.amount)}</td>
+        <td>${money(nteAmount)}</td>
         <td><select data-nte-cost="${r.id}" data-field="nte_subbucket_id">${nteSubbucketOptions(r.nte_subbucket_id || r.suggested_subbucket_id || '')}</select></td>
         <td>${r.cost_type === 'Labor' ? `
           <label style="display:flex;align-items:center;gap:6px;margin:0"><input data-nte-cost="${r.id}" data-field="nte_unproductive_time" type="checkbox" style="width:auto" ${Number(r.nte_unproductive_time || 0) ? 'checked' : ''}> Unproductive</label>
