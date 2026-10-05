@@ -15,6 +15,7 @@ import tempfile
 import threading
 import time
 import traceback
+import company_calendar
 from datetime import datetime, timedelta
 from email.message import EmailMessage
 from http import cookies
@@ -73,8 +74,9 @@ COG_CUSTOMER_OPTIONAL_NAMES = {"expenses", "truck & auto expense", "truck and au
 INVENTORY_PO_VENDOR_NAMES = {"warehouse inventory", "panel shop inventory", "panelshop inventory"}
 ROLE_NAMES = ("Admin", "User", "Read Only", "TX/Read Only", "Field PO")
 MCC_FEATURE_ENABLED = True
-HIDDEN_PERMISSION_KEYS = set() if MCC_FEATURE_ENABLED else {"mcc_quotes", "mcc_quote_setup"}
+HIDDEN_PERMISSION_KEYS = {"company_calendar"} | (set() if MCC_FEATURE_ENABLED else {"mcc_quotes", "mcc_quote_setup"})
 ALL_PERMISSION_DEFINITIONS = [
+    {"key": "company_calendar", "label": "Work Calendar", "group": "Company"},
     {"key": "projects", "label": "Project Dashboard", "group": "Projects"},
     {"key": "project_setup", "label": "Project Setup", "group": "Projects"},
     {"key": "fieldwise", "label": "Field Wise Import", "group": "Projects"},
@@ -2552,6 +2554,8 @@ def init_db():
             ensure_nte_defaults(con, sp["project_id"], sp["id"], None)
         for co in con.execute("SELECT id, project_id FROM change_orders WHERE COALESCE(pricing_type, 'Fixed') = 'T&M NTE'").fetchall():
             ensure_nte_defaults(con, co["project_id"], None, co["id"])
+    with db() as con:
+        company_calendar.initialize(con)
     seed_bid_tracker_from_workbook()
 
 
@@ -2715,10 +2719,13 @@ def current_user_with_permissions(handler):
     user = current_user(handler)
     if user:
         user["permissions"] = role_permissions(user.get("role"))
+        user["company_calendar_preview"] = company_calendar.preview_allowed(user)
     return user
 
 
 def can_view_permission(user, permission_key):
+    if permission_key == "company_calendar":
+        return company_calendar.preview_allowed(user)
     if not user:
         return False
     if user.get("role") == "Admin":
@@ -2727,6 +2734,8 @@ def can_view_permission(user, permission_key):
 
 
 def can_edit_permission(user, permission_key):
+    if permission_key == "company_calendar":
+        return company_calendar.preview_allowed(user)
     if not user:
         return False
     if user.get("role") == "Admin":
@@ -16040,6 +16049,9 @@ HTML = r"""
 """
 
 
+HTML = company_calendar.integrate(HTML)
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         print("%s - %s" % (self.address_string(), fmt % args))
@@ -16092,6 +16104,15 @@ class Handler(BaseHTTPRequestHandler):
                 return download_response(self, sqlite_backup_bytes(), filename, "application/vnd.sqlite3")
             if parsed.path == "/":
                 return text_response(self, HTML)
+            if parsed.path == "/api/company-calendar":
+                if not can_view_permission(user, "company_calendar"):
+                    return json_response(self, {"error": "Work Calendar access required."}, 403)
+                return json_response(self, {
+                    "events": rows("""SELECT e.*, p.name AS project_name, p.project_code
+                        FROM company_calendar_events e LEFT JOIN projects p ON p.id=e.project_id
+                        ORDER BY e.start_date, e.title, e.id"""),
+                    "projects": rows("SELECT id, project_code, name FROM projects ORDER BY project_code"),
+                })
             if parsed.path == "/nte-weekly-report":
                 if not can_view_permission(user, "nte_tracking"):
                     return text_response(self, "T&M NTE access required", "text/plain", 403)
@@ -16811,6 +16832,20 @@ class Handler(BaseHTTPRequestHandler):
                 return logout_response(self)
             if not current_user(self):
                 return json_response(self, {"error": "Login required"}, 401)
+            if parsed.path == "/api/company-calendar":
+                actor = current_user(self)
+                if not can_edit_permission(actor, "company_calendar"):
+                    return json_response(self, {"error": "Work Calendar edit access required."}, 403)
+                data = parse_json(self)
+                try:
+                    with db() as con:
+                        event_id = company_calendar.save(con, data, actor)
+                except ValueError as exc:
+                    return json_response(self, {"error": str(exc)}, 400)
+                except LookupError as exc:
+                    return json_response(self, {"error": str(exc)}, 404)
+                log_activity(actor, "updated event" if data.get("id") else "created event", "Work Calendar", str(event_id))
+                return json_response(self, {"id": event_id})
             if parsed.path == "/api/admin/send-test-email":
                 actor = current_user(self)
                 if not require_admin(self):
