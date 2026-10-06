@@ -64,6 +64,13 @@ def save(con, data, actor):
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)''', (*values, actor['id'], now, now)).lastrowid
 
 SECTION = r'''
+<style>
+ #calendarEditor { width:min(760px,calc(100vw - 32px)); max-height:calc(100dvh - 48px); overflow:auto; margin:auto; padding:24px; background:var(--panel); color:var(--text); border:1px solid var(--line); border-radius:12px; box-shadow:0 24px 80px rgba(0,0,0,.4); }
+ #calendarEditor:not([open]) { display:none; }
+ #calendarEditor::backdrop { background:rgba(15,23,42,.6); }
+ #calendarEditor .calendar-fields { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
+ @media(max-width:600px) { #calendarEditor { padding:16px; } #calendarEditor .calendar-fields { grid-template-columns:1fr; } }
+</style>
 <section id="companyCalendar" class="tab hidden">
  <div class="panel">
   <div class="section-head"><div><h2>Work Calendar</h2><p class="muted">Plan project dates, customer milestones, company events, and resource commitments.</p></div><button class="btn" id="calendarNew">Add event</button></div>
@@ -79,12 +86,12 @@ SECTION = r'''
   <p id="calendarMessage" role="status"></p><div id="calendarSummary"></div>
   <div style="overflow:auto"><div id="calendarContent"></div></div>
  </div>
- <div class="panel hidden" id="calendarEditor">
-  <h2 id="calendarEditorTitle">Add event</h2>
+ <dialog id="calendarEditor" aria-labelledby="calendarEditorTitle">
+  <div class="section-head"><h2 id="calendarEditorTitle">Add event</h2><button class="btn" type="button" id="calendarClose" aria-label="Close event details">&#215;</button></div>
   <form id="calendarForm">
    <input type="hidden" name="id">
    <label>Event title <input name="title" required maxlength="200"></label>
-   <div class="grid">
+   <div class="calendar-fields">
     <label>Event type <select name="category"></select></label><label>Status <select name="status"></select></label>
     <label>Start date <input type="date" name="start_date" required></label><label>End date <input type="date" name="end_date" required></label>
     <label>Project <select name="project_id"><option value="">Company / no project</option></select></label>
@@ -97,7 +104,7 @@ SECTION = r'''
    <button class="btn" type="submit" id="calendarSave">Save event</button> <button class="btn" type="button" id="calendarCancel">Close</button>
    <p id="calendarFormMessage" role="status"></p>
   </form>
- </div>
+ </dialog>
 </section>
 '''
 
@@ -169,17 +176,24 @@ SCRIPT = r'''
       calEl('calendarSave').classList.toggle('hidden',!editable);
       calEl('calendarEditorTitle').textContent=event?'Event details':'Add event';
       calEl('calendarFormMessage').textContent='';
-      calEl('calendarEditor').classList.remove('hidden');
-      calEl('calendarEditor').scrollIntoView({behavior:'smooth',block:'start'});
+      calEl('calendarEditor').showModal();
+      if(editable) calForm.elements.title.focus();
+      else calEl('calendarClose').focus();
     }
     calEl('calendarNew').onclick=async()=>{if(await confirmDiscard()) {markSaved();editCalendarEvent();}};
-    calEl('calendarCancel').onclick=async()=>{if(await confirmDiscard()){calEl('calendarEditor').classList.add('hidden');markSaved();}};
+    async function closeCalendarEditor() {
+      if(hasUnsavedChanges && !window.confirm('Discard your unsaved event changes?')) return;
+      calEl('calendarEditor').close();markSaved();
+    }
+    calEl('calendarCancel').onclick=closeCalendarEditor;
+    calEl('calendarClose').onclick=closeCalendarEditor;
+    calEl('calendarEditor').addEventListener('cancel',event=>{event.preventDefault();closeCalendarEditor();});
     calForm.elements.start_date.onchange=()=>{if(calForm.elements.end_date.value<calForm.elements.start_date.value)calForm.elements.end_date.value=calForm.elements.start_date.value;};
     calForm.onsubmit=async e=>{
       e.preventDefault(); calEl('calendarSave').disabled=true;
       try {
         await api('/api/company-calendar',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(formDataObj(calForm))});
-        markSaved();calEl('calendarEditor').classList.add('hidden');await loadCompanyCalendar();
+        markSaved();calEl('calendarEditor').close();await loadCompanyCalendar();
       } catch(err) { calEl('calendarFormMessage').textContent=err.message; }
       finally {calEl('calendarSave').disabled=false;}
     };
