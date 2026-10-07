@@ -16,6 +16,8 @@ import threading
 import time
 import traceback
 import company_calendar
+import access_control
+import session_security
 from datetime import datetime, timedelta
 from email.message import EmailMessage
 from http import cookies
@@ -380,7 +382,7 @@ def offline_html():
 </html>"""
 
 
-def purchase_order_html(po):
+def purchase_order_html(po, show_invoices=True):
     attachment = ""
     if po["attachment_file"]:
         safe_name = quote(po["attachment_file"])
@@ -390,7 +392,7 @@ def purchase_order_html(po):
         safe_name = quote(po["pickup_file"])
         pickup = f'<p><strong>Pickup Ticket:</strong> <a href="/uploads/{safe_name}" target="_blank" rel="noopener">{html_escape(po["pickup_file"])}</a></p>'
     invoice = ""
-    invoice_rows = rows("SELECT * FROM purchase_order_invoices WHERE po_id = ? ORDER BY uploaded_at DESC, id DESC", (po["id"],))
+    invoice_rows = rows("SELECT * FROM purchase_order_invoices WHERE po_id = ? ORDER BY uploaded_at DESC, id DESC", (po["id"],)) if show_invoices else []
     if invoice_rows:
         invoice_links = []
         for invoice_row in invoice_rows:
@@ -400,7 +402,7 @@ def purchase_order_html(po):
                 f'<span class="meta">${money(invoice_row["invoice_amount"]):,.2f} / {html_escape((invoice_row["uploaded_at"] or "").replace("T", " "))}</span></li>'
             )
         invoice = f'<p><strong>Vendor Invoices:</strong></p><ul>{"".join(invoice_links)}</ul>'
-    elif "invoice_file" in po.keys() and po["invoice_file"]:
+    elif show_invoices and "invoice_file" in po.keys() and po["invoice_file"]:
         safe_name = quote(po["invoice_file"])
         invoice = f'<p><strong>Vendor Invoice:</strong> <a href="/uploads/{safe_name}" target="_blank" rel="noopener">{html_escape(po["invoice_file"])}</a></p>'
     return f"""<!doctype html>
@@ -2556,6 +2558,7 @@ def init_db():
             ensure_nte_defaults(con, co["project_id"], None, co["id"])
     with db() as con:
         company_calendar.initialize(con)
+        session_security.initialize(con)
     seed_bid_tracker_from_workbook()
 
 
@@ -2652,14 +2655,14 @@ def verify_password(password, password_hash):
         return False
 
 
-def create_session(user_id):
+def create_session(user_id, secure=False):
     token = secrets.token_urlsafe(32)
     now = datetime.now()
     expires = now + timedelta(minutes=SESSION_IDLE_TIMEOUT_MINUTES)
     execute("DELETE FROM user_sessions WHERE expires_at <= ?", (now.isoformat(timespec="seconds"),))
     execute(
-        "INSERT INTO user_sessions (user_id, session_token, created_at, expires_at) VALUES (?, ?, ?, ?)",
-        (user_id, token, now.isoformat(timespec="seconds"), expires.isoformat(timespec="seconds")),
+        "INSERT INTO user_sessions (user_id, session_token, created_at, expires_at, secure_session) VALUES (?, ?, ?, ?, ?)",
+        (user_id, token, now.isoformat(timespec="seconds"), expires.isoformat(timespec="seconds"), int(secure)),
     )
     return token
 
@@ -2675,7 +2678,7 @@ def parse_cookie_header(header):
 
 
 def current_user(handler):
-    token = parse_cookie_header(handler.headers.get("Cookie")).get("pm_session")
+    token = parse_cookie_header(handler.headers.get("Cookie")).get(session_security.cookie_name(handler))
     if not token:
         return None
     now = datetime.now()
@@ -2683,17 +2686,21 @@ def current_user(handler):
         """
         SELECT users.id, users.username, users.display_name, users.role, users.active,
                COALESCE(users.po_auto_issue, 0) AS po_auto_issue,
-               COALESCE(users.must_change_password, 0) AS must_change_password
+               COALESCE(users.must_change_password, 0) AS must_change_password,
+               user_sessions.created_at AS session_created_at
         FROM user_sessions
         JOIN users ON users.id = user_sessions.user_id
         WHERE user_sessions.session_token = ?
           AND users.active = 1
           AND user_sessions.expires_at > ?
+          AND user_sessions.created_at > ?
+          AND user_sessions.secure_session = ?
         """,
-        (token, now.isoformat(timespec="seconds")),
+        (token, now.isoformat(timespec="seconds"), (now-timedelta(hours=session_security.ABSOLUTE_HOURS)).isoformat(timespec="seconds"), int(session_security.secure_request(handler))),
     )
     if user:
-        new_expires = now + timedelta(minutes=SESSION_IDLE_TIMEOUT_MINUTES)
+        absolute_end = datetime.fromisoformat(user.pop('session_created_at')) + timedelta(hours=session_security.ABSOLUTE_HOURS)
+        new_expires = min(now + timedelta(minutes=SESSION_IDLE_TIMEOUT_MINUTES), absolute_end)
         execute(
             "UPDATE user_sessions SET expires_at = ? WHERE session_token = ?",
             (new_expires.isoformat(timespec="seconds"), token),
@@ -4373,6 +4380,8 @@ def apply_internal_rate(category_type, category, raw_rate, rate_set_id=None):
 
 
 def json_response(handler, payload, status=200):
+    if status == 200 and getattr(handler, 'command', '') == 'GET':
+        payload = access_control.filter_payload(sys.modules[__name__], handler, payload)
     body = json.dumps(payload, default=str).encode("utf-8")
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json")
@@ -4412,7 +4421,7 @@ def login_success_response(handler, token):
     body = b'{"ok": true}'
     handler.send_response(200)
     handler.send_header("Content-Type", "application/json")
-    handler.send_header("Set-Cookie", f"pm_session={token}; Path=/; HttpOnly; SameSite=Lax")
+    handler.send_header("Set-Cookie", session_security.cookie_header(handler, token))
     handler.send_header("Cache-Control", "no-store")
     handler.send_header("Content-Length", str(len(body)))
     handler.end_headers()
@@ -4423,7 +4432,7 @@ def logout_response(handler):
     body = b'{"ok": true}'
     handler.send_response(200)
     handler.send_header("Content-Type", "application/json")
-    handler.send_header("Set-Cookie", "pm_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
+    handler.send_header("Set-Cookie", session_security.cookie_header(handler, clear=True))
     handler.send_header("Cache-Control", "no-store")
     handler.send_header("Content-Length", str(len(body)))
     handler.end_headers()
@@ -8714,6 +8723,14 @@ HTML = r"""
           <h2>My POs</h2>
           <button class="btn" id="refreshFieldPos" type="button">Refresh</button>
         </div>
+        <div class="grid cols-4">
+          <div><label for="fieldPoHistorySearch">Search My POs</label><input id="fieldPoHistorySearch" type="search" placeholder="PO #, customer, vendor, job/order, COG or description"></div>
+          <div><label for="fieldPoCustomerFilter">Customer</label><select id="fieldPoCustomerFilter"><option value="">All customers</option></select></div>
+          <div><label for="fieldPoVendorFilter">Vendor</label><select id="fieldPoVendorFilter"><option value="">All vendors</option></select></div>
+          <div><label for="fieldPoJobFilter">Job / Order # / COG</label><select id="fieldPoJobFilter"><option value="">All jobs / orders / COGs</option></select></div>
+        </div>
+        <div class="actions"><button class="btn" id="clearFieldPoFilters" type="button">Clear filters</button><span id="fieldPoHistoryCount" class="muted" role="status" aria-live="polite"></span></div>
+        <div id="fieldPoNoMatches" class="muted hidden">No POs match these filters. Try another search or clear the filters.</div>
         <div id="fieldPoList" class="field-po-list"></div>
       </div>
     </section>
@@ -9781,6 +9798,7 @@ HTML = r"""
     let jobOrderReportRows = [];
     let jobOrderSort = { field: 'job_number', direction: 'asc' };
     let fieldPoJobChoices = [];
+    let fieldPoHistoryRows = [];
     let officePoRows = [];
     let closedPoRows = [];
     let projectPoRows = [];
@@ -10328,10 +10346,12 @@ HTML = r"""
         return;
       }
       try {
+        const wasForced = document.getElementById('accountModal').dataset.force === '1';
         await api('/api/change-password', { method:'POST', body: JSON.stringify(data) });
         document.getElementById('accountModal').dataset.force = '0';
         document.getElementById('accountModal').classList.add('hidden');
         await loadCurrentUser();
+        if (wasForced) window.location.reload();
       } catch (err) {
         error.textContent = err.message;
       }
@@ -10957,6 +10977,7 @@ HTML = r"""
     };
 
     async function loadProjects() {
+      if (!['projects','project_setup','fieldwise','review_exceptions','vendor_invoices','customer_billing','customer_dashboard','nte_tracking','archived_projects'].some(canViewPermission)) return;
       state.projects = await api('/api/projects?status=all');
       const sel = document.getElementById('projectSelect');
       const activeProjects = state.projects.filter(p => (p.status || 'Active') !== 'Archived');
@@ -11355,11 +11376,43 @@ HTML = r"""
       });
     }
 
+    function filterFieldPoHistory() {
+      const needle = document.getElementById('fieldPoHistorySearch').value.trim().toLowerCase();
+      const customer = document.getElementById('fieldPoCustomerFilter').value;
+      const vendor = document.getElementById('fieldPoVendorFilter').value;
+      const job = document.getElementById('fieldPoJobFilter').value;
+      let shown = 0;
+      document.querySelectorAll('#fieldPoList [data-po-history-index]').forEach(card => {
+        const po = fieldPoHistoryRows[Number(card.dataset.poHistoryIndex)];
+        const text = [po.po_number, po.customer_name, po.vendor, po.job_number, po.job_label, po.description].join(' ').toLowerCase();
+        const match = (!needle || text.includes(needle)) && (!customer || po.customer_name === customer)
+          && (!vendor || po.vendor === vendor) && (!job || (po.job_label || po.job_number || '') === job);
+        card.classList.toggle('hidden', !match);
+        if (match) shown++;
+      });
+      document.getElementById('fieldPoHistoryCount').textContent = `${shown} of ${fieldPoHistoryRows.length} POs`;
+      document.getElementById('fieldPoNoMatches').classList.toggle('hidden', shown > 0 || !fieldPoHistoryRows.length);
+    }
+
+    function updateFieldPoHistoryFilters() {
+      [['fieldPoCustomerFilter', 'All customers', po => po.customer_name],
+       ['fieldPoVendorFilter', 'All vendors', po => po.vendor],
+       ['fieldPoJobFilter', 'All jobs / orders / COGs', po => po.job_label || po.job_number]].forEach(([id, label, valueFor]) => {
+        const select = document.getElementById(id);
+        const previous = select.value;
+        const values = [...new Set(fieldPoHistoryRows.map(valueFor).filter(Boolean))].sort((a,b) => a.localeCompare(b, undefined, {numeric:true, sensitivity:'base'}));
+        select.innerHTML = `<option value="">${label}</option>` + values.map(value => `<option value="${htmlEscape(value)}">${htmlEscape(value)}</option>`).join('');
+        select.value = values.includes(previous) ? previous : '';
+      });
+    }
+
     async function loadFieldPos() {
       const poRows = await api('/api/purchase-orders?mine=1');
+      fieldPoHistoryRows = poRows;
+      updateFieldPoHistoryFilters();
       const target = document.getElementById('fieldPoList');
       target.innerHTML = poRows.length
-        ? poRows.map(po => {
+        ? poRows.map((po, index) => {
           const statusClass = String(po.status || '').toLowerCase().replace(/\s+/g, '-');
           const pendingApproval = po.status === 'Pending Approval';
           const pickup = po.pickup_file
@@ -11371,7 +11424,7 @@ HTML = r"""
                 <input name="pickup_file" type="file" accept=".pdf,.png,.jpg,.jpeg,.webp" capture="environment" required>
                 <button class="btn primary" type="submit">Upload Pickup Ticket</button>
               </form>`;
-          return `<div class="field-po-card">
+          return `<div class="field-po-card" data-po-history-index="${index}">
             <div class="field-po-card-header">
               <div>
                 <div class="field-po-card-title">${htmlEscape(po.po_number || '')}</div>
@@ -11392,6 +11445,7 @@ HTML = r"""
           </div>`;
         }).join('')
         : '<div class="field-po-card"><strong>No POs yet.</strong><div class="field-po-card-meta">Your created POs will show here.</div></div>';
+      filterFieldPoHistory();
       document.querySelectorAll('[data-pickup-form]').forEach(form => form.onsubmit = async event => {
         event.preventDefault();
         const poId = form.dataset.pickupForm;
@@ -11681,22 +11735,19 @@ HTML = r"""
       }
       state.subprojects = await api(`/api/subprojects?project_id=${state.projectId}`);
       state.changeOrders = await api(`/api/change-orders?project_id=${state.projectId}`);
-      state.cogCategories = await api('/api/cog-categories');
+      state.cogCategories = ['cog_setup','po_requests','po_review','project_setup'].some(canViewPermission) ? await api('/api/cog-categories') : [];
       state.rateSets = await api('/api/rate-sets');
-      state.internalRates = await api('/api/internal-rates');
+      state.internalRates = canViewPermission('project_setup') ? await api('/api/internal-rates') : [];
       fillSelects();
-      await loadDashboard();
+      if (canViewPermission('projects')) await loadDashboard();
       loadSubprojectEditor();
       loadChangeOrderEditor();
       loadCogCategoryEditor();
       loadInternalRateEditor();
-      loadFieldWiseImportHistory();
-      loadVendorImportHistory();
-      loadFieldTicketLines();
-      loadVendorInvoiceLines();
-      loadVendorAllocationHistory();
-      loadCustomerInvoices();
-      refreshOpenDetails();
+      if (canViewPermission('fieldwise')) { loadFieldWiseImportHistory(); loadFieldTicketLines(); }
+      if (canViewPermission('vendor_invoices')) { loadVendorImportHistory(); loadVendorInvoiceLines(); loadVendorAllocationHistory(); }
+      if (canViewPermission('customer_billing')) loadCustomerInvoices();
+      if (canViewPermission('projects')) refreshOpenDetails();
       if (!document.getElementById('customerDashboard')?.classList.contains('hidden')) loadCustomerDashboard();
       if (!document.getElementById('nteTracking')?.classList.contains('hidden')) loadNteTracking();
     }
@@ -15531,6 +15582,14 @@ HTML = r"""
       }
     };
     document.getElementById('refreshOfficePos').onclick = () => loadOfficePos();
+    document.getElementById('fieldPoHistorySearch').oninput = filterFieldPoHistory;
+    ['fieldPoCustomerFilter', 'fieldPoVendorFilter', 'fieldPoJobFilter'].forEach(id => {
+      document.getElementById(id).onchange = filterFieldPoHistory;
+    });
+    document.getElementById('clearFieldPoFilters').onclick = () => {
+      ['fieldPoHistorySearch', 'fieldPoCustomerFilter', 'fieldPoVendorFilter', 'fieldPoJobFilter'].forEach(id => document.getElementById(id).value = '');
+      filterFieldPoHistory();
+    };
     document.getElementById('officePoSearch').oninput = () => renderOfficePos();
     document.getElementById('officePoStatusFilter').onchange = () => renderOfficePos();
     document.getElementById('refreshClosedPos').onclick = () => loadClosedPos();
@@ -16021,6 +16080,7 @@ HTML = r"""
     }
     (async () => {
       await loadCurrentUser();
+      if (Number(state.currentUser?.must_change_password || 0)) return;
       if (isTexasReadOnly()) {
         openTab('texasOps', { replaceHistory: true });
       } else if (state.currentUser?.role === 'Field PO') {
@@ -16057,6 +16117,8 @@ class Handler(BaseHTTPRequestHandler):
         print("%s - %s" % (self.address_string(), fmt % args))
 
     def do_GET(self):
+        if not access_control.authorize(sys.modules[__name__], self):
+            return
         try:
             parsed = urlparse(self.path)
             qs = parse_qs(parsed.query)
@@ -16078,13 +16140,13 @@ class Handler(BaseHTTPRequestHandler):
                 return redirect_response(self, "/login")
             if is_texas_read_only(user):
                 allowed_paths = ("/", "/api/me", "/api/texas-financial-summary")
-                if parsed.path not in allowed_paths and not parsed.path.startswith(public_paths):
+                if parsed.path not in allowed_paths and not parsed.path.startswith(public_paths) and not parsed.path.startswith(("/uploads/", "/pdf-viewer/", "/pdf-page/")):
                     if parsed.path.startswith("/api/"):
                         return json_response(self, {"error": "Texas Operations access only."}, 403)
                     return redirect_response(self, "/")
             if is_field_po_only(user):
                 allowed_paths = ("/", "/api/me", "/api/job-order-report", "/api/purchase-orders")
-                if parsed.path not in allowed_paths and not parsed.path.startswith(public_paths) and not parsed.path.startswith("/po/") and not parsed.path.startswith("/uploads/"):
+                if parsed.path not in allowed_paths and not parsed.path.startswith(public_paths) and not parsed.path.startswith(("/po/", "/uploads/", "/pdf-viewer/", "/pdf-page/")):
                     if parsed.path.startswith("/api/"):
                         return json_response(self, {"error": "PO access only."}, 403)
                     return redirect_response(self, "/")
@@ -16107,10 +16169,16 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/api/company-calendar":
                 if not can_view_permission(user, "company_calendar"):
                     return json_response(self, {"error": "Work Calendar access required."}, 403)
+                events = rows("""SELECT e.*, p.name AS project_name, p.project_code
+                    FROM company_calendar_events e LEFT JOIN projects p ON p.id=e.project_id
+                    ORDER BY e.start_date, e.title, e.id""")
+                if qs.get("month"):
+                    try:
+                        events = company_calendar.occurrences(events, qs['month'][0])
+                    except (ValueError, OverflowError):
+                        return json_response(self, {"error": "Choose a valid calendar month."}, 400)
                 return json_response(self, {
-                    "events": rows("""SELECT e.*, p.name AS project_name, p.project_code
-                        FROM company_calendar_events e LEFT JOIN projects p ON p.id=e.project_id
-                        ORDER BY e.start_date, e.title, e.id"""),
+                    "events": events,
                     "projects": rows("SELECT id, project_code, name FROM projects ORDER BY project_code"),
                 })
             if parsed.path == "/nte-weekly-report":
@@ -16157,7 +16225,7 @@ class Handler(BaseHTTPRequestHandler):
                     return text_response(self, "PO not found", "text/plain", 404)
                 if is_field_po_only(user) and po["requested_by_user_id"] != user["id"]:
                     return text_response(self, "Not found", "text/plain", 404)
-                return text_response(self, purchase_order_html(po))
+                return text_response(self, purchase_order_html(po, show_invoices=can_view_permission(user, "po_review")))
             if parsed.path.startswith("/uploads/"):
                 requested_upload = Path(unquote(parsed.path.removeprefix("/uploads/"))).name
                 if is_field_po_only(user):
@@ -16483,10 +16551,10 @@ class Handler(BaseHTTPRequestHandler):
                     ),
                 )
             if parsed.path == "/api/purchase-orders":
-                if not can_use_field_po(user):
+                if not can_view_permission(user, "po_requests") and not can_view_permission(user, "po_review"):
                     return json_response(self, {"error": "PO access required."}, 403)
                 mine_only = qs.get("mine", [""])[0] == "1"
-                if mine_only or is_field_po_only(user):
+                if mine_only or not can_view_permission(user, "po_review"):
                     return json_response(
                         self,
                         purchase_orders_with_invoices("SELECT * FROM purchase_orders WHERE requested_by_user_id = ? ORDER BY created_at DESC, id DESC", (user["id"],)),
@@ -16816,6 +16884,8 @@ class Handler(BaseHTTPRequestHandler):
             return json_response(self, {"error": str(e)}, 500)
 
     def do_POST(self):
+        if not access_control.authorize(sys.modules[__name__], self):
+            return
         try:
             parsed = urlparse(self.path)
             if parsed.path == "/api/login":
@@ -16823,10 +16893,10 @@ class Handler(BaseHTTPRequestHandler):
                 user = one("SELECT * FROM users WHERE username = ? AND active = 1", (data.get("username"),))
                 if not user or not verify_password(data.get("password"), user["password_hash"]):
                     return json_response(self, {"error": "Invalid login"}, 401)
-                token = create_session(user["id"])
+                token = create_session(user["id"], secure=session_security.secure_request(self))
                 return login_success_response(self, token)
             if parsed.path == "/api/logout":
-                token = parse_cookie_header(self.headers.get("Cookie")).get("pm_session")
+                token = parse_cookie_header(self.headers.get("Cookie")).get(session_security.cookie_name(self))
                 if token:
                     execute("DELETE FROM user_sessions WHERE session_token = ?", (token,))
                 return logout_response(self)
@@ -16888,14 +16958,11 @@ class Handler(BaseHTTPRequestHandler):
                     return json_response(self, {"error": "New passwords do not match."}, 400)
                 if new_password == DEFAULT_NEW_USER_PASSWORD:
                     return json_response(self, {"error": "Choose a password different from the temporary password."}, 400)
-                execute(
-                    "UPDATE users SET password_hash = ?, must_change_password = 0 WHERE id = ?",
-                    (hash_password(new_password), user["id"]),
-                )
-                token = parse_cookie_header(self.headers.get("Cookie")).get("pm_session")
                 with db() as con:
-                    con.execute("DELETE FROM user_sessions WHERE user_id = ? AND session_token <> ?", (user["id"], token or ""))
-                return json_response(self, {"ok": True})
+                    con.execute("UPDATE users SET password_hash = ?, must_change_password = 0 WHERE id = ?", (hash_password(new_password), user["id"]))
+                    con.execute("DELETE FROM user_sessions WHERE user_id = ?", (user["id"],))
+                token = create_session(user["id"], secure=session_security.secure_request(self))
+                return login_success_response(self, token)
             if parsed.path == "/api/nte-completion":
                 actor = current_user(self)
                 if not can_edit_permission(actor, "nte_tracking"):
@@ -18982,6 +19049,9 @@ class Handler(BaseHTTPRequestHandler):
                 updated = apply_internal_rate(data.get("category_type"), data.get("category"), money(data.get("raw_rate")), data.get("rate_set_id"))
                 return json_response(self, {"id": new_id, "updated_cost_records": updated})
             if parsed.path == "/api/imports/delete":
+                needed = "vendor_invoices" if data.get("source") == "Vendor Invoice" else "fieldwise" if data.get("source") in ("Field Wise", "Field Wise PDF") else None
+                if not needed or not can_edit_permission(current_user(self), needed):
+                    return json_response(self, {"error": "Import edit access required."}, 403)
                 with db() as con:
                     deleted = con.execute(
                         """
@@ -19250,6 +19320,8 @@ class Handler(BaseHTTPRequestHandler):
             return json_response(self, {"error": str(e)}, 500)
 
     def do_PUT(self):
+        if not access_control.authorize(sys.modules[__name__], self):
+            return
         try:
             parsed = urlparse(self.path)
             data = parse_json(self)
@@ -19275,7 +19347,9 @@ class Handler(BaseHTTPRequestHandler):
                         return json_response(self, {"error": "That username is already in use."}, 400)
                     execute("UPDATE users SET username = ? WHERE id = ?", (new_username, user_id))
                 if "password" in data and data.get("password"):
-                    execute("UPDATE users SET password_hash = ?, must_change_password = 1 WHERE id = ?", (hash_password(data.get("password")), user_id))
+                    with db() as con:
+                        con.execute("UPDATE users SET password_hash = ?, must_change_password = 1 WHERE id = ?", (hash_password(data.get("password")), user_id))
+                        con.execute("DELETE FROM user_sessions WHERE user_id = ?", (user_id,))
                 if "role" in data:
                     execute("UPDATE users SET role = ? WHERE id = ?", (clean_role(data.get("role")), user_id))
                 if "display_name" in data:
@@ -20207,6 +20281,8 @@ class Handler(BaseHTTPRequestHandler):
             return json_response(self, {"error": str(e)}, 500)
 
     def do_DELETE(self):
+        if not access_control.authorize(sys.modules[__name__], self):
+            return
         try:
             parsed = urlparse(self.path)
             if not current_user(self):

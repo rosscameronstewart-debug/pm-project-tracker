@@ -61,6 +61,24 @@ class CalendarTests(unittest.TestCase):
         self.assertFalse(company_calendar.preview_allowed(dict(self.actor, active=0)))
         self.assertNotIn('company_calendar', [p['key'] for p in app.PERMISSION_DEFINITIONS])
 
+    def test_recurring_dates_and_edit_series(self):
+        with sqlite3.connect(self.path) as con:
+            con.row_factory = sqlite3.Row
+            event_id = company_calendar.save(con, dict(self.data, start_date='2026-01-31', end_date='2026-02-01', repeat_frequency='Monthly', repeat_until='2026-04-30'), self.actor)
+            event = dict(con.execute('SELECT * FROM company_calendar_events').fetchone())
+            feb = company_calendar.occurrences([event], '2026-02')
+            self.assertEqual([e['start_date'] for e in feb], ['2026-01-31', '2026-02-28'])
+            self.assertEqual(feb[1]['end_date'], '2026-03-01')
+            self.assertEqual(company_calendar.occurrences([event], '2026-03')[1]['start_date'], '2026-03-31')
+            self.assertEqual(company_calendar.occurrences([event], '2026-05')[0]['start_date'], '2026-04-30')
+            company_calendar.save(con, dict(self.data, id=event_id, repeat_frequency='Weekly', repeat_interval=2, repeat_until='2026-10-31'), self.actor)
+            event = dict(con.execute('SELECT * FROM company_calendar_events').fetchone())
+            self.assertEqual([e['start_date'] for e in company_calendar.occurrences([event], '2026-10')], ['2026-10-05','2026-10-19'])
+            self.assertEqual(con.execute('SELECT count(*) FROM company_calendar_events').fetchone()[0], 1)
+            for changes in (dict(repeat_until=''), dict(repeat_until='2026-01-01'), dict(repeat_interval=0)):
+                with self.assertRaises(ValueError):
+                    company_calendar.save(con, dict(self.data, repeat_frequency='Weekly', **changes), self.actor)
+
     def test_http_permissions_and_validation(self):
         with patch.object(app, 'DB_PATH', self.path), patch.object(app, 'current_user', side_effect=lambda _: self.actor), patch.object(app, 'role_permissions', return_value={'company_calendar': {'can_view': 1, 'can_edit': 0}}), patch.object(app, 'log_activity'):
             server = ThreadingHTTPServer(('127.0.0.1', 0), app.Handler)

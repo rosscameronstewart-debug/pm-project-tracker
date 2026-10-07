@@ -1,5 +1,6 @@
 """Company scheduling storage and dashboard interface."""
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+import calendar
 import math
 
 KINDS = ('Project start', 'Project completion', 'Customer milestone', 'Company event', 'Time off', 'Other')
@@ -24,6 +25,40 @@ def initialize(con):
         );
         CREATE INDEX IF NOT EXISTS company_calendar_dates ON company_calendar_events(start_date, end_date);
     ''')
+    columns = {row[1] for row in con.execute('PRAGMA table_info(company_calendar_events)')}
+    for name, definition in (('repeat_frequency', "TEXT NOT NULL DEFAULT 'None'"), ('repeat_interval', 'INTEGER NOT NULL DEFAULT 1'), ('repeat_until', "TEXT NOT NULL DEFAULT ''")):
+        if name not in columns:
+            con.execute(f'ALTER TABLE company_calendar_events ADD COLUMN {name} {definition}')
+
+def occurrences(events, month):
+    first = date.fromisoformat(month + '-01')
+    last = first.replace(day=calendar.monthrange(first.year, first.month)[1])
+    result = []
+    for event in events:
+        start = date.fromisoformat(event['start_date'])
+        duration = date.fromisoformat(event['end_date']) - start
+        frequency = event.get('repeat_frequency', 'None')
+        until = date.fromisoformat(event['repeat_until']) if frequency != 'None' else start
+        interval = event.get('repeat_interval', 1)
+        for n in range(4000):
+            if frequency in ('Daily', 'Weekly'):
+                current = start + timedelta(days=n * interval * (7 if frequency == 'Weekly' else 1))
+            elif frequency in ('Monthly', 'Yearly'):
+                offset = n * interval * (12 if frequency == 'Yearly' else 1)
+                year, m = divmod(start.year * 12 + start.month - 1 + offset, 12)
+                if year > 9999:
+                    break
+                current = date(year, m+1, min(start.day, calendar.monthrange(year, m+1)[1]))
+            else:
+                current = start
+            if current > until or current > last:
+                break
+            if current + duration >= first:
+                result.append(dict(event, start_date=current.isoformat(), end_date=(current+duration).isoformat(),
+                                   series_start_date=event['start_date'], series_end_date=event['end_date']))
+            if frequency == 'None':
+                break
+    return sorted(result, key=lambda e: (e['start_date'], e['title'], e['id']))
 
 def save(con, data, actor):
     title = str(data.get('title') or '').strip()
@@ -41,6 +76,19 @@ def save(con, data, actor):
         raise ValueError('Enter valid dates, a whole crew count, and leadership hours.')
     if end < start:
         raise ValueError('End date must be on or after the start date.')
+    frequency = data.get('repeat_frequency') or 'None'
+    if frequency not in ('None', 'Daily', 'Weekly', 'Monthly', 'Yearly'):
+        raise ValueError('Choose a valid repeat frequency.')
+    interval, until = 1, ''
+    if frequency != 'None':
+        try:
+            interval = int(str(data.get('repeat_interval') or '1'))
+            until_date = date.fromisoformat(str(data.get('repeat_until') or ''))
+        except (ValueError, TypeError):
+            raise ValueError('Enter a whole repeat interval and a repeat end date.')
+        if not 1 <= interval <= 52 or not start <= until_date <= start + timedelta(days=3650):
+            raise ValueError('Repeat interval must be 1–52, with a repeat end date within ten years of the start.')
+        until = until_date.isoformat()
     if not 0 <= crew <= 10000 or not math.isfinite(hours) or not 0 <= hours <= 10000:
         raise ValueError('Crew and leadership hours must be between 0 and 10,000.')
     project_id = data.get('project_id') or None
@@ -48,20 +96,20 @@ def save(con, data, actor):
         raise ValueError('The selected project no longer exists.')
     values = (title, category, status, start.isoformat(), end.isoformat(), project_id,
               str(data.get('owner') or '').strip(), str(data.get('location') or '').strip(),
-              crew, hours, str(data.get('notes') or '').strip())
+              crew, hours, str(data.get('notes') or '').strip(), frequency, interval, until)
     now = datetime.now().isoformat(timespec='seconds')
     if data.get('id'):
         cur = con.execute('''UPDATE company_calendar_events SET
             title=?, category=?, status=?, start_date=?, end_date=?, project_id=?,
-            owner=?, location=?, crew_count=?, leadership_hours=?, notes=?, updated_at=? WHERE id=?''',
+            owner=?, location=?, crew_count=?, leadership_hours=?, notes=?, repeat_frequency=?, repeat_interval=?, repeat_until=?, updated_at=? WHERE id=?''',
             (*values, now, data['id']))
         if not cur.rowcount:
             raise LookupError('Calendar event not found.')
         return int(data['id'])
     return con.execute('''INSERT INTO company_calendar_events
         (title,category,status,start_date,end_date,project_id,owner,location,crew_count,
-         leadership_hours,notes,created_by,created_at,updated_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)''', (*values, actor['id'], now, now)).lastrowid
+         leadership_hours,notes,repeat_frequency,repeat_interval,repeat_until,created_by,created_at,updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''', (*values, actor['id'], now, now)).lastrowid
 
 SECTION = r'''
 <style>
@@ -94,12 +142,16 @@ SECTION = r'''
    <div class="calendar-fields">
     <label>Event type <select name="category"></select></label><label>Status <select name="status"></select></label>
     <label>Start date <input type="date" name="start_date" required></label><label>End date <input type="date" name="end_date" required></label>
+    <label>Repeat <select name="repeat_frequency"><option>None</option><option>Daily</option><option>Weekly</option><option>Monthly</option><option>Yearly</option></select></label>
+    <label>Repeat every <input name="repeat_interval" type="number" min="1" max="52" step="1" value="1"><span class="muted">Use 2 with Weekly for every other week.</span></label>
+    <label>Repeat through <input name="repeat_until" type="date"></label>
     <label>Project <select name="project_id"><option value="">Company / no project</option></select></label>
     <label>Owner / leadership <input name="owner" placeholder="Person or team responsible"></label>
     <label>Location <input name="location"></label>
     <label>Crew needed per day <input name="crew_count" type="number" min="0" max="10000" step="1" value="0"></label>
     <label>Leadership hours per day <input name="leadership_hours" type="number" min="0" max="10000" step="0.25" value="0"></label>
    </div>
+   <p class="muted" id="calendarRepeatHelp">Repeats keep the same event duration. Monthly dates that do not exist use the last day of that month. Editing or changing status applies to the entire series.</p>
    <label>Notes / scheduling dependencies <textarea name="notes" rows="3"></textarea></label>
    <button class="btn" type="submit" id="calendarSave">Save event</button> <button class="btn" type="button" id="calendarCancel">Close</button>
    <p id="calendarFormMessage" role="status"></p>
@@ -124,7 +176,7 @@ SCRIPT = r'''
     async function loadCompanyCalendar() {
       const request = ++calendarRequest;
       try {
-        const data = await api('/api/company-calendar');
+        const data = await api('/api/company-calendar?month='+encodeURIComponent(calEl('calendarMonth').value));
         if (request !== calendarRequest) return;
         calendarEvents = data.events;
         const opts = data.projects.map(p => `<option value="${p.id}">${htmlEscape(p.project_code+' — '+p.name)}</option>`).join('');
@@ -169,12 +221,14 @@ SCRIPT = r'''
     }
     function editCalendarEvent(event) {
       calForm.reset();
-      const defaults = {id:'',title:'',category:'Project start',status:'Scheduled',start_date:calDate(new Date()),end_date:calDate(new Date()),project_id:'',owner:'',location:'',crew_count:0,leadership_hours:0,notes:''};
-      Object.entries(event || defaults).forEach(([key,value])=>{if(calForm.elements.namedItem(key)) calForm.elements.namedItem(key).value=value ?? '';});
+      const defaults = {id:'',title:'',category:'Project start',status:'Scheduled',start_date:calDate(new Date()),end_date:calDate(new Date()),project_id:'',owner:'',location:'',crew_count:0,leadership_hours:0,notes:'',repeat_frequency:'None',repeat_interval:1,repeat_until:''};
+      const values = event ? {...defaults,...event,start_date:event.series_start_date || event.start_date,end_date:event.series_end_date || event.end_date} : defaults;
+      Object.entries(values).forEach(([key,value])=>{if(calForm.elements.namedItem(key)) calForm.elements.namedItem(key).value=value ?? '';});
       const editable=canEditPermission('company_calendar');
       Array.from(calForm.elements).forEach(el=>{if(!['calendarCancel','calendarSave'].includes(el.id))el.disabled=!editable;});
       calEl('calendarSave').classList.toggle('hidden',!editable);
-      calEl('calendarEditorTitle').textContent=event?'Event details':'Add event';
+      calEl('calendarEditorTitle').textContent=event?(values.repeat_frequency !== 'None'?'Recurring event — edit series':'Event details'):'Add event';
+      updateCalendarRepeat();
       calEl('calendarFormMessage').textContent='';
       calEl('calendarEditor').showModal();
       if(editable) calForm.elements.title.focus();
@@ -188,6 +242,14 @@ SCRIPT = r'''
     calEl('calendarCancel').onclick=closeCalendarEditor;
     calEl('calendarClose').onclick=closeCalendarEditor;
     calEl('calendarEditor').addEventListener('cancel',event=>{event.preventDefault();closeCalendarEditor();});
+    function updateCalendarRepeat() {
+      const repeating=calForm.elements.repeat_frequency.value !== 'None';
+      calForm.elements.repeat_until.required=repeating;
+      calForm.elements.repeat_until.disabled=!repeating || !canEditPermission('company_calendar');
+      calForm.elements.repeat_interval.disabled=!repeating || !canEditPermission('company_calendar');
+      calEl('calendarRepeatHelp').classList.toggle('hidden',!repeating);
+    }
+    calForm.elements.repeat_frequency.onchange=updateCalendarRepeat;
     calForm.elements.start_date.onchange=()=>{if(calForm.elements.end_date.value<calForm.elements.start_date.value)calForm.elements.end_date.value=calForm.elements.start_date.value;};
     calForm.onsubmit=async e=>{
       e.preventDefault(); calEl('calendarSave').disabled=true;
@@ -197,11 +259,12 @@ SCRIPT = r'''
       } catch(err) { calEl('calendarFormMessage').textContent=err.message; }
       finally {calEl('calendarSave').disabled=false;}
     };
-    ['calendarMonth','calendarView','calendarCategory','calendarProject','calendarStatus'].forEach(id=>calEl(id).onchange=renderCompanyCalendar);
-    function moveCalendarMonth(delta) {const [y,m]=calEl('calendarMonth').value.split('-').map(Number);calEl('calendarMonth').value=calDate(new Date(y,m-1+delta,1)).slice(0,7);renderCompanyCalendar();}
+    ['calendarView','calendarCategory','calendarProject','calendarStatus'].forEach(id=>calEl(id).onchange=renderCompanyCalendar);
+    calEl('calendarMonth').onchange=loadCompanyCalendar;
+    function moveCalendarMonth(delta) {const [y,m]=calEl('calendarMonth').value.split('-').map(Number);calEl('calendarMonth').value=calDate(new Date(y,m-1+delta,1)).slice(0,7);loadCompanyCalendar();}
     calEl('calendarPrev').onclick=()=>moveCalendarMonth(-1);
     calEl('calendarNext').onclick=()=>moveCalendarMonth(1);
-    calEl('calendarToday').onclick=()=>{calEl('calendarMonth').value=calDate(new Date()).slice(0,7);renderCompanyCalendar();};
+    calEl('calendarToday').onclick=()=>{calEl('calendarMonth').value=calDate(new Date()).slice(0,7);loadCompanyCalendar();};
 '''
 
 def integrate(html):
