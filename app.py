@@ -2497,6 +2497,8 @@ def init_db():
         cog_cols = [r["name"] for r in con.execute("PRAGMA table_info(cog_categories)").fetchall()]
         if "restricted" not in cog_cols:
             con.execute("ALTER TABLE cog_categories ADD COLUMN restricted INTEGER DEFAULT 0")
+        if "po_code" not in cog_cols:
+            con.execute("ALTER TABLE cog_categories ADD COLUMN po_code TEXT DEFAULT ''")
         default_rate_set = con.execute("SELECT id FROM rate_sets WHERE name = 'Current'").fetchone()
         if not default_rate_set:
             cur = con.execute("INSERT INTO rate_sets (name, effective_date, active) VALUES ('Current', '', 1)")
@@ -8854,6 +8856,7 @@ HTML = r"""
         <div class="grid cols-4">
           <div><label>Name</label><input id="cogName" placeholder="Truck 12"></div>
           <div><label>Internal COG Code</label><input id="cogCode" placeholder="TRUCK"></div>
+          <div><label for="cogPoCode">PO Code</label><input id="cogPoCode" maxlength="3" pattern="[A-Za-z0-9]{3}" placeholder="A07"></div>
           <div style="grid-column:span 2"><label>Description</label><input id="cogDescription" placeholder="Optional notes for office review"></div>
           <label class="checkline"><input type="checkbox" id="cogRestricted"> Restrict to selected users</label>
         </div>
@@ -13463,9 +13466,10 @@ HTML = r"""
         }).join('')}</div>`;
       };
       tableEl.innerHTML = state.cogCategories.length
-        ? `<thead><tr><th>Name</th><th>Internal COG Code</th><th>Description</th><th>Restricted</th><th>Allowed Users</th><th></th></tr></thead><tbody>${state.cogCategories.map(c => `<tr>
+        ? `<thead><tr><th>Name</th><th>Internal COG Code</th><th>PO Code</th><th>Description</th><th>Restricted</th><th>Allowed Users</th><th></th></tr></thead><tbody>${state.cogCategories.map(c => `<tr>
             <td><input data-cog="${c.id}" data-field="name" value="${htmlEscape(c.name || '')}"></td>
             <td><input data-cog="${c.id}" data-field="code" value="${htmlEscape(c.code || '')}"></td>
+            <td><input data-cog="${c.id}" data-field="po_code" aria-label="PO Code" maxlength="3" pattern="[A-Za-z0-9]{3}" placeholder="A07" value="${htmlEscape(c.po_code || '')}"></td>
             <td><input data-cog="${c.id}" data-field="description" value="${htmlEscape(c.description || '')}"></td>
             <td><label class="checkline"><input data-cog="${c.id}" data-field="restricted" type="checkbox" ${Number(c.restricted || 0) ? 'checked' : ''}> Restrict PO use</label><span class="access-rule-note">When checked, only selected users can create POs with this COG.</span></td>
             <td>${userOptionsForCog(c)}</td>
@@ -13485,6 +13489,7 @@ HTML = r"""
           fields[el.dataset.field] = el.type === 'checkbox' ? (el.checked ? '1' : '0') : el.value;
         });
         fields.allowed_user_ids = Array.from(tableEl.querySelectorAll(`[data-cog-user][data-cog="${id}"]:checked`)).map(el => el.value);
+        try {
         await api(`/api/cog-categories/${id}`, { method:'PUT', body: JSON.stringify(fields) });
         btn.closest('tr')?.classList.remove('setup-dirty');
         markSaved();
@@ -13492,6 +13497,9 @@ HTML = r"""
         jobOrderReportRows = await api('/api/job-order-report');
         loadCogCategoryEditor();
         renderFieldPoJobChoices(document.getElementById('fieldPoJobSearch')?.value || '');
+        } catch (err) {
+          window.alert(err.message || 'Could not save this COG. Your edits are still shown; correct them and try again.');
+        }
       });
       tableEl.querySelectorAll('[data-delete-cog]').forEach(btn => btn.onclick = async () => {
         const id = btn.dataset.deleteCog;
@@ -15968,12 +15976,13 @@ HTML = r"""
         method: 'POST',
         body: JSON.stringify({
           code: document.getElementById('cogCode').value,
+          po_code: document.getElementById('cogPoCode').value,
           name: document.getElementById('cogName').value,
           description: document.getElementById('cogDescription').value,
           restricted: document.getElementById('cogRestricted')?.checked ? '1' : '0'
         })
       });
-      ['cogCode','cogName','cogDescription'].forEach(id => document.getElementById(id).value = '');
+      ['cogCode','cogPoCode','cogName','cogDescription'].forEach(id => document.getElementById(id).value = '');
       if (document.getElementById('cogRestricted')) document.getElementById('cogRestricted').checked = false;
       markSaved();
       state.cogCategories = await api('/api/cog-categories');
@@ -18801,6 +18810,9 @@ class Handler(BaseHTTPRequestHandler):
                     return json_response(self, {"error": "Admin required"}, 403)
                 code = str(data.get("code") or "").strip().upper()
                 name = str(data.get("name") or "").strip()
+                po_code = str(data.get("po_code") or "").strip()
+                if not re.fullmatch(r"[A-Za-z0-9]{3}", po_code):
+                    return json_response(self, {"error": "PO Code must contain exactly three letters or numbers (for example, A07)."}, 400)
                 description = str(data.get("description") or "").strip()
                 restricted = 1 if str(data.get("restricted") or "0") == "1" else 0
                 allowed_user_ids = data.get("allowed_user_ids") or []
@@ -18812,14 +18824,14 @@ class Handler(BaseHTTPRequestHandler):
                     existing = con.execute("SELECT id FROM cog_categories WHERE lower(name) = lower(?)", (name,)).fetchone()
                     if existing:
                         con.execute(
-                            "UPDATE cog_categories SET code = ?, description = ?, restricted = ?, active = 1 WHERE id = ?",
-                            (code, description, restricted, existing["id"]),
+                            "UPDATE cog_categories SET code = ?, po_code = ?, description = ?, restricted = ?, active = 1 WHERE id = ?",
+                            (code, po_code, description, restricted, existing["id"]),
                         )
                         new_id = existing["id"]
                     else:
                         cur = con.execute(
-                            "INSERT INTO cog_categories (code, name, description, restricted, active, created_at) VALUES (?, ?, ?, ?, 1, ?)",
-                            (code, name, description, restricted, datetime.now().isoformat(timespec="seconds")),
+                            "INSERT INTO cog_categories (code, name, po_code, description, restricted, active, created_at) VALUES (?, ?, ?, ?, ?, 1, ?)",
+                            (code, name, po_code, description, restricted, datetime.now().isoformat(timespec="seconds")),
                         )
                         new_id = cur.lastrowid
                     saved_access = set_cog_user_access(con, new_id, allowed_user_ids if restricted else [])
@@ -20254,6 +20266,9 @@ class Handler(BaseHTTPRequestHandler):
                 category_id = parsed.path.rsplit("/", 1)[-1]
                 code = str(data.get("code") or "").strip().upper()
                 name = str(data.get("name") or "").strip()
+                po_code = str(data.get("po_code") or "").strip()
+                if po_code and not re.fullmatch(r"[A-Za-z0-9]{3}", po_code):
+                    return json_response(self, {"error": "PO Code must contain exactly three letters or numbers (for example, A07)."}, 400)
                 description = str(data.get("description") or "").strip()
                 restricted = 1 if str(data.get("restricted") or "0") == "1" else 0
                 allowed_user_ids = data.get("allowed_user_ids") or []
@@ -20266,8 +20281,8 @@ class Handler(BaseHTTPRequestHandler):
                     if duplicate:
                         return json_response(self, {"error": "That COG name already exists."}, 400)
                     updated = con.execute(
-                        "UPDATE cog_categories SET code = ?, name = ?, description = ?, restricted = ?, active = 1 WHERE id = ?",
-                        (code, name, description, restricted, category_id),
+                        "UPDATE cog_categories SET code = ?, name = ?, po_code = ?, description = ?, restricted = ?, active = 1 WHERE id = ?",
+                        (code, name, po_code, description, restricted, category_id),
                     ).rowcount
                     if updated:
                         saved_access = set_cog_user_access(con, category_id, allowed_user_ids if restricted else [])
