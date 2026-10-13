@@ -8183,8 +8183,20 @@ HTML = r"""
     .sort-indicator { color: var(--blue); font-size: 11px; margin-left: 4px; }
     .table-wrap { width: 100%; max-width: 100%; max-height: 520px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; overscroll-behavior: contain; }
     .table-wrap table { min-width: max(760px, 100%); }
-    #cogCategoryTable { min-width: 1180px; }
-    .cog-access-list { min-width: 260px; max-height: 170px; overflow: auto; display: grid; gap: 6px; padding: 4px; }
+    #cogCategoryTable { min-width: 1040px; table-layout: fixed; }
+    #cogCategoryTable th:nth-child(1) { width: 180px; }
+    #cogCategoryTable th:nth-child(2) { width: 110px; }
+    #cogCategoryTable th:nth-child(3) { width: 85px; }
+    #cogCategoryTable th:nth-child(4) { width: 200px; }
+    #cogCategoryTable th:nth-child(5) { width: 145px; }
+    #cogCategoryTable th:nth-child(6) { width: 230px; }
+    #cogCategoryTable th:nth-child(7) { width: 90px; }
+    #cogCategoryTable .cog-row-actions { display: flex; flex-direction: column; gap: 8px; }
+    #cogCategoryTable .cog-row-actions .btn { width: 100%; margin: 0; }
+    #cogSetup .checkline { display: flex; align-items: flex-start; gap: 8px; }
+    #cogSetup .checkline input[type="checkbox"] { width: 16px; height: 16px; padding: 0; margin: 1px 0 0; flex: 0 0 16px; }
+    #cogCategoryTable .checkline span { min-width: 0; overflow-wrap: anywhere; }
+    .cog-access-list { min-width: 0; max-height: 170px; overflow-y: auto; overflow-x: hidden; display: grid; gap: 10px; padding: 4px; }
     .access-rule-note { display: block; margin-top: 4px; color: var(--muted); font-size: 12px; line-height: 1.3; }
     .checkline.compact { margin: 0; font-size: 12px; line-height: 1.25; }
     table.resizable-columns { table-layout: fixed; }
@@ -8649,6 +8661,7 @@ HTML = r"""
         <button data-tab="fieldPo" data-nav-area="main" data-nav-level="main">Purchase Orders</button>
         <div class="nav-subgroup hidden" data-nav-group="po">
           <button data-tab="fieldPo" data-nav-area="po" data-nav-level="sub">Create PO</button>
+          <button data-tab="fieldPoSearch" data-nav-area="po" data-nav-level="sub">PO Search</button>
           <button data-tab="officePo" data-nav-area="po" data-nav-level="sub">Office PO Review</button>
           <button data-tab="closedPo" data-nav-area="po" data-nav-level="sub">Closed POs</button>
           <button data-tab="poInvoiceAudit" data-nav-area="po" data-nav-level="sub">Invoice Audit</button>
@@ -8680,6 +8693,15 @@ HTML = r"""
       </div>
     </section>
 
+    <section id="fieldPoSearch" class="tab hidden">
+      <div class="panel">
+        <h2>PO Search</h2><p class="muted">Find POs created by anyone. You can update only your own POs.</p>
+        <div class="actions"><button class="btn" data-open-tab="fieldPo" type="button">Create / My POs</button><button class="btn" id="refreshFieldPoSearch" type="button">Refresh</button></div>
+        <label for="allFieldPoSearch">Search all POs</label><input id="allFieldPoSearch" type="search" placeholder="PO #, customer, vendor, job/order/COG, employee or description">
+        <label for="allFieldPoStatus">Status</label><select id="allFieldPoStatus"><option value="">All statuses</option><option>Pending Approval</option><option>Issued</option><option>Picked Up</option><option>Closed</option><option>Void</option></select>
+        <p id="allFieldPoCount" class="muted" role="status" aria-live="polite"></p><div id="allFieldPoList" class="field-po-list"></div>
+      </div>
+    </section>
     <section id="fieldPo" class="tab hidden">
       <div class="panel field-po-hero">
         <h2>Field Purchase Orders</h2>
@@ -8722,7 +8744,7 @@ HTML = r"""
       </div>
       <div class="panel" style="margin-top:14px">
         <div style="display:flex;align-items:center;justify-content:space-between;gap:12px">
-          <h2>My POs</h2>
+          <h2>My POs</h2><button class="btn" data-open-tab="fieldPoSearch" type="button">Search all POs</button>
           <button class="btn" id="refreshFieldPos" type="button">Refresh</button>
         </div>
         <div class="grid cols-4">
@@ -8856,7 +8878,7 @@ HTML = r"""
         <div class="grid cols-4">
           <div><label>Name</label><input id="cogName" placeholder="Truck 12"></div>
           <div><label>Internal COG Code</label><input id="cogCode" placeholder="TRUCK"></div>
-          <div><label for="cogPoCode">PO Code</label><input id="cogPoCode" maxlength="3" pattern="[A-Za-z0-9]{3}" placeholder="A07"></div>
+          <div><label for="cogPoCode">PO Code</label><input id="cogPoCode" maxlength="5" pattern="[A-Za-z0-9]{0,5}" placeholder="A07"></div>
           <div style="grid-column:span 2"><label>Description</label><input id="cogDescription" placeholder="Optional notes for office review"></div>
           <label class="checkline"><input type="checkbox" id="cogRestricted"> Restrict to selected users</label>
         </div>
@@ -9838,6 +9860,7 @@ HTML = r"""
     }
     applyTheme(localStorage.getItem('pm-tracker-theme') || 'light');
     function tableStorageKey(table) {
+      if (table.id === 'cogCategoryTable') return 'column-widths:cogCategoryTable:compact-v2';
       if (table.id) return `column-widths:${table.id}`;
       const section = table.closest('section')?.id || 'page';
       const index = Array.from(document.querySelectorAll(`#${section} table`)).indexOf(table);
@@ -9920,6 +9943,7 @@ HTML = r"""
       texasOps: 'texas_ops',
       texasReminders: 'texas_reminders',
       fieldPo: 'po_requests',
+      fieldPoSearch: 'po_requests',
       officePo: 'po_review',
       closedPo: 'po_review',
       poInvoiceAudit: 'po_review',
@@ -10119,7 +10143,7 @@ HTML = r"""
 
     function navOptionsForTab(tabName) {
       const projectTabs = ['dashboard','newMasterProject','setup','import','review','invoices','billing','customerDashboard','nteTracking','projectPo','archivedProjects'];
-      const poTabs = ['fieldPo','officePo','closedPo','poInvoiceAudit','vendorPriceCatalog','cogSetup'];
+      const poTabs = ['fieldPoSearch','fieldPo','officePo','closedPo','poInvoiceAudit','vendorPriceCatalog','cogSetup'];
       const quotingTabs = ['mccQuotes','mccQuoteSetup'];
       const homeTabs = ['home','bids','jobOrderReport','admin','activity'];
       if (projectTabs.includes(tabName)) return 'project';
@@ -10242,7 +10266,7 @@ HTML = r"""
     async function openTab(tabName, options={}) {
       if (tabName !== 'home' && !canViewTab(tabName)) tabName = 'home';
       if (isTexasReadOnly() && tabName !== 'texasOps') tabName = 'texasOps';
-      if (isFieldPoOnly() && tabName !== 'fieldPo') tabName = 'fieldPo';
+      if (isFieldPoOnly() && !['fieldPo','fieldPoSearch'].includes(tabName)) tabName = 'fieldPo';
       if (!PO_FEATURE_ENABLED && ['fieldPo', 'officePo', 'projectPo'].includes(tabName)) tabName = 'home';
       markSaved();
       document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
@@ -10269,6 +10293,7 @@ HTML = r"""
       if (tabName === 'archivedProjects') loadArchivedProjects();
       if (tabName === 'jobOrderReport') loadJobOrderReport();
       if (tabName === 'fieldPo') loadFieldPo();
+      if (tabName === 'fieldPoSearch') loadFieldPoSearch();
       if (tabName === 'officePo') loadOfficePos();
       if (tabName === 'closedPo') loadClosedPos();
       if (tabName === 'poInvoiceAudit') loadPoInvoiceAuditOmissions();
@@ -11378,6 +11403,33 @@ HTML = r"""
         });
       });
     }
+
+    let allFieldPoRows = [];
+    async function loadFieldPoSearch() {
+      allFieldPoRows = await api('/api/purchase-orders');
+      renderFieldPoSearch();
+    }
+    function renderFieldPoSearch() {
+      const query = document.getElementById('allFieldPoSearch').value.trim().toLowerCase();
+      const status = document.getElementById('allFieldPoStatus').value;
+      const rows = allFieldPoRows.filter(po => (!status || po.status === status) &&
+        [po.po_number,po.customer_name,po.vendor,po.job_number,po.job_label,po.requested_by_username,po.description].join(' ').toLowerCase().includes(query));
+      document.getElementById('allFieldPoCount').textContent = `${rows.length} of ${allFieldPoRows.length} POs`;
+      document.getElementById('allFieldPoList').innerHTML = rows.map(po => `<div class="field-po-card">
+        <div class="field-po-card-header"><strong>${htmlEscape(po.po_number)}</strong><span>${htmlEscape(po.status)}</span></div>
+        <div><strong>Job / Order / COG:</strong> ${htmlEscape(po.job_label || po.job_number || '')}</div>
+        <div><strong>Customer:</strong> ${htmlEscape(po.customer_name || '')}</div><div><strong>Vendor:</strong> ${htmlEscape(po.vendor || '')}</div>
+        <div><strong>Created by:</strong> ${htmlEscape(po.requested_by_username || '')}</div><div class="muted">${htmlEscape(po.description || '')}</div>
+        <div class="actions"><a class="btn" href="/po/${po.id}" target="_blank" rel="noopener">Open PO</a>
+        ${po.attachment_file ? `<a class="btn" href="/uploads/${encodeURIComponent(po.attachment_file)}" target="_blank" rel="noopener">Open Quote / Attachment</a>` : ''}
+        ${po.pickup_file ? `<a class="btn" href="/uploads/${encodeURIComponent(po.pickup_file)}" target="_blank" rel="noopener">Open Pickup Ticket</a>` : ''}
+        ${Number(po.requested_by_user_id) === Number(state.currentUser.id) ? '<button class="btn" data-open-tab="fieldPo" type="button">Update my PO</button>' : '<span class="muted">View only</span>'}</div>
+      </div>`).join('') || '<p class="muted">No POs match your search.</p>';
+      document.querySelectorAll('#allFieldPoList [data-open-tab]').forEach(btn => btn.onclick = () => openTab('fieldPo'));
+    }
+    document.getElementById('allFieldPoSearch').oninput = renderFieldPoSearch;
+    document.getElementById('allFieldPoStatus').onchange = renderFieldPoSearch;
+    document.getElementById('refreshFieldPoSearch').onclick = loadFieldPoSearch;
 
     function filterFieldPoHistory() {
       const needle = document.getElementById('fieldPoHistorySearch').value.trim().toLowerCase();
@@ -13462,18 +13514,18 @@ HTML = r"""
         if (!state.cogAccessUsers.length) return '<div class="muted">No active users found.</div>';
         return `<div class="cog-access-list">${state.cogAccessUsers.map(user => {
           const label = [user.display_name, user.username].filter(Boolean).join(' - ');
-          return `<label class="checkline compact"><input data-cog="${c.id}" data-field="allowed_user_ids" data-cog-user="${user.id}" type="checkbox" value="${user.id}" ${allowed.has(String(user.id)) ? 'checked' : ''}> ${htmlEscape(label)}</label>`;
+          return `<label class="checkline compact"><input data-cog="${c.id}" data-field="allowed_user_ids" data-cog-user="${user.id}" type="checkbox" value="${user.id}" ${allowed.has(String(user.id)) ? 'checked' : ''}> <span>${htmlEscape(label)}</span></label>`;
         }).join('')}</div>`;
       };
       tableEl.innerHTML = state.cogCategories.length
         ? `<thead><tr><th>Name</th><th>Internal COG Code</th><th>PO Code</th><th>Description</th><th>Restricted</th><th>Allowed Users</th><th></th></tr></thead><tbody>${state.cogCategories.map(c => `<tr>
             <td><input data-cog="${c.id}" data-field="name" value="${htmlEscape(c.name || '')}"></td>
             <td><input data-cog="${c.id}" data-field="code" value="${htmlEscape(c.code || '')}"></td>
-            <td><input data-cog="${c.id}" data-field="po_code" aria-label="PO Code" maxlength="3" pattern="[A-Za-z0-9]{3}" placeholder="A07" value="${htmlEscape(c.po_code || '')}"></td>
+            <td><input data-cog="${c.id}" data-field="po_code" aria-label="PO Code" maxlength="5" pattern="[A-Za-z0-9]{0,5}" placeholder="A07" value="${htmlEscape(c.po_code || '')}"></td>
             <td><input data-cog="${c.id}" data-field="description" value="${htmlEscape(c.description || '')}"></td>
             <td><label class="checkline"><input data-cog="${c.id}" data-field="restricted" type="checkbox" ${Number(c.restricted || 0) ? 'checked' : ''}> Restrict PO use</label><span class="access-rule-note">When checked, only selected users can create POs with this COG.</span></td>
             <td>${userOptionsForCog(c)}</td>
-            <td class="actions-cell"><button class="btn" data-save-cog="${c.id}" type="button">Save</button><button class="btn danger" data-delete-cog="${c.id}" type="button">Delete</button></td>
+            <td class="actions-cell"><div class="cog-row-actions"><button class="btn" data-save-cog="${c.id}" type="button">Save</button><button class="btn danger" data-delete-cog="${c.id}" type="button">Delete</button></div></td>
           </tr>`).join('')}</tbody>`
         : '<tbody><tr><td>No COG categories yet.</td></tr></tbody>';
       tableEl.querySelectorAll('[data-cog]').forEach(el => {
@@ -16093,7 +16145,7 @@ HTML = r"""
       if (isTexasReadOnly()) {
         openTab('texasOps', { replaceHistory: true });
       } else if (state.currentUser?.role === 'Field PO') {
-        openTab('fieldPo', { replaceHistory: true });
+        openTab(currentUrlTab() === 'fieldPoSearch' ? 'fieldPoSearch' : 'fieldPo', { replaceHistory: true });
       } else {
         await loadProjects();
         const requestedTab = currentUrlTab();
@@ -16232,23 +16284,9 @@ class Handler(BaseHTTPRequestHandler):
                 po = one("SELECT * FROM purchase_orders WHERE id = ?", (po_id,))
                 if not po:
                     return text_response(self, "PO not found", "text/plain", 404)
-                if is_field_po_only(user) and po["requested_by_user_id"] != user["id"]:
-                    return text_response(self, "Not found", "text/plain", 404)
                 return text_response(self, purchase_order_html(po, show_invoices=can_view_permission(user, "po_review")))
             if parsed.path.startswith("/uploads/"):
                 requested_upload = Path(unquote(parsed.path.removeprefix("/uploads/"))).name
-                if is_field_po_only(user):
-                    allowed_attachment = one(
-                        """
-                        SELECT id
-                        FROM purchase_orders
-                        WHERE requested_by_user_id = ?
-                          AND (attachment_file = ? OR pickup_file = ?)
-                        """,
-                        (user["id"], requested_upload, requested_upload),
-                    )
-                    if not allowed_attachment:
-                        return text_response(self, "Not found", "text/plain", 404)
                 path = upload_attachment_path(requested_upload)
                 if not path:
                     return text_response(self, "Not found", "text/plain", 404)
@@ -16563,7 +16601,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not can_view_permission(user, "po_requests") and not can_view_permission(user, "po_review"):
                     return json_response(self, {"error": "PO access required."}, 403)
                 mine_only = qs.get("mine", [""])[0] == "1"
-                if mine_only or not can_view_permission(user, "po_review"):
+                if mine_only:
                     return json_response(
                         self,
                         purchase_orders_with_invoices("SELECT * FROM purchase_orders WHERE requested_by_user_id = ? ORDER BY created_at DESC, id DESC", (user["id"],)),
@@ -18811,8 +18849,8 @@ class Handler(BaseHTTPRequestHandler):
                 code = str(data.get("code") or "").strip().upper()
                 name = str(data.get("name") or "").strip()
                 po_code = str(data.get("po_code") or "").strip()
-                if not re.fullmatch(r"[A-Za-z0-9]{3}", po_code):
-                    return json_response(self, {"error": "PO Code must contain exactly three letters or numbers (for example, A07)."}, 400)
+                if not re.fullmatch(r"[A-Za-z0-9]{0,5}", po_code):
+                    return json_response(self, {"error": "PO Code must be blank or contain up to five letters or numbers."}, 400)
                 description = str(data.get("description") or "").strip()
                 restricted = 1 if str(data.get("restricted") or "0") == "1" else 0
                 allowed_user_ids = data.get("allowed_user_ids") or []
@@ -20267,8 +20305,8 @@ class Handler(BaseHTTPRequestHandler):
                 code = str(data.get("code") or "").strip().upper()
                 name = str(data.get("name") or "").strip()
                 po_code = str(data.get("po_code") or "").strip()
-                if po_code and not re.fullmatch(r"[A-Za-z0-9]{3}", po_code):
-                    return json_response(self, {"error": "PO Code must contain exactly three letters or numbers (for example, A07)."}, 400)
+                if not re.fullmatch(r"[A-Za-z0-9]{0,5}", po_code):
+                    return json_response(self, {"error": "PO Code must be blank or contain up to five letters or numbers."}, 400)
                 description = str(data.get("description") or "").strip()
                 restricted = 1 if str(data.get("restricted") or "0") == "1" else 0
                 allowed_user_ids = data.get("allowed_user_ids") or []

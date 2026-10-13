@@ -18,7 +18,11 @@ class CogCodeTests(unittest.TestCase):
         self.assertEqual(status,200)
         key=result['id']
         self.assertEqual(app.one('SELECT po_code FROM cog_categories WHERE id=?',(key,))['po_code'],'007')
-        for bad in ['7','1234','A-7','１２３']:
+        for valid in ['', '7', 'AB', 'A07', '1234', 'aB123']:
+            data['po_code']=valid
+            self.assertEqual(self.request('/api/cog-categories/'+str(key),data,'PUT')[0],200)
+            self.assertEqual(app.one('SELECT po_code FROM cog_categories WHERE id=?',(key,))['po_code'],valid)
+        for bad in ['ABC123', 'A-7', 'A 7', '\uff11\uff12\uff13']:
             data['po_code']=bad
             self.assertEqual(self.request('/api/cog-categories/'+str(key),data,'PUT')[0],400)
         data['po_code']='a07'

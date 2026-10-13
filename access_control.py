@@ -100,13 +100,13 @@ def document_name(path):
 
 def po_visible(app, user, po):
     return bool(po and (app.can_view_permission(user,'po_review') or
-                (app.can_view_permission(user,'po_requests') and po['requested_by_user_id'] == user['id'])))
+                app.can_view_permission(user,'po_requests')))
 
 def document_allowed(app, user, name):
     """Resolve an exact stored filename to its owner. Unreferenced uploads are private."""
     if not name:
         return False
-    # PO invoices are office documents; field staff may see only their attachments/pickups.
+    # PO invoices are office documents; field staff may see PO attachments/pickups for every requester.
     pos = app.rows('SELECT * FROM purchase_orders WHERE attachment_file=? OR pickup_file=?', (name,name))
     if any(po_visible(app,user,po) for po in pos):
         return True
@@ -156,7 +156,7 @@ def filter_payload(app, handler, payload):
             return any(app.can_view_permission(user,p) for p in ('fieldwise','review_exceptions','nte_tracking'))
         return [r for r in payload if allowed(r)]
     if path == '/api/purchase-orders' and not app.can_view_permission(user,'po_review'):
-        return [{k:v for k,v in po.items() if 'invoice' not in k} for po in payload if po['requested_by_user_id'] == user['id']]
+        return [{k:v for k,v in po.items() if 'invoice' not in k} for po in payload]
     return payload
 
 def authorize(app, handler):

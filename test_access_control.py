@@ -123,8 +123,9 @@ class AccessTests(unittest.TestCase):
         self.grant('po_requests',1)
         self.assertEqual(self.request('/uploads/own.pdf')[0],200)
         self.assertEqual(self.request('/po/10')[0],200)
-        self.assertEqual(self.request('/po/11')[0],404)
-        for name in ('other.pdf','office.pdf','financial.pdf','orphan.pdf'):
+        self.assertEqual(self.request('/po/11')[0],200)
+        self.assertEqual(self.request('/uploads/other.pdf')[0],200)
+        for name in ('office.pdf','financial.pdf','orphan.pdf'):
             for prefix,suffix in (('/uploads/',''),('/pdf-viewer/',''),('/pdf-page/','/0.png')):
                 with self.subTest(name=name,prefix=prefix):
                     self.assertEqual(self.request(prefix+name+suffix)[0],404)
@@ -133,7 +134,9 @@ class AccessTests(unittest.TestCase):
         self.assertEqual(self.request('/api/purchase-orders/11/pickup','POST')[0],404)
         self.assertEqual(self.request('/api/purchase-orders/10/invoice','POST')[0],403)
         body=json.loads(self.request('/api/purchase-orders')[1])
-        self.assertEqual([po['id'] for po in body],[10])
+        self.assertEqual(sorted(po['id'] for po in body),[10,11])
+        mine=json.loads(self.request('/api/purchase-orders?mine=1')[1])
+        self.assertEqual([po['id'] for po in mine],[10])
         self.assertNotIn('invoices',body[0])
         self.assertNotIn(b'office.pdf',self.request('/po/10')[1])
 
