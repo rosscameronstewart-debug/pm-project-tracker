@@ -99,6 +99,7 @@ class AccessTests(unittest.TestCase):
                                 self.assertNotEqual(access.requirement(method,path),())
 
     def test_feature_reads_and_writes_are_denied_without_permission(self):
+        self.assertEqual(self.request('/api/project-materials')[0],403)
         for path in ('/api/projects','/api/summary','/api/customer-invoices','/api/bid-summary',
                      '/api/texas-financial-summary','/api/internal-rates','/api/imports',
                      '/api/vendor-invoice-lines','/api/nte-summary','/api/admin/database-backup'):
@@ -117,6 +118,14 @@ class AccessTests(unittest.TestCase):
         self.assertEqual(self.request('/api/bids')[0],200)
         for method,path in (('POST','/api/bids'),('PUT','/api/bids/1'),('DELETE','/api/subprojects/1')):
             self.assertEqual(self.request(path,method)[0],403)
+
+    def test_field_can_read_materials_but_not_change_them(self):
+        type(self).actor['role']='Field PO'
+        self.grant('po_requests',1)
+        status,body=self.request('/api/project-materials')
+        self.assertEqual(status,200)
+        self.assertIn('items',json.loads(body))
+        self.assertEqual(self.request('/api/project-materials','POST')[0],403)
 
     def test_document_download_preview_and_page_use_same_owner(self):
         type(self).actor['role']='Field PO'

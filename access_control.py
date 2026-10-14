@@ -6,6 +6,7 @@ PROJECT_READ = ('projects','project_setup','fieldwise','review_exceptions','vend
                 'customer_billing','customer_dashboard','nte_tracking','archived_projects')
 
 READ = {
+    'project-materials': ('projects','po_requests','po_review','vendor_invoices'),
     'job-order-report': ('job_order_report','po_requests','po_review'),
     'fieldwise-audit-omissions': ('fieldwise_audit',),
     'po-invoice-audit-omissions': ('po_review',),

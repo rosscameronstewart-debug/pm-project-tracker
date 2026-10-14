@@ -16,6 +16,7 @@ import threading
 import time
 import traceback
 import company_calendar
+import project_materials
 import access_control
 import session_security
 from datetime import datetime, timedelta
@@ -6726,7 +6727,7 @@ def import_fieldwise_pdf(path, project_id):
     return {"count": count, "skipped": skipped, "order_number": order_number, "matched_subproject_id": matched_subproject_id, "matched_change_order_id": matched_change_order_id}
 
 
-def import_vendor_invoice_pdf(path, project_id):
+def import_vendor_invoice_pdf(path, project_id, preview_only=False):
     if pdfplumber is None:
         raise RuntimeError("Vendor invoice PDF import needs pdfplumber, but it is not available.")
     text = extract_pdf_text(path)
@@ -7159,6 +7160,24 @@ def import_vendor_invoice_pdf(path, project_id):
         order_number = first_regex([r"(?:PO|Purchase Order|Customer PO)(?:\s*number|\s*#)?\s*:?\s*([A-Za-z0-9\-]+)"], text)
         total_due = parse_money_text(first_regex([r"(?:Total|Amount Due)\s*:?\s*\$?\s*([0-9,]+\.[0-9]{2})"], text))
         item_lines = []
+
+    if preview_only:
+        parsed = []
+        for line in item_lines:
+            unit = ''
+            if isinstance(line, dict):
+                description = line['description']
+                item = line['product_code']
+                qty = money(line.get('qty', line.get('shipped_qty') or line.get('ordered_qty')))
+                unit = line.get('shipped_unit') or line.get('ordered_unit') or ''
+            elif len(line) == 6:
+                ordered, item, description, shipped, price, extension = line
+                qty = money(shipped or ordered)
+            else:
+                ordered, description, shipped, price, extension = line
+                item = ''; qty = money(shipped or ordered)
+            parsed.append({'item':item,'description':description,'qty':qty,'unit':unit})
+        return {'items':parsed,'vendor':vendor,'invoice_number':invoice_number,'date':date_text(invoice_date)}
 
     matched_subproject = None
     if order_number:
@@ -8189,6 +8208,18 @@ HTML = r"""
     .attention-card .detail { color: var(--muted); font-size: 13px; }
     .attention-card .amount { color: var(--ink); font-weight: 700; text-align: right; }
     .attention-card .open-link { grid-column: 2; color: var(--blue); font-weight: 800; font-size: 13px; text-align: right; }
+    #materialsTable { min-width: 1150px; table-layout: fixed; }
+    #materialsTable th:nth-child(1) { width: 100px; }
+    #materialsTable th:nth-child(2) { width: 170px; }
+    #materialsTable th:nth-child(3) { width: 320px; }
+    #materialsTable th:nth-child(4) { width: 90px; }
+    #materialsTable th:nth-child(5) { width: 150px; }
+    #materialsTable th:nth-child(6) { width: 160px; }
+    #materialsTable th:nth-child(7) { width: 160px; }
+    .material-description-preview, .material-item-code { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; }
+    #materialsTable [data-material-description] { margin-top: 6px; padding: 5px 8px; font-size: 12px; }
+    #materialDescriptionDialog { width: min(640px,90vw); max-height: 80vh; overflow: auto; background: var(--panel); color: var(--ink); border: 1px solid var(--line); border-radius: 10px; padding: 20px; }
+    #materialDescriptionDialog::backdrop { background: rgba(0,0,0,.55); }
     .attention-list { grid-column: 1 / -1; display: grid; gap: 6px; margin-top: 4px; }
     .attention-item { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 8px; padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: color-mix(in srgb, var(--field-bg) 72%, transparent); }
     .attention-item strong { display: block; font-size: 13px; }
@@ -8699,6 +8730,7 @@ HTML = r"""
           <button data-tab="billing" data-nav-area="project" data-nav-level="sub">Customer Billing</button>
           <button data-tab="customerDashboard" data-nav-area="project" data-nav-level="sub">Customer Dashboard</button>
           <button data-tab="nteTracking" data-nav-area="project" data-nav-level="sub">T&M NTE</button>
+          <button data-tab="projectMaterials" data-nav-area="project" data-nav-level="sub">Materials Bought</button>
           <button data-tab="projectPo" data-nav-area="project" data-nav-level="sub" class="po-feature-disabled">POs</button>
           <button data-tab="archivedProjects" data-nav-area="project" data-nav-level="sub">Archived Projects</button>
         </div>
@@ -8789,7 +8821,7 @@ HTML = r"""
       </div>
       <div class="panel" style="margin-top:14px">
         <div style="display:flex;align-items:center;justify-content:space-between;gap:12px">
-          <h2>My POs</h2><button class="btn" data-open-tab="fieldPoSearch" type="button">Search all POs</button>
+          <h2>My POs</h2><button class="btn" data-open-tab="projectMaterials" type="button">Materials Bought</button><button class="btn" data-open-tab="fieldPoSearch" type="button">Search all POs</button>
           <button class="btn" id="refreshFieldPos" type="button">Refresh</button>
         </div>
         <div class="grid cols-4">
@@ -9495,6 +9527,14 @@ HTML = r"""
       </div>
     </section>
 
+    <dialog id="materialDescriptionDialog" aria-labelledby="materialDescriptionTitle"><h2 id="materialDescriptionTitle"></h2><p id="materialDescriptionText" style="white-space:pre-wrap;overflow-wrap:anywhere"></p><button id="materialDescriptionClose" class="btn" type="button">Close</button></dialog>
+    <section id="projectMaterials" class="tab hidden"><div class="panel">
+       <h2>Materials Bought</h2><p class="muted">Items and quantities from uploaded vendor invoices. Bought by identifies the linked PO requester. Invoice quantities do not confirm delivery or pickup.</p>
+       <div class="grid cols-2"><div><label for="materialsProject">Project</label><select id="materialsProject"></select></div><div><label for="materialsSearch">Search items, job/order, vendor, buyer or PO</label><input id="materialsSearch" type="search"></div></div>
+       <label for="materialsJob">Job / Order</label><select id="materialsJob"><option value="">All jobs / orders</option></select>
+       <div class="actions"><button class="btn" id="materialsRefresh" type="button">Refresh</button><button class="btn" data-open-tab="fieldPo" type="button">Create / My POs</button></div>
+       <p id="materialsCount" class="muted" role="status"></p><div id="materialsWarnings" class="muted"></div><div class="table-wrap"><table id="materialsTable"></table></div>
+    </div></section>
     <section id="projectPo" class="tab hidden">
       <div class="panel">
         <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
@@ -9906,6 +9946,7 @@ HTML = r"""
     }
     applyTheme(localStorage.getItem('pm-tracker-theme') || 'light');
     function tableStorageKey(table) {
+      if (table.id === 'materialsTable') return 'column-widths:materialsTable:compact-v2';
       if (table.id === 'cogCategoryTable') return 'column-widths:cogCategoryTable:division-v3';
       if (table.id) return `column-widths:${table.id}`;
       const section = table.closest('section')?.id || 'page';
@@ -9982,6 +10023,7 @@ HTML = r"""
       customerDashboard: 'customer_dashboard',
       nteTracking: 'nte_tracking',
       projectPo: 'po_review',
+      projectMaterials: 'po_requests',
       fieldwiseAudit: 'fieldwise_audit',
       bids: 'bids',
       jobOrderReport: 'job_order_report',
@@ -10059,6 +10101,7 @@ HTML = r"""
       return !!Number(state.currentUser?.permissions?.[key]?.can_edit || 0);
     };
     const canViewTab = tabName => {
+      if (tabName === 'projectMaterials') return canViewPermission('po_requests') || canViewPermission('projects') || canViewPermission('vendor_invoices');
       if (tabName === 'cogSetup') return state.currentUser?.role === 'Admin';
       return canViewPermission(TAB_PERMISSIONS[tabName]);
     };
@@ -10188,7 +10231,7 @@ HTML = r"""
     }).observe(document.querySelector('.app-content'), { childList: true, subtree: true });
 
     function navOptionsForTab(tabName) {
-      const projectTabs = ['dashboard','newMasterProject','setup','import','review','invoices','billing','customerDashboard','nteTracking','projectPo','archivedProjects'];
+      const projectTabs = ['projectMaterials','dashboard','newMasterProject','setup','import','review','invoices','billing','customerDashboard','nteTracking','projectPo','archivedProjects'];
       const poTabs = ['fieldPoSearch','fieldPo','officePo','closedPo','poInvoiceAudit','vendorPriceCatalog','cogSetup'];
       const quotingTabs = ['mccQuotes','mccQuoteSetup'];
       const homeTabs = ['home','bids','jobOrderReport','admin','activity'];
@@ -10312,7 +10355,7 @@ HTML = r"""
     async function openTab(tabName, options={}) {
       if (tabName !== 'home' && !canViewTab(tabName)) tabName = 'home';
       if (isTexasReadOnly() && tabName !== 'texasOps') tabName = 'texasOps';
-      if (isFieldPoOnly() && !['fieldPo','fieldPoSearch'].includes(tabName)) tabName = 'fieldPo';
+      if (isFieldPoOnly() && !['fieldPo','fieldPoSearch','projectMaterials'].includes(tabName)) tabName = 'fieldPo';
       if (!PO_FEATURE_ENABLED && ['fieldPo', 'officePo', 'projectPo'].includes(tabName)) tabName = 'home';
       markSaved();
       document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
@@ -10330,6 +10373,7 @@ HTML = r"""
       if (tabName === 'customerDashboard') loadCustomerDashboard();
       if (tabName === 'nteTracking') loadNteTracking();
       if (tabName === 'projectPo') loadProjectPos();
+      if (tabName === 'projectMaterials') loadProjectMaterials();
       if (tabName === 'newMasterProject') loadNewMasterProjectForm();
       if (tabName === 'bids') loadBidDashboard();
       if (tabName === 'admin') { loadUsers(); loadEmailStatus(); loadInventoryCloudStatus(); }
@@ -16193,7 +16237,7 @@ HTML = r"""
       if (isTexasReadOnly()) {
         openTab('texasOps', { replaceHistory: true });
       } else if (state.currentUser?.role === 'Field PO') {
-        openTab(currentUrlTab() === 'fieldPoSearch' ? 'fieldPoSearch' : 'fieldPo', { replaceHistory: true });
+        openTab(['fieldPoSearch','projectMaterials'].includes(currentUrlTab()) ? currentUrlTab() : 'fieldPo', { replaceHistory: true });
       } else {
         await loadProjects();
         const requestedTab = currentUrlTab();
@@ -16219,6 +16263,7 @@ HTML = r"""
 
 
 HTML = company_calendar.integrate(HTML)
+HTML = HTML.replace('</script>', project_materials.SCRIPT+'</script>', 1)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -16254,7 +16299,7 @@ class Handler(BaseHTTPRequestHandler):
                         return json_response(self, {"error": "Texas Operations access only."}, 403)
                     return redirect_response(self, "/")
             if is_field_po_only(user):
-                allowed_paths = ("/", "/api/me", "/api/job-order-report", "/api/purchase-orders")
+                allowed_paths = ("/", "/api/me", "/api/job-order-report", "/api/purchase-orders", "/api/project-materials")
                 if parsed.path not in allowed_paths and not parsed.path.startswith(public_paths) and not parsed.path.startswith(("/po/", "/uploads/", "/pdf-viewer/", "/pdf-page/")):
                     if parsed.path.startswith("/api/"):
                         return json_response(self, {"error": "PO access only."}, 403)
