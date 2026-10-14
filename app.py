@@ -1406,13 +1406,24 @@ def db():
     DATA_DIR.mkdir(exist_ok=True)
     UPLOAD_DIR.mkdir(exist_ok=True)
     BRAND_DIR.mkdir(exist_ok=True)
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=15)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys = ON")
+    con.execute("PRAGMA synchronous = FULL")
     return con
 
 
 def init_db():
+    if os.environ.get('PM_TRACKER_SQLITE_WAL') == '1':
+        if sqlite3.sqlite_version_info < (3, 51, 3):
+            raise RuntimeError('WAL requires the approved patched SQLite runtime (3.51.3 or later).')
+        connection = db()
+        try:
+            mode = connection.execute('PRAGMA journal_mode = WAL').fetchone()[0]
+            if mode.lower() != 'wal':
+                raise RuntimeError('Could not enable SQLite WAL mode.')
+        finally:
+            connection.close()
     with db() as con:
         con.executescript(
             """
