@@ -10121,6 +10121,7 @@ HTML = r"""
       return target.closest('.cost-filter')
         || target.closest('#financialProfitTrend')
         || target.closest('#emailTestPanel')
+        || target.closest('#projectMaterials')
         || target.id === 'showAllCosts';
     };
     const markUnsaved = event => {
@@ -11895,6 +11896,7 @@ HTML = r"""
       if (canViewPermission('projects')) refreshOpenDetails();
       if (!document.getElementById('customerDashboard')?.classList.contains('hidden')) loadCustomerDashboard();
       if (!document.getElementById('nteTracking')?.classList.contains('hidden')) loadNteTracking();
+      if (!document.getElementById('projectMaterials')?.classList.contains('hidden')) loadProjectMaterials();
     }
 
     function fillSelects() {

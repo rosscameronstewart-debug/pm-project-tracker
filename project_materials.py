@@ -14,6 +14,8 @@ def list_materials(app, project_id):
         return {'projects':projects,'items':[],'warnings':[]}
     if not any(str(p['id']) == str(project_id) for p in projects):
         raise ValueError('Project not found.')
+    jobs = app.rows('''SELECT job_number,code,name FROM subprojects WHERE project_id=?
+        UNION ALL SELECT job_number,co_number AS code,title AS name FROM change_orders WHERE project_id=?''',(project_id,project_id))
     items, warnings, seen = [], [], set()
     invoices = app.rows('''SELECT poi.invoice_file,poi.uploaded_by_username,po.po_number,po.requested_by_username,
         po.job_number,po.job_label,po.vendor,po.id AS po_id
@@ -51,21 +53,31 @@ def list_materials(app, project_id):
             warnings.append({'po_number':linked.get('po_number') or '', 'job_number':linked.get('job_number') or '', 'vendor':linked.get('vendor') or '', 'message':'Invoice items unavailable; office review or a clearer invoice is needed.'})
     # Field-facing result deliberately excludes invoice PDFs, prices and totals.
     allowed=('item','description','qty','unit','vendor','record_date','ticket_or_invoice','job_number','job_label','buyer','po_number','uploaded_by')
-    return {'projects':projects,'items':[{k:row.get(k,'') for k in allowed} for row in items],'warnings':warnings}
+    return {'projects':projects,'jobs':jobs,'items':[{k:row.get(k,'') for k in allowed} for row in items],'warnings':warnings}
 
 
 SCRIPT = '''
     let projectMaterialData = {items:[],warnings:[]};
+    let materialsLoadSequence = 0;
     async function loadProjectMaterials() {
       const select=document.getElementById('materialsProject');
-      const id=select.value || state.projectId || '';
+      const id=state.projectId || select.value || '';
+      const sequence=++materialsLoadSequence;
+      select.parentElement.classList.toggle('hidden', !isFieldPoOnly());
       document.getElementById('materialsCount').textContent='Loading invoice items...';
       try {
-        projectMaterialData=await api('/api/project-materials?project_id='+encodeURIComponent(id));
+        const result=await api('/api/project-materials?project_id='+encodeURIComponent(id));
+        if (sequence !== materialsLoadSequence) return;
+        projectMaterialData=result;
         select.innerHTML='<option value="">Choose a project</option>'+projectMaterialData.projects.map(p=>`<option value="${p.id}">${htmlEscape(p.project_code+' — '+p.name)}</option>`).join('');
         select.value=String(id);
         const jobs=[...new Set(projectMaterialData.items.map(r=>r.job_number).filter(Boolean))].sort();
-        document.getElementById('materialsJob').innerHTML='<option value="">All jobs / orders</option>'+jobs.map(j=>`<option>${htmlEscape(j)}</option>`).join('');
+        document.getElementById('materialsJob').innerHTML='<option value="">All jobs / orders</option>'+jobs.map(j=>{
+          const metadata=(projectMaterialData.jobs || []).filter(row=>String(row.job_number)===String(j));
+          const details=[...new Set(metadata.map(row=>[row.code,row.name].filter(Boolean).join(' — ')).filter(Boolean))].join(' / ')
+            || projectMaterialData.items.find(row=>row.job_number===j)?.job_label || '';
+          return `<option value="${htmlEscape(j)}">${htmlEscape([j,details].filter(Boolean).join(' — '))}</option>`;
+        }).join('');
         renderProjectMaterials();
       } catch(err) { document.getElementById('materialsCount').textContent=err.message; }
     }
@@ -85,7 +97,10 @@ SCRIPT = '''
       if (!rows.length) document.getElementById('materialsCount').textContent += ' — No readable invoice items match. Items appear after an invoice is uploaded and linked to this project.';
     }
     document.getElementById('materialDescriptionClose').onclick=()=>document.getElementById('materialDescriptionDialog').close();
-    document.getElementById('materialsProject').onchange=loadProjectMaterials;
+    document.getElementById('materialsProject').onchange=()=>{
+      state.projectId=Number(document.getElementById('materialsProject').value) || null;
+      loadProjectMaterials();
+    };
     document.getElementById('materialsRefresh').onclick=loadProjectMaterials;
     document.getElementById('materialsSearch').oninput=renderProjectMaterials;
     document.getElementById('materialsJob').onchange=renderProjectMaterials;
