@@ -16985,7 +16985,8 @@ class Handler(BaseHTTPRequestHandler):
             parsed = urlparse(self.path)
             if parsed.path == "/api/login":
                 data = parse_json(self)
-                user = one("SELECT * FROM users WHERE username = ? AND active = 1", (data.get("username"),))
+                username = clean_username(data.get("username"))
+                user = one("SELECT * FROM users WHERE lower(username) = lower(?) AND active = 1", (username,))
                 if not user or not verify_password(data.get("password"), user["password_hash"]):
                     return json_response(self, {"error": "Invalid login"}, 401)
                 token = create_session(user["id"], secure=session_security.secure_request(self))

@@ -36,6 +36,14 @@ class SessionTests(unittest.TestCase):
         except HTTPError as error:
             return error.code,error.read(),error.headers
 
+    def test_login_username_ignores_case_but_password_does_not(self):
+        app.execute('UPDATE users SET username=? WHERE id=101', ('Field1@Example.com',))
+        for username in ('field1@example.com', 'FIELD1@EXAMPLE.COM', '  FiElD1@ExAmPlE.CoM  '):
+            self.assertEqual(self.request('/api/login',method='POST',data={'username':username,'password':'OldPassword123!'})[0],200)
+        self.assertEqual(self.request('/api/login',method='POST',data={'username':'FIELD1@EXAMPLE.COM','password':'oldpassword123!'})[0],401)
+        app.execute('UPDATE users SET active=0 WHERE id=101')
+        self.assertEqual(self.request('/api/login',method='POST',data={'username':'FIELD1@EXAMPLE.COM','password':'OldPassword123!'})[0],401)
+
     def test_temporary_password_cannot_bypass_prompt(self):
         app.execute('UPDATE users SET must_change_password=1 WHERE id=101')
         token=app.create_session(101)
