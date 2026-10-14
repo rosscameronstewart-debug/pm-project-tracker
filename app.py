@@ -16690,6 +16690,8 @@ class Handler(BaseHTTPRequestHandler):
                         (limit,),
                     ),
                 )
+            if parsed.path == '/api/project-materials':
+                return json_response(self, project_materials.list_materials(sys.modules[__name__], qs.get('project_id',[''])[0]))
             if parsed.path == "/api/purchase-orders":
                 if not can_view_permission(user, "po_requests") and not can_view_permission(user, "po_review"):
                     return json_response(self, {"error": "PO access required."}, 403)
