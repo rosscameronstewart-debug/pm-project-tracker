@@ -2499,6 +2499,18 @@ def init_db():
             con.execute("ALTER TABLE cog_categories ADD COLUMN restricted INTEGER DEFAULT 0")
         if "po_code" not in cog_cols:
             con.execute("ALTER TABLE cog_categories ADD COLUMN po_code TEXT DEFAULT ''")
+        if 'customer_name' not in cog_cols:
+            con.execute("ALTER TABLE cog_categories ADD COLUMN customer_name TEXT DEFAULT ''")
+            con.execute("ALTER TABLE cog_categories ADD COLUMN division TEXT DEFAULT ''")
+            # Split recognized trailing divisions, retaining the historical label.
+            for row in con.execute('SELECT id,name FROM cog_categories').fetchall():
+                original = str(row['name'] or '').strip()
+                customer, division = original, ''
+                for suffix in ('Truck Repairs and Maintenance','Truck Stock','Maintenance','Expenses','Tools','Inventory'):
+                    if original.lower().endswith(' '+suffix.lower()):
+                        customer, division = original[:-len(suffix)].strip(), original[-len(suffix):]
+                        break
+                con.execute('UPDATE cog_categories SET customer_name=?,division=? WHERE id=?',(customer,division,row['id']))
         default_rate_set = con.execute("SELECT id FROM rate_sets WHERE name = 'Current'").fetchone()
         if not default_rate_set:
             cur = con.execute("INSERT INTO rate_sets (name, effective_date, active) VALUES ('Current', '', 1)")
@@ -3619,20 +3631,52 @@ def parse_fieldwise_parts_database(path):
     return parsed
 
 
-def next_po_number(con):
+def po_code_for_customer(con, job_ref, customer):
+    if job_ref.get('cog_category_id'):
+        row = con.execute('SELECT po_code FROM cog_categories WHERE id=? AND COALESCE(active,1)=1',(job_ref['cog_category_id'],)).fetchone()
+        code = str(row['po_code'] or '').strip() if row else ''
+        if not code:
+            raise ValueError('This COG has no PO Code. Ask an administrator to add one in COG Setup.')
+        return code
+    def normalized(value):
+        return ' '.join(re.sub(r'[^a-z0-9]+', ' ', str(value or '').lower()).split())
+    name = normalized(customer)
+    codes = set()
+    # Explicit familiar abbreviations; never use an arbitrary fuzzy match.
+    aliases = {'CLR': ['continental'], 'TXO': ['morningstar'], 'JWP': ['jw power']}
+    for row in con.execute('SELECT name,customer_name,po_code FROM cog_categories WHERE COALESCE(active,1)=1'):
+        code = str(row['po_code'] or '').strip().upper()
+        if not code: continue
+        base = normalized(row['customer_name']) or re.sub(r'\s+maintenance$', '', normalized(row['name']))
+        candidates = [base, normalized(code)] + aliases.get(code, [])
+        if name and any(name == value or name.startswith(value+' ') for value in candidates if value):
+            codes.add(code)
+    if len(codes) == 1:
+        return codes.pop()
+    if len(codes) > 1:
+        raise ValueError('This customer matches multiple COG PO Codes. Ask an administrator to clarify the customer/COG setup before creating the PO.')
+    raise ValueError('No COG PO Code matches this customer. Check the customer name or ask an administrator to update COG Setup.')
+
+
+def next_po_number(con, po_code='PO'):
     year = datetime.now().year
-    prefix = f"PO-{year}-"
-    row = con.execute(
-        "SELECT po_number FROM purchase_orders WHERE po_number LIKE ? ORDER BY po_number DESC LIMIT 1",
-        (f"{prefix}%",),
-    ).fetchone()
-    seq = 1
-    if row:
-        try:
-            seq = int(str(row["po_number"]).rsplit("-", 1)[-1]) + 1
-        except Exception:
-            seq = 1
-    return f"{prefix}{seq:04d}"
+    short_year = f'{year % 100:02d}'
+    code = str(po_code or 'PO').strip().upper()
+    if not re.fullmatch(r'[A-Z0-9]{1,5}', code):
+        raise ValueError('PO Code must contain up to five letters or numbers.')
+    # Acquire the SQLite writer lock before allocating, so simultaneous requests
+    # cannot read the same sequence. The caller inserts the PO in this transaction.
+    if not con.in_transaction:
+        con.execute('BEGIN IMMEDIATE')
+    seq = 0
+    pattern = re.compile(r'^.+-(?:' + str(year) + '|' + short_year + r')-(\d+)$')
+    for row in con.execute('SELECT po_number FROM purchase_orders WHERE po_number LIKE ? OR po_number LIKE ?',('%-'+str(year)+'-%','%-'+short_year+'-%')):
+        match = pattern.fullmatch(str(row['po_number']))
+        if match:
+            seq = max(seq, int(match.group(1)))
+    if seq >= 9999:
+        raise ValueError('The four-digit PO sequence is full for this year. Contact an administrator.')
+    return f'{code}-{short_year}-{seq+1:04d}'
 
 
 def job_reference_for_po(con, job_key):
@@ -8183,14 +8227,15 @@ HTML = r"""
     .sort-indicator { color: var(--blue); font-size: 11px; margin-left: 4px; }
     .table-wrap { width: 100%; max-width: 100%; max-height: 520px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; overscroll-behavior: contain; }
     .table-wrap table { min-width: max(760px, 100%); }
-    #cogCategoryTable { min-width: 1040px; table-layout: fixed; }
+    #cogCategoryTable { min-width: 1170px; table-layout: fixed; }
     #cogCategoryTable th:nth-child(1) { width: 180px; }
-    #cogCategoryTable th:nth-child(2) { width: 110px; }
-    #cogCategoryTable th:nth-child(3) { width: 85px; }
-    #cogCategoryTable th:nth-child(4) { width: 200px; }
-    #cogCategoryTable th:nth-child(5) { width: 145px; }
-    #cogCategoryTable th:nth-child(6) { width: 230px; }
-    #cogCategoryTable th:nth-child(7) { width: 90px; }
+    #cogCategoryTable th:nth-child(2) { width: 130px; }
+    #cogCategoryTable th:nth-child(3) { width: 110px; }
+    #cogCategoryTable th:nth-child(4) { width: 85px; }
+    #cogCategoryTable th:nth-child(5) { width: 200px; }
+    #cogCategoryTable th:nth-child(6) { width: 145px; }
+    #cogCategoryTable th:nth-child(7) { width: 230px; }
+    #cogCategoryTable th:nth-child(8) { width: 90px; }
     #cogCategoryTable .cog-row-actions { display: flex; flex-direction: column; gap: 8px; }
     #cogCategoryTable .cog-row-actions .btn { width: 100%; margin: 0; }
     #cogSetup .checkline { display: flex; align-items: flex-start; gap: 8px; }
@@ -8876,7 +8921,8 @@ HTML = r"""
           <strong>Access Rules:</strong> check <strong>Restrict PO use</strong> on a COG row, then select the users allowed to create POs with that COG. Admins can always use and manage every COG.
         </div>
         <div class="grid cols-4">
-          <div><label>Name</label><input id="cogName" placeholder="Truck 12"></div>
+          <div><label>Customer Name</label><input id="cogCustomerName" placeholder="Customer or company"></div>
+          <div><label>Division</label><input id="cogDivision" placeholder="Maintenance, Tools, Expenses..."></div>
           <div><label>Internal COG Code</label><input id="cogCode" placeholder="TRUCK"></div>
           <div><label for="cogPoCode">PO Code</label><input id="cogPoCode" maxlength="5" pattern="[A-Za-z0-9]{0,5}" placeholder="A07"></div>
           <div style="grid-column:span 2"><label>Description</label><input id="cogDescription" placeholder="Optional notes for office review"></div>
@@ -9860,7 +9906,7 @@ HTML = r"""
     }
     applyTheme(localStorage.getItem('pm-tracker-theme') || 'light');
     function tableStorageKey(table) {
-      if (table.id === 'cogCategoryTable') return 'column-widths:cogCategoryTable:compact-v2';
+      if (table.id === 'cogCategoryTable') return 'column-widths:cogCategoryTable:division-v3';
       if (table.id) return `column-widths:${table.id}`;
       const section = table.closest('section')?.id || 'page';
       const index = Array.from(document.querySelectorAll(`#${section} table`)).indexOf(table);
@@ -13518,8 +13564,9 @@ HTML = r"""
         }).join('')}</div>`;
       };
       tableEl.innerHTML = state.cogCategories.length
-        ? `<thead><tr><th>Name</th><th>Internal COG Code</th><th>PO Code</th><th>Description</th><th>Restricted</th><th>Allowed Users</th><th></th></tr></thead><tbody>${state.cogCategories.map(c => `<tr>
-            <td><input data-cog="${c.id}" data-field="name" value="${htmlEscape(c.name || '')}"></td>
+        ? `<thead><tr><th>Customer Name</th><th>Division</th><th>Internal COG Code</th><th>PO Code</th><th>Description</th><th>Restricted</th><th>Allowed Users</th><th></th></tr></thead><tbody>${state.cogCategories.map(c => `<tr>
+            <td><input data-cog="${c.id}" data-field="customer_name" aria-label="Customer Name" value="${htmlEscape(c.customer_name || '')}"></td>
+            <td><input data-cog="${c.id}" data-field="division" aria-label="Division" value="${htmlEscape(c.division || '')}"></td>
             <td><input data-cog="${c.id}" data-field="code" value="${htmlEscape(c.code || '')}"></td>
             <td><input data-cog="${c.id}" data-field="po_code" aria-label="PO Code" maxlength="5" pattern="[A-Za-z0-9]{0,5}" placeholder="A07" value="${htmlEscape(c.po_code || '')}"></td>
             <td><input data-cog="${c.id}" data-field="description" value="${htmlEscape(c.description || '')}"></td>
@@ -16029,12 +16076,13 @@ HTML = r"""
         body: JSON.stringify({
           code: document.getElementById('cogCode').value,
           po_code: document.getElementById('cogPoCode').value,
-          name: document.getElementById('cogName').value,
+          customer_name: document.getElementById('cogCustomerName').value,
+          division: document.getElementById('cogDivision').value,
           description: document.getElementById('cogDescription').value,
           restricted: document.getElementById('cogRestricted')?.checked ? '1' : '0'
         })
       });
-      ['cogCode','cogPoCode','cogName','cogDescription'].forEach(id => document.getElementById(id).value = '');
+      ['cogCode','cogPoCode','cogCustomerName','cogDivision','cogDescription'].forEach(id => document.getElementById(id).value = '');
       if (document.getElementById('cogRestricted')) document.getElementById('cogRestricted').checked = false;
       markSaved();
       state.cogCategories = await api('/api/cog-categories');
@@ -17590,7 +17638,13 @@ class Handler(BaseHTTPRequestHandler):
                                 pass
                         return json_response(self, {"error": "Enter the customer for this shop / COG PO."}, 400)
                     effective_customer_name = customer_name or job_ref["customer"] or ""
-                    po_number = next_po_number(con)
+                    try:
+                        po_code = po_code_for_customer(con, job_ref, effective_customer_name)
+                        po_number = next_po_number(con, po_code)
+                    except ValueError as error:
+                        if attachment_file:
+                            (UPLOAD_DIR / attachment_file).unlink(missing_ok=True)
+                        return json_response(self, {'error':str(error)},400)
                     initial_status = "Issued" if can_auto_issue_po(user) else "Pending Approval"
                     cur = con.execute(
                         """
@@ -18847,7 +18901,11 @@ class Handler(BaseHTTPRequestHandler):
                 if not require_admin(self):
                     return json_response(self, {"error": "Admin required"}, 403)
                 code = str(data.get("code") or "").strip().upper()
-                name = str(data.get("name") or "").strip()
+                customer_name = str(data.get('customer_name', data.get('name')) or '').strip()
+                division = str(data.get('division') or '').strip()
+                name = ' '.join(part for part in (customer_name,division) if part)
+                if not customer_name:
+                    return json_response(self, {'error':'Customer Name is required.'},400)
                 po_code = str(data.get("po_code") or "").strip()
                 if not re.fullmatch(r"[A-Za-z0-9]{0,5}", po_code):
                     return json_response(self, {"error": "PO Code must be blank or contain up to five letters or numbers."}, 400)
@@ -18862,14 +18920,14 @@ class Handler(BaseHTTPRequestHandler):
                     existing = con.execute("SELECT id FROM cog_categories WHERE lower(name) = lower(?)", (name,)).fetchone()
                     if existing:
                         con.execute(
-                            "UPDATE cog_categories SET code = ?, po_code = ?, description = ?, restricted = ?, active = 1 WHERE id = ?",
-                            (code, po_code, description, restricted, existing["id"]),
+                            "UPDATE cog_categories SET code = ?, name = ?, customer_name = ?, division = ?, po_code = ?, description = ?, restricted = ?, active = 1 WHERE id = ?",
+                            (code, name, customer_name, division, po_code, description, restricted, existing["id"]),
                         )
                         new_id = existing["id"]
                     else:
                         cur = con.execute(
-                            "INSERT INTO cog_categories (code, name, po_code, description, restricted, active, created_at) VALUES (?, ?, ?, ?, ?, 1, ?)",
-                            (code, name, po_code, description, restricted, datetime.now().isoformat(timespec="seconds")),
+                            "INSERT INTO cog_categories (code, name, customer_name, division, po_code, description, restricted, active, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)",
+                            (code, name, customer_name, division, po_code, description, restricted, datetime.now().isoformat(timespec="seconds")),
                         )
                         new_id = cur.lastrowid
                     saved_access = set_cog_user_access(con, new_id, allowed_user_ids if restricted else [])
@@ -20303,7 +20361,11 @@ class Handler(BaseHTTPRequestHandler):
                     return json_response(self, {"error": "Admin required"}, 403)
                 category_id = parsed.path.rsplit("/", 1)[-1]
                 code = str(data.get("code") or "").strip().upper()
-                name = str(data.get("name") or "").strip()
+                customer_name = str(data.get('customer_name', data.get('name')) or '').strip()
+                division = str(data.get('division') or '').strip()
+                name = ' '.join(part for part in (customer_name,division) if part)
+                if not customer_name:
+                    return json_response(self, {'error':'Customer Name is required.'},400)
                 po_code = str(data.get("po_code") or "").strip()
                 if not re.fullmatch(r"[A-Za-z0-9]{0,5}", po_code):
                     return json_response(self, {"error": "PO Code must be blank or contain up to five letters or numbers."}, 400)
@@ -20319,8 +20381,8 @@ class Handler(BaseHTTPRequestHandler):
                     if duplicate:
                         return json_response(self, {"error": "That COG name already exists."}, 400)
                     updated = con.execute(
-                        "UPDATE cog_categories SET code = ?, name = ?, po_code = ?, description = ?, restricted = ?, active = 1 WHERE id = ?",
-                        (code, name, po_code, description, restricted, category_id),
+                        "UPDATE cog_categories SET code = ?, name = ?, customer_name = ?, division = ?, po_code = ?, description = ?, restricted = ?, active = 1 WHERE id = ?",
+                        (code, name, customer_name, division, po_code, description, restricted, category_id),
                     ).rowcount
                     if updated:
                         saved_access = set_cog_user_access(con, category_id, allowed_user_ids if restricted else [])

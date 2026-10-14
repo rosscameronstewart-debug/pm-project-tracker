@@ -13,10 +13,12 @@ class CogCodeTests(unittest.TestCase):
         except HTTPError as e: return e.code,json.loads(e.read())
     def test_code_roundtrip_and_validation(self):
         type(self).actor={'id':1,'role':'Admin','username':'admin'}
-        data={'name':'Code test','code':'TEST','po_code':'007'}
+        data={'customer_name':'Code test','division':'Maintenance','code':'TEST','po_code':'007'}
         status,result=self.request('/api/cog-categories',data,'POST')
         self.assertEqual(status,200)
         key=result['id']
+        saved=app.one('SELECT customer_name,division,name FROM cog_categories WHERE id=?',(key,))
+        self.assertEqual(saved,{'customer_name':'Code test','division':'Maintenance','name':'Code test Maintenance'})
         self.assertEqual(app.one('SELECT po_code FROM cog_categories WHERE id=?',(key,))['po_code'],'007')
         for valid in ['', '7', 'AB', 'A07', '1234', 'aB123']:
             data['po_code']=valid
