@@ -8231,7 +8231,7 @@ HTML = r"""
     #materialsTable [data-material-description] { margin-top: 6px; padding: 5px 8px; font-size: 12px; }
     #materialDescriptionDialog { width: min(640px,90vw); max-height: 80vh; overflow: auto; background: var(--panel); color: var(--ink); border: 1px solid var(--line); border-radius: 10px; padding: 20px; }
     #materialDescriptionDialog::backdrop { background: rgba(0,0,0,.55); }
-    .attention-list { grid-column: 1 / -1; display: grid; gap: 6px; margin-top: 4px; }
+    .attention-list { grid-column: 1 / -1; display: grid; gap: 6px; margin-top: 4px; max-height: 280px; overflow-y: auto; overscroll-behavior: contain; padding-right: 6px; align-content: start; }
     .attention-item { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 8px; padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: color-mix(in srgb, var(--field-bg) 72%, transparent); }
     .attention-item strong { display: block; font-size: 13px; }
     .attention-item span { color: var(--muted); font-size: 12px; }
@@ -8354,6 +8354,17 @@ HTML = r"""
     #mccQuoteItemTable input, #mccQuoteItemTable select { min-width: 0; padding: 7px 8px; }
     #mccQuoteItemTable .btn { padding: 7px 9px; font-size: 13px; }
     #officePoTable, #closedPoTable, #projectPoTable { min-width: 1560px; table-layout: fixed; }
+    #officePoTable .actions-cell .btn,
+    #closedPoTable .actions-cell .btn,
+    #projectPoTable .actions-cell .btn { display: block; width: 100%; box-sizing: border-box; margin: 0 0 8px; text-align: center; }
+    #officePoTable tr.po-dirty td, #closedPoTable tr.po-dirty td, #projectPoTable tr.po-dirty td { background: color-mix(in srgb, var(--gold) 13%, var(--panel)); }
+    #officePoTable tr.po-dirty td:first-child, #closedPoTable tr.po-dirty td:first-child, #projectPoTable tr.po-dirty td:first-child { box-shadow: inset 4px 0 0 var(--gold); }
+    tr.po-dirty [data-office-po-field], tr.po-dirty [data-office-po-invoice-edit] { border-color: var(--gold); }
+    [data-cancel-office-po][hidden] { display: none !important; }
+    tr.po-dirty [data-save-office-po] { background: var(--gold); color: #171717; border-color: var(--gold); }
+    #officePoTable .actions-cell .btn:last-child,
+    #closedPoTable .actions-cell .btn:last-child,
+    #projectPoTable .actions-cell .btn:last-child { margin-bottom: 0; }
     #officePoTable th, #officePoTable td,
     #closedPoTable th, #closedPoTable td,
     #projectPoTable th, #projectPoTable td { vertical-align: top; }
@@ -9911,6 +9922,7 @@ HTML = r"""
     let openSubprojectDetailId = null;
     let masterDetailIsOpen = false;
     let hasUnsavedChanges = false;
+    let hasNonPoUnsavedChanges = false;
     let selectedDashboardSubprojectId = null;
     let selectedDashboardChangeOrderId = null;
     let invoiceGroupSeq = 0;
@@ -10065,7 +10077,7 @@ HTML = r"""
       return data;
     };
     const formDataObj = form => Object.fromEntries(new FormData(form).entries());
-    const markSaved = () => { hasUnsavedChanges = false; };
+    const markSaved = () => { hasUnsavedChanges = false; hasNonPoUnsavedChanges = false; };
     function requestAuditReason({ title, message, defaultReason }) {
       return new Promise(resolve => {
         const modal = document.getElementById('auditReasonModal');
@@ -10138,6 +10150,7 @@ HTML = r"""
     const markUnsaved = event => {
       if (isTemporaryViewControl(event.target)) return;
       if (event.target.matches('input, textarea, select') && event.target.type !== 'file' && event.target.id !== 'projectSelect') {
+        if (!event.target.closest('#officePoTable, #closedPoTable, #projectPoTable')) hasNonPoUnsavedChanges = true;
         hasUnsavedChanges = true;
       }
     };
@@ -10237,7 +10250,11 @@ HTML = r"""
       if (event.key === 'Escape') closeCopyChangeOrderModal();
     });
     let resizeObserverTimer = null;
-    new MutationObserver(() => {
+    new MutationObserver(records => {
+      const tableStructureChanged = records.some(record =>
+        [...record.addedNodes, ...record.removedNodes].some(node => node.nodeType === 1 &&
+          (node.matches('table, thead, tbody, tr, th, td') || node.querySelector('table'))));
+      if (!tableStructureChanged) return;
       clearTimeout(resizeObserverTimer);
       resizeObserverTimer = setTimeout(() => enableResizableTables(), 80);
     }).observe(document.querySelector('.app-content'), { childList: true, subtree: true });
@@ -10265,7 +10282,7 @@ HTML = r"""
 
     function attentionItemsHtml(alert) {
       if (alert.key !== 'stale_job_invoices' || !Array.isArray(alert.items) || !alert.items.length) return '';
-      return `<div class="attention-list">${alert.items.map(item => `
+      return `<div class="attention-list" tabindex="0" role="region" aria-label="Jobs requiring attention">${alert.items.map(item => `
         <div class="attention-item">
           <div>
             <strong>${htmlEscape(item.label || 'Job')}</strong>
@@ -10307,7 +10324,7 @@ HTML = r"""
         target.querySelectorAll('[data-alert-tab]').forEach(card => {
           card.onclick = () => openAttentionTab(card.dataset.alertTab);
           card.onkeydown = event => {
-            if (event.key === 'Enter' || event.key === ' ') {
+            if (event.target === card && (event.key === 'Enter' || event.key === ' ')) {
               event.preventDefault();
               card.click();
             }
@@ -11351,8 +11368,13 @@ HTML = r"""
       });
     }
 
-    function officePoJobOptions(po) {
+    function officePoJobOptions(po, expanded=false) {
       const currentValue = po.external_job_order_id ? `external_job:${po.external_job_order_id}` : (po.cog_category_id ? `cog:${po.cog_category_id}` : (po.change_order_id ? `change_order:${po.change_order_id}` : (po.subproject_id ? `subproject:${po.subproject_id}` : '')));
+      if (!expanded) {
+        const current = jobOrderReportRows.find(row => row.job_key === currentValue);
+        const label = current ? [current.job_number,current.customer,current.project_name,current.reference_code].filter(Boolean).join(' - ') : (po.job_label || po.job_number || 'Choose job/order...');
+        return `<option value="${htmlEscape(currentValue)}" selected>${htmlEscape(label)}</option>`;
+      }
       return '<option value="">Choose job/order...</option>' + jobOrderReportRows.filter(row => row.job_key).map(row => {
         const label = [row.job_number, row.customer, row.project_name, row.reference_code].filter(Boolean).join(' - ');
         return `<option value="${htmlEscape(row.job_key)}" ${row.job_key === currentValue ? 'selected' : ''}>${htmlEscape(label)}</option>`;
@@ -11711,10 +11733,59 @@ HTML = r"""
             <td><select data-office-po-field="${po.id}" data-field="status">${statusOptions}</select>${eventLines}</td>
             <td><textarea data-office-po-field="${po.id}" data-field="close_reason" placeholder="Required when closing">${htmlEscape(po.close_reason || '')}</textarea><textarea data-office-po-field="${po.id}" data-field="void_reason" placeholder="Required when voiding" style="margin-top:6px">${htmlEscape(po.void_reason || '')}</textarea></td>
             <td><textarea data-office-po-field="${po.id}" data-field="description">${htmlEscape(po.description || '')}</textarea>${po.attachment_file ? `<div><a class="pdf-link" href="/uploads/${encodeURIComponent(po.attachment_file)}" target="_blank" rel="noopener">Attachment</a></div>` : ''}${po.pickup_file ? `<div><a class="pdf-link" href="/uploads/${encodeURIComponent(po.pickup_file)}" target="_blank" rel="noopener">Pickup ticket</a></div>` : '<div class="muted">No pickup ticket</div>'}${invoiceBlock}${invoiceUpload}</td>
-            <td class="actions-cell"><a class="btn" href="/po/${po.id}" target="_blank" rel="noopener">Open</a><button class="btn" data-save-office-po="${po.id}" type="button">Save</button>${state.currentUser?.role === 'Admin' ? `<button class="btn danger" data-delete-office-po="${po.id}" type="button">Delete</button>` : ''}</td>
+            <td class="actions-cell"><a class="btn" href="/po/${po.id}" target="_blank" rel="noopener">Open</a><button class="btn" data-save-office-po="${po.id}" type="button">Save</button><button class="btn" data-cancel-office-po="${po.id}" type="button" hidden>Cancel changes</button>${state.currentUser?.role === 'Admin' ? `<button class="btn danger" data-delete-office-po="${po.id}" type="button">Delete</button>` : ''}</td>
           </tr>`;
         }).join('')}</tbody>`
         : '<tbody><tr><td>No POs match those filters.</td></tr></tbody>';
+      const poTable = document.getElementById(config.tableId);
+      const poById = new Map(rows.map(po => [String(po.id),po]));
+      poTable.querySelectorAll('select[data-field="job_key"]').forEach(select => {
+        const expand = () => {
+          if (select.dataset.optionsLoaded) return;
+          const po = poById.get(select.dataset.officePoField);
+          if (!po) return;
+          const value = select.value;
+          select.innerHTML = officePoJobOptions(po,true);
+          if (!Array.from(select.options).some(option => option.value === value)) {
+            select.add(new Option(po.job_label || po.job_number || 'Current job/order',value));
+          }
+          select.value = value;
+          select.dataset.optionsLoaded = '1';
+        };
+        select.addEventListener('pointerdown',expand);
+        select.addEventListener('focus',expand);
+      });
+      poTable.querySelectorAll('input, select, textarea').forEach(input => {
+        input.dataset.poOriginalValue = input.value;
+      });
+      const highlightPoEdits = event => {
+        if (!event.target.matches('input, select, textarea')) return;
+        const row = event.target.closest('tr');
+        if (!row) return;
+        const changed = Array.from(row.querySelectorAll('input, select, textarea')).some(input =>
+          input.type === 'file' ? Boolean(input.files?.length) : input.value !== input.dataset.poOriginalValue);
+        row.classList.toggle('po-dirty', changed);
+        row.querySelector('[data-cancel-office-po]').hidden = !changed;
+        const save = row.querySelector('[data-save-office-po]');
+        if (save) {
+          const label = changed ? 'Save changes' : 'Save';
+          if (save.textContent !== label) save.textContent = label;
+          const title = changed ? 'This PO has unsaved changes' : 'Save PO';
+          if (save.title !== title) save.title = title;
+        }
+        hasUnsavedChanges = hasNonPoUnsavedChanges || Boolean(document.querySelector('tr.po-dirty'));
+      };
+      poTable.querySelectorAll('[data-cancel-office-po]').forEach(button => button.onclick = () => {
+        const row = button.closest('tr');
+        row.querySelectorAll('input, select, textarea').forEach(input => {
+          input.value = input.type === 'file' ? '' : input.dataset.poOriginalValue;
+        });
+        row.querySelectorAll('[data-office-po-invoice-file-name]').forEach(label => label.textContent = '');
+        const input = row.querySelector('input, select, textarea');
+        if (input) highlightPoEdits({target:input});
+      });
+      poTable.oninput = highlightPoEdits;
+      poTable.onchange = highlightPoEdits;
       function collectOfficePoFields(id) {
         const fields = {};
         document.querySelectorAll(`#${config.tableId} [data-office-po-field="${id}"]`).forEach(el => fields[el.dataset.field] = el.value);
@@ -11764,6 +11835,10 @@ HTML = r"""
       document.querySelectorAll(`#${config.tableId} [data-save-office-po]`).forEach(btn => btn.onclick = async () => {
         const id = btn.dataset.saveOfficePo;
         const fields = collectOfficePoFields(id);
+        const previousLabel = btn.textContent;
+        try {
+        btn.disabled = true;
+        btn.textContent = 'Saving...';
         await api(`/api/purchase-orders/${id}`, {
           method: 'PUT',
           body: JSON.stringify(fields)
@@ -11771,6 +11846,16 @@ HTML = r"""
         await saveOfficePoInvoiceAmounts(id);
         await uploadOfficePoInvoiceIfSelected(id);
         await config.reload();
+        } catch (err) {
+          window.alert(err.message || 'Could not complete saving this PO. Check the row and try again.');
+          const field = fields.status === 'Void' ? 'void_reason' : fields.status === 'Closed' ? 'close_reason' : '';
+          if (field && !String(fields[field] || '').trim()) {
+            document.querySelector(`#${config.tableId} [data-office-po-field="${id}"][data-field="${field}"]`)?.focus();
+          }
+        } finally {
+          btn.disabled = false;
+          btn.textContent = previousLabel;
+        }
       });
       document.querySelectorAll(`#${config.tableId} [data-office-po-invoice-file]`).forEach(input => input.onchange = () => {
         const label = document.querySelector(`#${config.tableId} [data-office-po-invoice-file-name="${input.dataset.officePoInvoiceFile}"]`);
