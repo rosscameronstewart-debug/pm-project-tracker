@@ -129,20 +129,21 @@ class AccessTests(unittest.TestCase):
 
     def test_closing_po_needs_no_reason_but_voiding_still_does(self):
         self.grant('po_review',1)
-        app.execute("UPDATE purchase_orders SET invoice_file='',close_reason='',status='Issued' WHERE id=10")
+        app.execute("INSERT INTO purchase_orders (id,po_number,job_number,vendor,description,requested_by_user_id,created_at,updated_at,status) VALUES (12,'CLOSE-TEST','JOB1','Test','Test',101,'2026-10-16','2026-10-16','Issued')")
+        self.addCleanup(app.execute,'DELETE FROM purchase_orders WHERE id=12')
         reference=dict(project_id=None,subproject_id=None,change_order_id=None,cog_category_id=None,
                        external_job_order_id=None,job_number='JOB1',job_label='Test job',customer='Customer')
         data=dict(status='Closed',vendor='Test',description='Test',customer_name='Customer',
                   job_key='test:1',close_reason='',void_reason='')
         with patch.object(app,'job_reference_for_po',return_value=reference):
-            status,body=self.request('/api/purchase-orders/10','PUT',data)
+            status,body=self.request('/api/purchase-orders/12','PUT',data)
             self.assertEqual(status,200,body)
-            saved=app.one('SELECT status,close_reason,closed_at FROM purchase_orders WHERE id=10')
+            saved=app.one('SELECT status,close_reason,closed_at FROM purchase_orders WHERE id=12')
             self.assertEqual(saved['status'],'Closed')
             self.assertEqual(saved['close_reason'],'')
             self.assertTrue(saved['closed_at'])
             data['status']='Void'
-            status,body=self.request('/api/purchase-orders/10','PUT',data)
+            status,body=self.request('/api/purchase-orders/12','PUT',data)
             self.assertEqual(status,400,body)
             self.assertIn('Void reason',json.loads(body)['error'])
 
