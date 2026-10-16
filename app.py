@@ -4386,6 +4386,23 @@ def fieldwise_time_entry_labor_records_from_text(text, work_description):
         entry_text = line_match.group(3).strip()
         if not employee:
             continue
+        # Some time entries omit Reg/OT. The final number is hours;
+        # preceding numbers belong to the class (e.g. Automation Tech 1).
+        if not re.search(r"\b(?:Reg|OT)\b", entry_text, flags=re.IGNORECASE):
+            default_entry = re.fullmatch(r"(.+?)\s+([0-9]+(?:\.[0-9]+)?)", entry_text)
+            if default_entry and money(default_entry.group(2)) > 0:
+                records.append(
+                    {
+                        "cost_type": "Labor",
+                        "item": f"{employee} - {default_entry.group(1).strip()} - Reg",
+                        "description": work_description,
+                        "qty": money(default_entry.group(2)),
+                        "rate": 0,
+                        "amount": 0,
+                        "source_page": None,
+                    }
+                )
+            continue
         for entry_match in re.finditer(r"(.+?)\s+(Reg|OT)\s+([0-9]+(?:\.[0-9]+)?)", entry_text, flags=re.IGNORECASE):
             labor_class = entry_match.group(1).strip()
             # Field Wise sometimes exports same-line entries as
