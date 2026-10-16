@@ -11731,7 +11731,7 @@ HTML = r"""
             <td>${amountCell}</td>
             <td>${htmlEscape(po.requested_by_username || '')}</td>
             <td><select data-office-po-field="${po.id}" data-field="status">${statusOptions}</select>${eventLines}</td>
-            <td><textarea data-office-po-field="${po.id}" data-field="close_reason" placeholder="Required when closing">${htmlEscape(po.close_reason || '')}</textarea><textarea data-office-po-field="${po.id}" data-field="void_reason" placeholder="Required when voiding" style="margin-top:6px">${htmlEscape(po.void_reason || '')}</textarea></td>
+            <td><textarea data-office-po-field="${po.id}" data-field="close_reason" placeholder="Optional close reason">${htmlEscape(po.close_reason || '')}</textarea><textarea data-office-po-field="${po.id}" data-field="void_reason" placeholder="Required when voiding" style="margin-top:6px">${htmlEscape(po.void_reason || '')}</textarea></td>
             <td><textarea data-office-po-field="${po.id}" data-field="description">${htmlEscape(po.description || '')}</textarea>${po.attachment_file ? `<div><a class="pdf-link" href="/uploads/${encodeURIComponent(po.attachment_file)}" target="_blank" rel="noopener">Attachment</a></div>` : ''}${po.pickup_file ? `<div><a class="pdf-link" href="/uploads/${encodeURIComponent(po.pickup_file)}" target="_blank" rel="noopener">Pickup ticket</a></div>` : '<div class="muted">No pickup ticket</div>'}${invoiceBlock}${invoiceUpload}</td>
             <td class="actions-cell"><a class="btn" href="/po/${po.id}" target="_blank" rel="noopener">Open</a><button class="btn" data-save-office-po="${po.id}" type="button">Save</button><button class="btn" data-cancel-office-po="${po.id}" type="button" hidden>Cancel changes</button>${state.currentUser?.role === 'Admin' ? `<button class="btn danger" data-delete-office-po="${po.id}" type="button">Delete</button>` : ''}</td>
           </tr>`;
@@ -19667,8 +19667,6 @@ class Handler(BaseHTTPRequestHandler):
                     if status == "Closed":
                         if not close_reason and current_po["invoice_file"]:
                             close_reason = "Closed after vendor invoice was received."
-                        if not close_reason:
-                            return json_response(self, {"error": "Close reason is required to close a PO."}, 400)
                         if current_po["status"] != "Closed" or not closed_at:
                             closed_at = now
                             closed_by_user_id = actor["id"]
