@@ -4242,6 +4242,7 @@ def labor_category(item):
     aliases = {
         'panel shop labor': 'Panel Shop ST',
         'panel shop ot labor': 'Panel Shop OT',
+        'automation tech 1 st': 'Automation Tech ST',
     }
     return aliases.get(category.casefold(), category)
 

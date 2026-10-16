@@ -27,7 +27,11 @@ class LaborCategoryTests(unittest.TestCase):
         records = app.fieldwise_time_entry_labor_records_from_text(text, 'Panel work')
         self.assertEqual([r['qty'] for r in records], [8, 4])
         self.assertTrue(all(r['item'] == 'Miguel Mireles - Automation Tech 1 - Reg' for r in records))
-        self.assertEqual(app.labor_category(records[0]['item']), 'Automation Tech 1 ST')
+        self.assertEqual(app.labor_category(records[0]['item']), 'Automation Tech ST')
+
+    def test_automation_alias_only_maps_confirmed_regular_category(self):
+        self.assertEqual(app.labor_category('Miguel Mireles - Automation Tech 1 - Reg'), 'Automation Tech ST')
+        self.assertEqual(app.labor_category('Miguel Mireles - Automation Tech 1 - OT'), 'Automation Tech 1 OT')
 
     def test_explicit_regular_and_overtime_still_take_precedence(self):
         text = ('Time Entries\nName Date\n'
