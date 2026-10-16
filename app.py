@@ -4238,7 +4238,12 @@ def labor_category(item):
     category = re.sub(r"\s*-\s*Reg\b", " ST", category, flags=re.IGNORECASE)
     category = re.sub(r"\bReg\b", "ST", category, flags=re.IGNORECASE)
     category = category.replace(" - ", " ")
-    return re.sub(r"\s+", " ", category).strip()
+    category = re.sub(r"\s+", " ", category).strip()
+    aliases = {
+        'panel shop labor': 'Panel Shop ST',
+        'panel shop ot labor': 'Panel Shop OT',
+    }
+    return aliases.get(category.casefold(), category)
 
 
 def equipment_category(item):
