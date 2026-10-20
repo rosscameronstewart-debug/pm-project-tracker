@@ -624,7 +624,7 @@ def nte_weekly_report_html(project_id):
     kpi_history = nte_kpi_history(project_id)
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
     total_budget = sum(money(b.get("current_budget")) for b in buckets)
-    total_used = sum(money(b.get("actual_cost")) for b in buckets)
+    total_used = sum(nte_reported_budget_used(b) for b in buckets)
     total_remaining = total_budget - total_used
     projected_buckets = [b for b in buckets if money((b.get("completion") or {}).get("completion_percent")) > 0]
     total_estimated_at_completion = sum(money(b.get("estimated_cost_at_completion")) for b in projected_buckets)
@@ -916,7 +916,7 @@ def nte_weekly_report_html(project_id):
       </div>
       <div class="summary">
         <div class="kpi"><div class="label">Current Budget</div><div class="value">{dollars(total_budget)}</div></div>
-        <div class="kpi"><div class="label">Used</div><div class="value">{dollars(total_used)}</div></div>
+        <div class="kpi"><div class="label">Used</div><div class="value">{dollars(total_used)}</div>{'<div class="muted">Includes full budget overrides</div>' if any((b.get('completion') or {}).get('use_full_budget') for b in buckets) else ''}</div>
         <div class="kpi"><div class="label">Remaining</div><div class="value {'bad' if total_remaining < 0 else 'good'}">{dollars(total_remaining)}</div></div>
         <div class="kpi"><div class="label">Estimated Cost to Completion</div><div class="value {'bad' if projected_buckets and total_estimated_variance < 0 else ''}">{dollars(total_estimated_at_completion) if projected_buckets else "Needs field %"}</div><div class="muted">{dollars(total_estimated_variance)} projected variance</div></div>
         <div class="kpi"><div class="label">Avg Field Completion</div><div class="value">{avg_completion:.1f}%</div><div class="muted">Average of main buckets</div></div>
@@ -1023,7 +1023,7 @@ def nte_weekly_report_pdf_bytes(project_id):
         return drawing
 
     total_budget = sum(money(b.get("current_budget")) for b in buckets)
-    total_used = sum(money(b.get("actual_cost")) for b in buckets)
+    total_used = sum(nte_reported_budget_used(b) for b in buckets)
     total_remaining = total_budget - total_used
     projected_buckets = [b for b in buckets if money((b.get("completion") or {}).get("completion_percent")) > 0]
     total_estimated_at_completion = sum(money(b.get("estimated_cost_at_completion")) for b in projected_buckets)
@@ -1072,7 +1072,7 @@ def nte_weekly_report_pdf_bytes(project_id):
             ],
             [
                 "",
-                "",
+                Paragraph("Includes full budget overrides" if any((b.get('completion') or {}).get('use_full_budget') for b in buckets) else "", summary_note_style),
                 "",
                 Paragraph(f"{dollars(total_estimated_variance)} projected variance" if projected_buckets else "", summary_note_style),
                 Paragraph("Average of main buckets", summary_note_style),
@@ -7744,6 +7744,13 @@ def customer_dashboard_summary(project_id):
     return {"project": project, "targets": targets, "tickets": tickets, "summary": summary}
 
 
+def nte_reported_budget_used(bucket):
+    completion = bucket.get("completion") or {}
+    if completion.get("use_full_budget") and money(completion.get("completion_percent")) == 100:
+        return money(bucket.get("current_budget"))
+    return money(bucket.get("actual_cost"))
+
+
 def nte_completion_estimate(actual_cost, current_budget, completion_percent, use_full_budget=False):
     actual_cost, current_budget, completion_percent = map(money, (actual_cost, current_budget, completion_percent))
     override = bool(use_full_budget) and completion_percent == 100
@@ -7981,6 +7988,8 @@ def nte_summary(project_id, subproject_id=None, change_order_id=None, seed_defau
         actual_cost = money(bucket["actual_cost"])
         current_budget = money(bucket["current_budget"])
         use_full_budget = bool(bucket["completion"].get("use_full_budget"))
+        bucket["reported_budget_used"] = nte_reported_budget_used(bucket)
+        bucket["reported_budget_remaining"] = current_budget - bucket["reported_budget_used"]
         bucket.update(nte_completion_estimate(actual_cost, current_budget, completion_percent, use_full_budget))
         for sub in bucket.get("subbuckets", []):
             sub_actual = money(sub.get("actual_cost"))
@@ -14223,7 +14232,8 @@ HTML = r"""
       const reallocations = buckets.reduce((sum, b) => sum + Math.abs(Number(b.approved_reallocations || 0)), 0) / 2;
       const current = buckets.reduce((sum, b) => sum + Number(b.current_budget || 0), 0);
       const actual = buckets.reduce((sum, b) => sum + Number(b.actual_cost || 0), 0);
-      const remaining = current - actual;
+      const used = buckets.reduce((sum, b) => sum + Number(b.reported_budget_used ?? b.actual_cost ?? 0), 0);
+      const remaining = current - used;
       const unproductiveHours = buckets.reduce((sum, b) => sum + Number(b.unproductive_labor_hours || 0), 0);
       const projectedBuckets = buckets.filter(b => Number(b.completion?.completion_percent || 0) > 0);
       const estimatedAtCompletion = projectedBuckets.reduce((sum, b) => sum + Number(b.estimated_cost_at_completion || 0), 0);
@@ -14238,7 +14248,8 @@ HTML = r"""
         <div class="panel kpi"><div class="label">Approved Additions</div><div class="value">${money(additions)}</div><div class="hint">Approved documented increases</div></div>
         <div class="panel kpi"><div class="label">Approved Transfers</div><div class="value">${money(reallocations)}</div><div class="hint">Budget moved between buckets</div></div>
         <div class="panel kpi"><div class="label">Actual Cost</div><div class="value">${money(actual)}</div><div class="hint">Assigned cost records</div></div>
-        <div class="panel kpi"><div class="label">Remaining NTE</div><div class="value ${remaining < 0 ? 'bad' : 'good'}">${money(remaining)}</div><div class="hint">Current budget less actual cost</div></div>
+        <div class="panel kpi"><div class="label">Used</div><div class="value">${money(used)}</div><div class="hint">Includes full budget overrides</div></div>
+        <div class="panel kpi"><div class="label">Remaining NTE</div><div class="value ${remaining < 0 ? 'bad' : 'good'}">${money(remaining)}</div><div class="hint">Current budget less used, including overrides</div></div>
         <div class="panel kpi"><div class="label">Estimated Cost to Completion</div><div class="value ${projectedBuckets.length && estimatedVariance < 0 ? 'bad' : ''}">${projectedBuckets.length ? money(estimatedAtCompletion) : 'Needs field %'}</div><div class="hint">${projectedBuckets.length ? `${money(estimatedVariance)} projected variance` : 'Enter field completion per bucket'}</div></div>
         <div class="panel kpi"><div class="label">Unproductive Time</div><div class="value">${unproductiveHours.toFixed(2)}</div><div class="hint">Flagged labor hours</div></div>`;
       const needsCodingKpi = document.getElementById('nteNeedsCodingKpi');

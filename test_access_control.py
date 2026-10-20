@@ -96,11 +96,14 @@ class AccessTests(unittest.TestCase):
         summary = app.nte_summary(project_id)['buckets'][0]
         self.assertEqual(summary['estimated_cost_at_completion'], 123912)
         self.assertEqual(summary['actual_cost'], 0)
+        self.assertEqual(summary['reported_budget_used'], 123912)
+        self.assertEqual(summary['reported_budget_remaining'], 0)
         self.assertEqual(sum(s['estimated_cost_at_completion'] for s in summary['subbuckets']), 123912)
         self.assertTrue(all(s['completion_percent'] == 100 and s['use_full_budget'] for s in summary['subbuckets']))
         self.assertEqual(self.request('/api/nte-completion', 'POST', {**data,'use_full_budget':False})[0], 200)
         self.assertEqual(app.nte_completion_by_bucket(project_id)[bucket_id]['use_full_budget'], 0)
         self.assertEqual(app.nte_summary(project_id)['buckets'][0]['estimated_cost_at_completion'], 0)
+        self.assertEqual(app.nte_summary(project_id)['buckets'][0]['reported_budget_used'], 0)
         self.assertEqual(self.request('/api/nte-completion', 'POST', {**data,'completion_percent':40,'use_full_budget':False})[0], 200)
         self.assertTrue(all(s['completion_percent'] == 40 and not s['use_full_budget'] for s in app.nte_summary(project_id)['buckets'][0]['subbuckets']))
 

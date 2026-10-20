@@ -5,6 +5,17 @@ import app
 
 
 class NteCompletionTests(unittest.TestCase):
+    def test_used_totals_mix_forced_and_normal_sections_and_restore_on_clear(self):
+        forced = {'current_budget':1000,'actual_cost':200,'completion':{'completion_percent':100,'use_full_budget':True}}
+        normal = {'current_budget':500,'actual_cost':150,'completion':{'completion_percent':50}}
+        self.assertEqual(sum(app.nte_reported_budget_used(b) for b in [forced,normal]),1150)
+        self.assertEqual(1500-sum(app.nte_reported_budget_used(b) for b in [forced,normal]),350)
+        self.assertEqual(forced['actual_cost'],200)
+        forced['completion']['use_full_budget']=False
+        self.assertEqual(app.nte_reported_budget_used(forced),200)
+        forced['completion'].update(use_full_budget=True,completion_percent=90)
+        self.assertEqual(app.nte_reported_budget_used(forced),200)
+
     def test_reports_show_each_subbucket_completion_and_full_budget_override(self):
         bucket = {'name':'606 - E-Rack - Palermo 13-1', 'current_budget':123912,
                   'actual_cost':28027.28, 'remaining':95884.72,
@@ -27,6 +38,9 @@ class NteCompletionTests(unittest.TestCase):
             self.assertIn('20.8% of budget spent',html)
             self.assertIn('23.5% of budget spent',html)
             self.assertIn('Projected cost not yet recorded',html)
+            self.assertIn('<div class="label">Used</div><div class="value">$123,912.00</div>',html)
+            self.assertIn('<div class="label">Remaining</div><div class="value good">$0.00</div>',html)
+            self.assertIn('Includes full budget overrides',html)
             self.assertIn('50.0% complete',html)
             self.assertIn('Full budget override',html)
             import pdfplumber
@@ -36,6 +50,7 @@ class NteCompletionTests(unittest.TestCase):
             self.assertEqual(text.count('100.0% complete'),2)
             self.assertIn('Full budget override',text)
             self.assertIn('$123,912.00',text)
+            self.assertIn('$123,912.00 $123,912.00 $0.00',text)
             self.report_pdf = pdf
 
     def test_full_budget_override_matches_screenshot_and_preserves_actual(self):
