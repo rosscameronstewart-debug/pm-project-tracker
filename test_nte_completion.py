@@ -29,9 +29,10 @@ class NteCompletionTests(unittest.TestCase):
             self.assertIn('Projected cost not yet recorded',html)
             self.assertIn('50.0% complete',html)
             self.assertIn('Full budget override',html)
-            from pypdf import PdfReader
+            import pdfplumber
             pdf=app.nte_weekly_report_pdf_bytes(1)
-            text='\n'.join(p.extract_text() for p in PdfReader(BytesIO(pdf)).pages)
+            with pdfplumber.open(BytesIO(pdf)) as report:
+                text='\n'.join(p.extract_text() or '' for p in report.pages)
             self.assertEqual(text.count('100.0% complete'),2)
             self.assertIn('Full budget override',text)
             self.assertIn('$123,912.00',text)
