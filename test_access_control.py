@@ -73,6 +73,37 @@ class AccessTests(unittest.TestCase):
         except HTTPError as error:
             return error.code, error.read()
 
+    def test_nte_full_budget_override_permissions_validation_and_reversal(self):
+        with app.db() as con:
+            project_id = con.execute("INSERT INTO projects(project_code,name,created_at) VALUES ('NTE-OVERRIDE-TEST','Override test','2026-10-20')").lastrowid
+            bucket_id = con.execute("INSERT INTO nte_buckets(project_id,name,created_at) VALUES (?,'Test bucket','2026-10-20')", (project_id,)).lastrowid
+            con.execute("INSERT INTO nte_subbuckets(bucket_id,name,cost_type,original_budget,created_at) VALUES (?,'Labor','Labor',51912,'2026-10-20')", (bucket_id,))
+            con.execute("INSERT INTO nte_subbuckets(bucket_id,name,cost_type,original_budget,created_at) VALUES (?,'Material','Material',72000,'2026-10-20')", (bucket_id,))
+        def cleanup():
+            with app.db() as con:
+                con.execute('DELETE FROM projects WHERE id=?', (project_id,))
+        self.addCleanup(cleanup)
+        data = {'project_id':project_id, 'bucket_id':bucket_id, 'completion_percent':100, 'use_full_budget':True}
+        self.grant('nte_tracking', edit=0)
+        self.assertEqual(self.request('/api/nte-completion', 'POST', data)[0], 403)
+        self.grant('nte_tracking', edit=1)
+        self.assertEqual(self.request('/api/nte-completion', 'POST', {**data,'completion_percent':90})[0], 400)
+        self.assertEqual(self.request('/api/nte-completion', 'POST', {**data,'use_full_budget':'false'})[0], 400)
+        self.assertEqual(self.request('/api/nte-completion', 'POST', {**data,'project_id':-1})[0], 404)
+        self.assertEqual(self.request('/api/nte-completion', 'POST', data)[0], 200)
+        saved = app.nte_completion_by_bucket(project_id)[bucket_id]
+        self.assertEqual((saved['completion_percent'], saved['use_full_budget']), (100, 1))
+        summary = app.nte_summary(project_id)['buckets'][0]
+        self.assertEqual(summary['estimated_cost_at_completion'], 123912)
+        self.assertEqual(summary['actual_cost'], 0)
+        self.assertEqual(sum(s['estimated_cost_at_completion'] for s in summary['subbuckets']), 123912)
+        self.assertTrue(all(s['completion_percent'] == 100 and s['use_full_budget'] for s in summary['subbuckets']))
+        self.assertEqual(self.request('/api/nte-completion', 'POST', {**data,'use_full_budget':False})[0], 200)
+        self.assertEqual(app.nte_completion_by_bucket(project_id)[bucket_id]['use_full_budget'], 0)
+        self.assertEqual(app.nte_summary(project_id)['buckets'][0]['estimated_cost_at_completion'], 0)
+        self.assertEqual(self.request('/api/nte-completion', 'POST', {**data,'completion_percent':40,'use_full_budget':False})[0], 200)
+        self.assertTrue(all(s['completion_percent'] == 40 and not s['use_full_budget'] for s in app.nte_summary(project_id)['buckets'][0]['subbuckets']))
+
     def test_all_existing_routes_have_a_policy(self):
         tree = ast.parse(Path(app.__file__).read_text(encoding='utf-8'))
         handler = next(n for n in tree.body if isinstance(n,ast.ClassDef) and n.name=='Handler')

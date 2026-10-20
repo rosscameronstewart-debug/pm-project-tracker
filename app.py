@@ -644,9 +644,9 @@ def nte_weekly_report_html(project_id):
             return 0
         return max(0, min(100, round((money(used) / budget) * 100, 1)))
 
-    def usage_bar(used, budget):
-        pct = percent(used, budget)
-        return f'<div class="bar"><span style="width:{pct}%"></span></div><div class="bar-label">{pct}% used</div>'
+    def completion_bar(completion):
+        pct = max(0, min(100, money(completion)))
+        return f'<div class="bar"><span style="width:{pct}%"></span></div><div class="bar-label">{pct:.1f}% complete</div>'
 
     bucket_sections = []
     for bucket in buckets:
@@ -663,7 +663,7 @@ def nte_weekly_report_html(project_id):
             sub_rows.append(
                 f"""
                 <tr>
-                  <td><strong>{html_escape(sub.get("name"))}</strong><div class="muted">{html_escape(sub.get("cost_type"))}</div></td>
+                  <td><strong>{html_escape(sub.get("name"))}</strong><div class="muted">{html_escape(sub.get("cost_type"))}</div><div><strong>{money(sub.get("completion_percent")):.1f}% complete</strong></div></td>
                   <td>{dollars(sub.get("current_budget"))}</td>
                   <td>{dollars(sub.get("actual_cost"))}</td>
                   <td>{dollars(sub.get("remaining"))}</td>
@@ -671,7 +671,7 @@ def nte_weekly_report_html(project_id):
                     {dollars(sub.get("estimated_cost_at_completion")) if money(bucket_completion.get("completion_percent")) > 0 else "Needs field %"}
                     <div class="muted">{html_escape(sub.get("estimated_completion_status") or "")}</div>
                   </td>
-                  <td>{usage_bar(sub.get("actual_cost"), sub.get("current_budget"))}{labor_text}</td>
+                  <td>{completion_bar(sub.get("completion_percent"))}<div class="muted">{percent(sub.get("actual_cost"), sub.get("current_budget")):.1f}% of budget spent</div>{labor_text}</td>
                 </tr>
                 """
             )
@@ -684,21 +684,22 @@ def nte_weekly_report_html(project_id):
                   <p>{html_escape(bucket.get("description") or "")}</p>
                 </div>
                 <div>
-                  <div class="label">Used / Budget</div>
+                  <div class="label">Actual cost / Budget</div>
                   <div class="value">{dollars(bucket.get("actual_cost"))} / {dollars(bucket.get("current_budget"))}</div>
-                  {usage_bar(bucket.get("actual_cost"), bucket.get("current_budget"))}
+                  <div class="muted">{percent(bucket.get("actual_cost"), bucket.get("current_budget")):.1f}% of budget spent</div>
                   <div class="label" style="margin-top:10px">Field Completion</div>
                   <div class="value">{money(bucket_completion.get("completion_percent")):.1f}%</div>
+                  {completion_bar(bucket_completion.get("completion_percent"))}
                   <div class="muted">{html_escape(bucket_completion.get("report_date") or "No date recorded")}</div>
                   <div class="label" style="margin-top:10px">Estimated Cost to Completion</div>
                   <div class="value {'' if money(bucket.get("estimated_cost_at_completion")) <= money(bucket.get("current_budget")) else 'bad'}">{dollars(bucket.get("estimated_cost_at_completion")) if money(bucket_completion.get("completion_percent")) > 0 else "Needs field %"}</div>
                   <div class="muted">{html_escape(bucket.get("estimated_completion_status") or "")}</div>
-                  <div class="muted">Remaining to complete: {dollars(bucket.get("estimated_cost_to_complete")) if money(bucket_completion.get("completion_percent")) > 0 else "-"}</div>
+                  <div class="muted">{'Projected cost not yet recorded' if bucket_completion.get('use_full_budget') else 'Remaining to complete'}: {dollars(bucket.get("estimated_cost_to_complete")) if money(bucket_completion.get("completion_percent")) > 0 else "-"}</div>
                 </div>
               </div>
               {f'<p><strong>Field completion note:</strong> {html_escape(bucket_completion.get("notes"))}</p>' if bucket_completion.get("notes") else ''}
               <table>
-                <thead><tr><th>Sub-Bucket</th><th>Current Budget</th><th>Used</th><th>Remaining</th><th>Estimated Cost to Completion</th><th>Usage</th></tr></thead>
+                <thead><tr><th>Sub-Bucket</th><th>Current Budget</th><th>Actual Cost</th><th>Unspent Budget</th><th>Estimated Cost to Completion</th><th>Completion</th></tr></thead>
                 <tbody>{''.join(sub_rows) or '<tr><td colspan="6">No sub-buckets entered.</td></tr>'}</tbody>
               </table>
             </section>
@@ -798,7 +799,7 @@ def nte_weekly_report_html(project_id):
               <td><strong>{html_escape(panel.get("name"))}</strong><div class="muted">{html_escape(panel.get("notes") or "")}</div></td>
               <td>{money(panel.get("completed_panels")):,.0f} / {money(panel.get("total_panels")):,.0f}</td>
               <td>{money(panel.get("remaining_panels")):,.0f}</td>
-              <td>{usage_bar(panel.get("completed_panels"), panel.get("total_panels"))}</td>
+              <td>{completion_bar(panel.get("completion_percent"))}</td>
             </tr>
             """
         )
@@ -1103,12 +1104,13 @@ def nte_weekly_report_pdf_bytes(project_id):
         story.append(Paragraph(f"Used / Budget: <b>{dollars(bucket.get('actual_cost'))} / {dollars(bucket.get('current_budget'))}</b> ({pct_text(bucket.get('actual_cost'), bucket.get('current_budget'))})", styles["Small"]))
         story.append(Paragraph(f"Field Completion: <b>{money(bucket_completion.get('completion_percent')):.1f}%</b> {html_escape(bucket_completion.get('report_date') or '')}", styles["Small"]))
         if money(bucket_completion.get("completion_percent")) > 0:
-            story.append(Paragraph(f"Estimated Cost to Completion: <b>{dollars(bucket.get('estimated_cost_at_completion'))}</b> ({html_escape(bucket.get('estimated_completion_status') or '')}; remaining to complete {dollars(bucket.get('estimated_cost_to_complete'))})", styles["Small"]))
+            remaining_label = 'projected cost not yet recorded' if bucket_completion.get('use_full_budget') else 'remaining to complete'
+            story.append(Paragraph(f"Estimated Cost to Completion: <b>{dollars(bucket.get('estimated_cost_at_completion'))}</b> ({html_escape(bucket.get('estimated_completion_status') or '')}; {remaining_label} {dollars(bucket.get('estimated_cost_to_complete'))})", styles["Small"]))
         else:
             story.append(Paragraph("Estimated Cost to Completion: <b>Needs field completion percent</b>", styles["Small"]))
         if bucket_completion.get("notes"):
             story.append(Paragraph(f"<b>Field completion note:</b> {html_escape(bucket_completion.get('notes'))}", styles["Small"]))
-        rows = [["Sub-Bucket", "Type", "Current Budget", "Used", "Remaining", "Est. Cost to Completion", "Usage / Labor Hours"]]
+        rows = [["Sub-Bucket", "Type", "Current Budget", "Actual Cost", "Unspent Budget", "Est. Cost to Completion", "Budget Spent / Labor Hours"]]
         for sub in bucket.get("subbuckets", []):
             labor = ""
             if sub.get("cost_type") == "Labor":
@@ -1117,7 +1119,7 @@ def nte_weekly_report_pdf_bytes(project_id):
                     labor += f"<br/>{money(sub.get('unproductive_labor_hours')):,.2f} unproductive hrs"
             sub_estimate = dollars(sub.get("estimated_cost_at_completion")) if money(bucket_completion.get("completion_percent")) > 0 else "Needs field %"
             rows.append([
-                Paragraph(html_escape(sub.get("name")), styles["Small"]),
+                Paragraph(f"{html_escape(sub.get('name'))}<br/><b>{money(sub.get('completion_percent')):.1f}% complete</b>", styles["Small"]),
                 Paragraph(html_escape(sub.get("cost_type")), styles["Small"]),
                 dollars(sub.get("current_budget")),
                 dollars(sub.get("actual_cost")),
@@ -1125,6 +1127,7 @@ def nte_weekly_report_pdf_bytes(project_id):
                 Paragraph(f"{sub_estimate}<br/>{html_escape(sub.get('estimated_completion_status') or '')}", styles["Small"]),
                 Paragraph(f"{pct_text(sub.get('actual_cost'), sub.get('current_budget'))}{labor}", styles["Small"]),
             ])
+        rows[0] = [Paragraph(f"<b>{html_escape(label)}</b>", styles["Small"]) for label in rows[0]]
         table = Table(rows, colWidths=[1.12 * inch, 0.65 * inch, 0.85 * inch, 0.78 * inch, 0.78 * inch, 1.05 * inch, 1.5 * inch], repeatRows=1)
         table.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#eaf0f5")),
@@ -2336,6 +2339,8 @@ def init_db():
         nte_completion_cols = [r["name"] for r in con.execute("PRAGMA table_info(nte_completion_updates)").fetchall()]
         if "bucket_id" not in nte_completion_cols:
             con.execute("ALTER TABLE nte_completion_updates ADD COLUMN bucket_id INTEGER REFERENCES nte_buckets(id) ON DELETE CASCADE")
+        if "use_full_budget" not in nte_completion_cols:
+            con.execute("ALTER TABLE nte_completion_updates ADD COLUMN use_full_budget INTEGER NOT NULL DEFAULT 0")
         nte_panel_cols = [r["name"] for r in con.execute("PRAGMA table_info(nte_panel_deliverables)").fetchall()]
         if "bucket_id" not in nte_panel_cols:
             con.execute("ALTER TABLE nte_panel_deliverables ADD COLUMN bucket_id INTEGER REFERENCES nte_buckets(id) ON DELETE CASCADE")
@@ -7739,6 +7744,20 @@ def customer_dashboard_summary(project_id):
     return {"project": project, "targets": targets, "tickets": tickets, "summary": summary}
 
 
+def nte_completion_estimate(actual_cost, current_budget, completion_percent, use_full_budget=False):
+    actual_cost, current_budget, completion_percent = map(money, (actual_cost, current_budget, completion_percent))
+    override = bool(use_full_budget) and completion_percent == 100
+    estimate = current_budget if override else (actual_cost / (completion_percent / 100) if completion_percent > 0 else 0)
+    return {
+        "estimated_cost_at_completion": estimate,
+        "estimated_cost_to_complete": max(0, estimate - actual_cost) if completion_percent > 0 else 0,
+        "estimated_completion_variance": current_budget - estimate if completion_percent > 0 else 0,
+        "estimated_completion_status": "Full budget override" if override else (
+            "No field completion entered" if completion_percent <= 0 else (
+                "Projected under budget" if current_budget >= estimate else "Projected over budget")),
+    }
+
+
 def nte_completion_by_bucket(project_id):
     completions = {}
     for row in rows(
@@ -7961,33 +7980,14 @@ def nte_summary(project_id, subproject_id=None, change_order_id=None, seed_defau
         completion_percent = money(bucket["completion"].get("completion_percent"))
         actual_cost = money(bucket["actual_cost"])
         current_budget = money(bucket["current_budget"])
-        if completion_percent > 0:
-            estimated_at_completion = actual_cost / (completion_percent / 100)
-            estimated_to_complete = max(0, estimated_at_completion - actual_cost)
-            estimated_variance = current_budget - estimated_at_completion
-        else:
-            estimated_at_completion = 0
-            estimated_to_complete = 0
-            estimated_variance = 0
-        bucket["estimated_cost_at_completion"] = estimated_at_completion
-        bucket["estimated_cost_to_complete"] = estimated_to_complete
-        bucket["estimated_completion_variance"] = estimated_variance
-        bucket["estimated_completion_status"] = "No field completion entered" if completion_percent <= 0 else ("Projected under budget" if estimated_variance >= 0 else "Projected over budget")
+        use_full_budget = bool(bucket["completion"].get("use_full_budget"))
+        bucket.update(nte_completion_estimate(actual_cost, current_budget, completion_percent, use_full_budget))
         for sub in bucket.get("subbuckets", []):
             sub_actual = money(sub.get("actual_cost"))
             sub_budget = money(sub.get("current_budget"))
-            if completion_percent > 0:
-                sub_estimated_at_completion = sub_actual / (completion_percent / 100)
-                sub_estimated_to_complete = max(0, sub_estimated_at_completion - sub_actual)
-                sub_estimated_variance = sub_budget - sub_estimated_at_completion
-            else:
-                sub_estimated_at_completion = 0
-                sub_estimated_to_complete = 0
-                sub_estimated_variance = 0
-            sub["estimated_cost_at_completion"] = sub_estimated_at_completion
-            sub["estimated_cost_to_complete"] = sub_estimated_to_complete
-            sub["estimated_completion_variance"] = sub_estimated_variance
-            sub["estimated_completion_status"] = "No field completion entered" if completion_percent <= 0 else ("Projected under budget" if sub_estimated_variance >= 0 else "Projected over budget")
+            sub["completion_percent"] = completion_percent
+            sub["use_full_budget"] = use_full_budget
+            sub.update(nte_completion_estimate(sub_actual, sub_budget, completion_percent, use_full_budget))
     for panel in panel_deliverables:
         total_panels = money(panel.get("total_panels"))
         completed_panels = min(total_panels, money(panel.get("completed_panels"))) if total_panels > 0 else money(panel.get("completed_panels"))
@@ -14285,6 +14285,8 @@ HTML = r"""
               <input data-nte-completion="${bucket.id}" data-field="report_date" type="date" value="${htmlEscape(bucket.completion?.report_date || new Date().toISOString().slice(0, 10))}" title="Report week">
               <input data-nte-completion="${bucket.id}" data-field="notes" value="${htmlEscape(bucket.completion?.notes || '')}" placeholder="Foreman note">
               <button class="btn" data-save-nte-completion="${bucket.id}" type="button">Save %</button>
+              <label><input type="checkbox" data-nte-completion="${bucket.id}" data-field="use_full_budget" ${bucket.completion?.use_full_budget ? 'checked' : ''}> Use full budget projection at 100%</label>
+              <button class="btn" data-save-nte-completion="${bucket.id}" data-complete-nte="true" type="button">100% / Full budget</button>
             </td>
             <td><input data-nte-bucket="${bucket.id}" data-field="description" value="${htmlEscape(bucket.description || '')}"></td>
             <td>
@@ -14309,7 +14311,7 @@ HTML = r"""
               </td>
               <td>${sub.cost_type === 'Labor' ? `<input data-nte-sub="${sub.id}" data-field="labor_hours_budget" type="number" step="0.01" value="${Number(sub.labor_hours_budget || 0).toFixed(2)}"><div class="muted">${Number(sub.labor_hours_used || 0).toFixed(2)} used / ${Number(sub.labor_hours_remaining || 0).toFixed(2)} remaining</div>` : '<span class="muted">-</span>'}</td>
               <td>${sub.cost_type === 'Labor' && Number(sub.unproductive_labor_hours || 0) ? `${Number(sub.unproductive_labor_hours || 0).toFixed(2)} hrs` : '<span class="muted">-</span>'}</td>
-              <td><span class="muted">Bucket level</span></td>
+              <td><strong>${Number(sub.completion_percent || 0).toFixed(1)}%</strong><div class="muted">From bucket${sub.use_full_budget ? ' / Full budget override' : ''}</div></td>
               <td><input data-nte-sub="${sub.id}" data-field="description" value="${htmlEscape(sub.description || '')}"></td>
               <td><button class="btn" data-save-nte-sub="${sub.id}" type="button">Save</button></td>
             </tr>
@@ -14334,11 +14336,22 @@ HTML = r"""
       tableEl.querySelectorAll('[data-save-nte-completion]').forEach(btn => btn.onclick = async () => {
         const bucketId = btn.dataset.saveNteCompletion;
         const fields = { project_id: state.projectId, bucket_id: bucketId };
-        tableEl.querySelectorAll(`[data-nte-completion="${bucketId}"]`).forEach(el => fields[el.dataset.field] = el.value);
-        await api('/api/nte-completion', { method:'POST', body: JSON.stringify(fields) });
-        markSaved();
-        document.getElementById('nteTrackingResult').textContent = `Field completion saved for bucket at ${Number(fields.completion_percent || 0).toFixed(1)}%.`;
-        await loadNteTracking(false);
+        tableEl.querySelectorAll(`[data-nte-completion="${bucketId}"]`).forEach(el => fields[el.dataset.field] = el.type === 'checkbox' ? el.checked : el.value);
+        if (btn.dataset.completeNte) {
+          fields.completion_percent = 100;
+          fields.use_full_budget = true;
+        }
+        btn.disabled = true;
+        try {
+          await api('/api/nte-completion', { method:'POST', body: JSON.stringify(fields) });
+          markSaved();
+          document.getElementById('nteTrackingResult').textContent = fields.use_full_budget ? 'Saved at 100% with full budget projection. Actual costs unchanged.' : `Field completion saved for bucket at ${Number(fields.completion_percent || 0).toFixed(1)}%.`;
+          await loadNteTracking(false);
+        } catch (error) {
+          document.getElementById('nteTrackingResult').textContent = `Could not save completion: ${error.message || error}`;
+        } finally {
+          btn.disabled = false;
+        }
       });
       tableEl.querySelectorAll('[data-save-nte-sub]').forEach(btn => btn.onclick = async () => {
         const id = btn.dataset.saveNteSub;
@@ -17235,6 +17248,11 @@ class Handler(BaseHTTPRequestHandler):
                 project_id = data.get("project_id")
                 bucket_id = data.get("bucket_id")
                 completion_percent = money(data.get("completion_percent"))
+                use_full_budget = data.get("use_full_budget", False)
+                if not isinstance(use_full_budget, bool):
+                    return json_response(self, {"error": "Full budget projection must be true or false."}, 400)
+                if use_full_budget and completion_percent != 100:
+                    return json_response(self, {"error": "Full budget projection requires 100% completion. Clear the option to use a lower percentage."}, 400)
                 if not project_id:
                     return json_response(self, {"error": "Project is required."}, 400)
                 if not bucket_id:
@@ -17250,9 +17268,9 @@ class Handler(BaseHTTPRequestHandler):
                         """
                         INSERT INTO nte_completion_updates (
                           project_id, bucket_id, completion_percent, report_date, notes,
-                          created_by_user_id, created_by_username, created_at
+                          created_by_user_id, created_by_username, created_at, use_full_budget
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             project_id,
@@ -17263,10 +17281,11 @@ class Handler(BaseHTTPRequestHandler):
                             actor["id"] if actor else None,
                             actor["username"] if actor else "",
                             now,
+                            int(use_full_budget),
                         ),
                     )
                     new_id = cur.lastrowid
-                log_activity(actor, "updated NTE field completion", "T&M NTE", bucket["name"], {"project_id": project_id, "bucket_id": bucket_id, "completion_percent": completion_percent, "report_date": data.get("report_date") or ""})
+                log_activity(actor, "updated NTE field completion", "T&M NTE", bucket["name"], {"project_id": project_id, "bucket_id": bucket_id, "completion_percent": completion_percent, "use_full_budget": use_full_budget, "report_date": data.get("report_date") or ""})
                 return json_response(self, {"id": new_id})
             if parsed.path.startswith("/api/nte-additions/") and parsed.path.endswith("/signed"):
                 actor = current_user(self)
