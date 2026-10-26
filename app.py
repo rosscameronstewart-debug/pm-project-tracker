@@ -9,6 +9,7 @@ import re
 import secrets
 import smtplib
 import sqlite3
+import math
 import subprocess
 import sys
 import tempfile
@@ -6766,6 +6767,132 @@ def import_fieldwise_pdf(path, project_id):
     return {"count": count, "skipped": skipped, "order_number": order_number, "matched_subproject_id": matched_subproject_id, "matched_change_order_id": matched_change_order_id}
 
 
+def richland_invoice_ocr_text(pages):
+    result = []
+    for page in pages:
+        # OCR's vertical order can swap cells on the same printed row. Group
+        # by vertical centre, then restore the invoice's left-to-right columns.
+        heights = sorted(line['y2'] - line['y1'] for line in page)
+        tolerance = heights[len(heights) // 2] * 0.45 if heights else 0
+        rows = []
+        for line in sorted(page, key=lambda cell: (cell['y1'] + cell['y2']) / 2):
+            center = (line['y1'] + line['y2']) / 2
+            if not rows or abs(center - rows[-1][0]) > tolerance:
+                rows.append([center, [line]])
+            else:
+                rows[-1][1].append(line)
+        result.extend('\t'.join(cell['text'] for cell in sorted(row, key=lambda cell: cell['x1'])) for _, row in rows)
+    return '\n'.join(result)
+
+
+def parse_richland_pump_invoice(text):
+    # Delivery tickets can repeat the purchase; only the invoice carries costs.
+    text = re.split(r"\bDELIVERY\s+TICKET\b", text, maxsplit=1, flags=re.IGNORECASE)[0]
+    header = re.search(r"\b([0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4})\s+([0-9]{4,})\b", text)
+    invoice_date = date_text(header.group(1)) if header else ""
+    invoice_number = header.group(2) if header else ""
+    po_header = re.search(r"P\.?\s*O\.?\s*Number\b(.+?)(?:\bQuantity\b)", text, flags=re.IGNORECASE | re.DOTALL)
+    order_number = first_regex([r"\b([A-Za-z0-9]+(?:-[A-Za-z0-9]+)+)\b"], po_header.group(1)) if po_header else ""
+    total_due = parse_money_text(first_regex(
+        [r"^\s*Total\s*:?\s*\$?\s*([0-9,]+\.[0-9]{2})\s*$"], text,
+        flags=re.IGNORECASE | re.MULTILINE))
+    table = re.search(r"\bQuantity\s+Item\s+Code\s+Description\s+Price\s+Each\s+Amount\s*(.+?)\bSubtotal\b", text,
+                      flags=re.IGNORECASE | re.DOTALL)
+    if not invoice_number or not invoice_date or not total_due or not table:
+        raise RuntimeError("Richland Pump invoice header, item table or total could not be read. Review the scan before importing.")
+    item_lines = []
+    money_pattern = r"\$?[0-9,]+\.[0-9]{2}"
+    row_pattern = rf"(.+?)\s+({money_pattern})\s+({money_pattern})T?(?=\s|$)"
+    body = table.group(1).strip()
+    last_end = 0
+    for match in re.finditer(row_pattern, body, flags=re.DOTALL | re.IGNORECASE):
+        details, rate_text, amount_text = match.groups()
+        parts = [line.strip() for line in re.split(r"[\t\n]", details.strip()) if line.strip()]
+        qty = None
+        # OCR often emits each cell separately. A numeric product code (e.g.
+        # 590) must not be mistaken for a quantity when its description follows.
+        if len(parts) > 2 and re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", parts[0]) and len(parts[1].split()) == 1:
+            qty = money(parts.pop(0))
+        first = parts.pop(0).split()
+        if len(first) >= 3 and re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", first[0]):
+            qty = money(first.pop(0))
+        product_code = first.pop(0)
+        description = " ".join(first + parts).strip()
+        rate, amount = parse_money_text(rate_text), parse_money_text(amount_text)
+        if qty is None and rate > 0:
+            qty = round(amount / rate, 6)
+        if not description or not qty or rate <= 0 or abs(qty * rate - amount) > 0.02:
+            raise RuntimeError("Richland Pump invoice quantity or price could not be reconciled. Review the item before importing.")
+        item_lines.append({"product_code": product_code, "description": description,
+                           "qty": qty, "unit_price": rate, "amount": amount})
+        last_end = match.end()
+    if body[last_end:].strip() or not item_lines or abs(sum(line['amount'] for line in item_lines) - total_due) > 0.02:
+        raise RuntimeError("Richland Pump invoice items do not match the invoice total. Review missing lines, tax or other charges before importing.")
+    return {"vendor": "Richland Pump & Supply", "invoice_number": invoice_number,
+            "invoice_date": invoice_date, "order_number": order_number,
+            "total_due": total_due, "item_lines": item_lines}
+
+
+def parse_amazon_order_invoice(text):
+    invoice_number = first_regex([
+        r"Amazon\.com\s+order\s+number\s*:\s*([0-9]{3}-[0-9]{7}-[0-9]{7})",
+        r"Final\s+Details\s+for\s+Order\s*#\s*([0-9]{3}-[0-9]{7}-[0-9]{7})",
+    ], text)
+    order_number = first_regex([r"^\s*PO\s+number\s*:\s*([^\r\n]+)"], text, flags=re.IGNORECASE | re.MULTILINE)
+    placed = first_regex([r"Order\s+Placed:\s*([^\r\n]+)"], text)
+    try:
+        invoice_date = datetime.strptime(placed, '%B %d, %Y').date().isoformat()
+    except ValueError:
+        invoice_date = date_text(placed)
+    currency_amount = r"(?:USD\s+|\$)\s*(-?[0-9,]+\.[0-9]{2})"
+    total_text = first_regex([rf"Grand\s+Total:\s*{currency_amount}", rf"Order\s+Total:\s*{currency_amount}"], text)
+    if not invoice_number or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", invoice_date) or not total_text:
+        raise RuntimeError("Amazon order number, order date or USD total could not be read. Review the document before importing.")
+    total_due = parse_money_text(total_text)
+    item_lines = []
+    blocks = re.findall(r"Items\s+Ordered\s+Price\s*\n(.+?)(?=Shipping\s+Address:|Payment\s+information|\Z)", text,
+                        flags=re.IGNORECASE | re.DOTALL)
+    for block in blocks:
+        for item in re.finditer(r"^\s*([0-9]+)\s+of:\s*(.+?)(?=^\s*[0-9]+\s+of:|\Z)", block,
+                                flags=re.IGNORECASE | re.MULTILINE | re.DOTALL):
+            qty = int(item.group(1))
+            detail = item.group(2)
+            product = re.split(r"(?:Sold\s+by|Supplied\s+by|Business\s+Price|Condition:)", detail,
+                               maxsplit=1, flags=re.IGNORECASE)[0]
+            price = re.search(currency_amount, product)
+            if not price or qty <= 0:
+                raise RuntimeError("Amazon item quantity or price could not be read. Review the document before importing.")
+            unit_price = parse_money_text(price.group(1))
+            description = re.sub(r"\s+", " ", product[:price.start()] + ' ' + product[price.end():]).strip()
+            seller = first_regex([r"Sold\s+by(?:\s+and\s+invoiced\s+on\s+behalf\s+of)?\s*:\s*([^\r\n]+)"], detail)
+            seller = re.sub(r"\s*\(seller\s+profile\)\s*", "", seller, flags=re.IGNORECASE).strip()
+            if not description:
+                raise RuntimeError("Amazon item description could not be read. Review the document before importing.")
+            if seller:
+                description += f" (Sold by: {seller})"
+            # This order layout has no printed ASIN or catalog item code.
+            item_lines.append({"product_code": "Amazon Item", "description": description,
+                               "qty": qty, "unit_price": unit_price, "amount": round(qty * unit_price, 2)})
+    # Use the final payment summary once, not each repeated shipment subtotal.
+    summary = re.split(r"Payment\s+information", text, flags=re.IGNORECASE)[-1]
+    for code, label in [
+        ('Shipping', r'Shipping\s*&\s*Handling'),
+        ('Sales Tax', r'(?:Estimated\s+tax\s+to\s+be\s+collected|Sales\s+Tax)'),
+        ('Promotion', r'Promotion\(s\)\s+Applied'),
+    ]:
+        charge_text = first_regex([rf"{label}:\s*{currency_amount}"], summary)
+        charge = parse_money_text(charge_text)
+        if code == 'Promotion':
+            charge = -abs(charge)
+        if charge:
+            item_lines.append({"product_code": code, "description": f"Amazon {code.lower()}",
+                               "qty": 1, "unit_price": charge, "amount": charge})
+    if not blocks or not any(row['product_code'] == 'Amazon Item' for row in item_lines) or abs(sum(row['amount'] for row in item_lines) - total_due) > 0.02:
+        raise RuntimeError("Amazon items and charges do not match the order total. Review missing shipments, tax or discounts before importing.")
+    return {"vendor": "Amazon", "invoice_number": invoice_number, "invoice_date": invoice_date,
+            "order_number": order_number, "total_due": total_due, "item_lines": item_lines}
+
+
 def import_vendor_invoice_pdf(path, project_id, preview_only=False):
     if pdfplumber is None:
         raise RuntimeError("Vendor invoice PDF import needs pdfplumber, but it is not available.")
@@ -6776,7 +6903,27 @@ def import_vendor_invoice_pdf(path, project_id, preview_only=False):
     source_file = Path(path).name
     lower = text.lower()
     compact_lower = re.sub(r"\s+", "", lower)
-    if "dsgsupply" in lower or "dakota supply group" in lower or "dsg truck delivery" in lower or "dsg#" in lower:
+    if re.search(r"final\s+details\s+for\s+order\s*#", lower) and "amazon.com" in lower:
+        amazon = parse_amazon_order_invoice(text)
+        vendor = amazon["vendor"]
+        invoice_number = amazon["invoice_number"]
+        invoice_date = amazon["invoice_date"]
+        order_number = amazon["order_number"]
+        total_due = amazon["total_due"]
+        item_lines = amazon["item_lines"]
+    elif re.search(r"richland\s+pump\s*(?:&|and)\s*supply", lower):
+        with pdfplumber.open(path) as richland_pdf:
+            scanned_richland = not any(page.extract_text() for page in richland_pdf.pages)
+        if scanned_richland:
+            text = richland_invoice_ocr_text(extract_pdf_ocr_pages(path))
+        richland = parse_richland_pump_invoice(text)
+        vendor = richland["vendor"]
+        invoice_number = richland["invoice_number"]
+        invoice_date = richland["invoice_date"]
+        order_number = richland["order_number"]
+        total_due = richland["total_due"]
+        item_lines = richland["item_lines"]
+    elif "dsgsupply" in lower or "dakota supply group" in lower or "dsg truck delivery" in lower or "dsg#" in lower:
         vendor = "Dakota Supply Group"
         item_lines = []
         if ("invoicesummary" in compact_lower or "invoice summary" in lower) and "qty" in lower and "subtotal" in lower:
@@ -8351,14 +8498,22 @@ HTML = r"""
     #bidTable tr.bid-dirty td:first-child { box-shadow: inset 4px 0 0 var(--gold); }
     #bidTable tr.bid-dirty input, #bidTable tr.bid-dirty select { background: color-mix(in srgb, var(--gold) 10%, var(--field-bg)); border-color: var(--gold); }
     #bidTable tr.bid-dirty [data-save-bid] { background: var(--gold); color: white; border-color: var(--gold); }
-    #usersTable { min-width: 980px; table-layout: fixed; }
-    #usersTable th:nth-child(1), #usersTable td:nth-child(1) { width: 260px; }
-    #usersTable th:nth-child(2), #usersTable td:nth-child(2) { width: 190px; }
-    #usersTable th:nth-child(3), #usersTable td:nth-child(3) { width: 160px; }
-    #usersTable th:nth-child(4), #usersTable td:nth-child(4) { width: 130px; }
-    #usersTable th:nth-child(5), #usersTable td:nth-child(5) { width: 145px; }
-    #usersTable th:nth-child(6), #usersTable td:nth-child(6) { width: 150px; }
-    #usersTable th:nth-child(7), #usersTable td:nth-child(7) { width: 210px; }
+    #usersTable { min-width: 0; table-layout: auto; }
+    #usersTable th:first-child { width: 42%; }
+    #usersTable th:last-child { width: 90px; }
+    #usersTable [data-edit-user] { min-width: 64px; white-space: nowrap; }
+    .user-filters { display: grid; grid-template-columns: minmax(180px, 2fr) minmax(120px, 1fr) minmax(120px, 1fr) auto; gap: 12px; align-items: end; margin: 16px 0; }
+    .user-filters label { display: block; }
+    #userEditor { width: min(540px, calc(100vw - 32px)); max-height: calc(100vh - 40px); overflow: auto; box-sizing: border-box; padding: 24px; color: var(--ink); background: var(--panel); border: 1px solid var(--line); border-radius: 12px; }
+    #userEditor::backdrop { background: rgba(0,0,0,.5); }
+    #userEditForm .grid { margin: 18px 0; }
+    #userEditForm .user-check { display: flex; align-items: center; gap: 8px; margin: 14px 0; }
+    #userEditForm .user-check input { width: auto; }
+    #userEditForm details { margin: 18px 0; }
+    #userEditorError { margin: 12px 0; }
+    .user-editor-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; padding-top: 16px; border-top: 1px solid var(--line); }
+    #deleteEditedUser { margin-right: auto; }
+    @media (max-width: 700px) { .user-filters { grid-template-columns: 1fr 1fr; } .user-filters > div:first-child { grid-column: 1 / -1; } #usersTable { font-size: 12px; } }
     #usersTable td { overflow-wrap: anywhere; word-break: normal; }
     #usersTable select, #usersTable input { min-width: 0; }
     #usersTable label { display: flex; align-items: center; gap: 6px; margin: 0; white-space: nowrap; }
@@ -8547,12 +8702,21 @@ HTML = r"""
     body.field-po-only .project-switcher,
     body.field-po-only nav,
     body.field-po-only .home-card:not([data-open-tab="fieldPo"]) { display: none !important; }
+    body.field-po-only .app-shell { grid-template-columns: minmax(0, 1fr); }
+    #fieldPo .grid > * { min-width: 0; }
+    #fieldPo input, #fieldPo select, #fieldPo textarea { min-width: 0; max-width: 100%; }
+    .field-po-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; }
+    .field-po-toolbar h2 { flex: 1 0 auto; margin: 0; }
+    .field-po-toolbar .actions { margin: 0; }
+    .field-po-toolbar .btn { min-height: 44px; overflow-wrap: normal; }
     .field-po-hero { max-width: 760px; margin: 0 auto 14px; }
     .field-po-hero h2 { font-size: 28px; margin-bottom: 4px; }
     .field-po-steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 12px; }
     .field-po-step { border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: var(--soft); font-weight: 750; }
     .field-po-step span { display: block; color: var(--muted); font-size: 12px; margin-top: 3px; font-weight: 650; }
     .field-po-panel { max-width: 760px; margin: 0 auto; }
+    #nteAdditionTable { min-width: 1800px; }
+    #nteAdditionTable th, #nteAdditionTable td:nth-child(4), #nteAdditionTable .btn { white-space: nowrap; }
     .field-po-panel label { font-size: 15px; color: var(--ink); margin-top: 16px; }
     .field-po-panel input,
     .field-po-panel select,
@@ -8704,6 +8868,8 @@ HTML = r"""
       .field-po-hero h2 { font-size: 24px; }
       .field-po-card-header { flex-direction: column; }
       .field-po-status { align-self: flex-start; }
+      .field-po-toolbar .actions { flex: 1 1 100%; }
+      .field-po-toolbar .actions .btn { flex: 1 1 130px; min-width: 0; }
       .grid.cols-4, .grid.cols-2 { grid-template-columns: 1fr; }
       .attention-grid { grid-template-columns: 1fr; }
       .section-head { flex-direction: column; align-items: stretch; }
@@ -8874,9 +9040,12 @@ HTML = r"""
         </form>
       </div>
       <div class="panel" style="margin-top:14px">
-        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px">
-          <h2>My POs</h2><button class="btn" data-open-tab="projectMaterials" type="button">Materials Bought</button><button class="btn" data-open-tab="fieldPoSearch" type="button">Search all POs</button>
+        <div class="field-po-toolbar">
+          <h2>My POs</h2>
+          <div class="actions">
+          <button class="btn" data-open-tab="projectMaterials" type="button">Materials Bought</button><button class="btn" data-open-tab="fieldPoSearch" type="button">Search all POs</button>
           <button class="btn" id="refreshFieldPos" type="button">Refresh</button>
+          </div>
         </div>
         <div class="grid cols-4">
           <div><label for="fieldPoHistorySearch">Search My POs</label><input id="fieldPoHistorySearch" type="search" placeholder="PO #, customer, vendor, job/order, COG or description"></div>
@@ -9716,19 +9885,45 @@ HTML = r"""
 
     <section id="admin" class="tab hidden">
       <div class="admin-grid">
-        <form class="panel" id="userForm">
-          <h2>Add User</h2>
+        <details class="panel" id="addUserPanel">
+          <summary><strong>Add User</strong></summary>
+          <form id="userForm" style="margin-top:14px">
           <label>Username</label><input name="username" type="email" autocomplete="username" required>
           <label>Display Name</label><input name="display_name">
           <label>Role</label><select name="role"><option>User</option><option>Read Only</option><option>TX/Read Only</option><option>Field PO</option><option>Admin</option></select>
           <label><input name="po_auto_issue" type="checkbox" value="1"> Auto-issue this user's POs</label>
           <p class="muted">New users start with temporary password TPE1776 and must change it at first login.</p>
           <div class="actions"><button class="btn primary" type="submit">Add User</button></div>
-        </form>
+          </form>
+        </details>
         <div class="panel">
           <h2>Users <span class="muted" id="usersCount"></span></h2>
+          <div class="user-filters">
+            <div><label for="usersSearch">Find a person</label><input id="usersSearch" type="search" placeholder="Search name or email" autocomplete="off"></div>
+            <div><label for="usersRoleFilter">Role</label><select id="usersRoleFilter"><option value="">All roles</option></select></div>
+            <div><label for="usersStatusFilter">Status</label><select id="usersStatusFilter"><option value="">All statuses</option><option value="active">Active</option><option value="inactive">Inactive</option><option value="password">Needs password change</option></select></div>
+            <button class="btn" id="clearUsersFilters" type="button">Clear filters</button>
+          </div>
+          <p class="muted" id="usersResults" role="status" aria-live="polite"></p>
           <div class="table-wrap"><table id="usersTable"></table></div>
         </div>
+        <dialog id="userEditor" aria-labelledby="userEditorTitle">
+          <form id="userEditForm">
+            <h2 id="userEditorTitle">Edit user</h2>
+            <p class="muted" id="userEditorSubtitle"></p>
+            <div class="grid cols-2">
+              <div><label for="editUserName">Username / email</label><input id="editUserName" name="username" required autocapitalize="none" autocorrect="off" spellcheck="false"></div>
+              <div><label for="editUserDisplayName">Display name</label><input id="editUserDisplayName" name="display_name"></div>
+              <div><label for="editUserRole">Role</label><select id="editUserRole" name="role"></select></div>
+              <div><label for="editUserActive">Status</label><select id="editUserActive" name="active"><option value="1">Active</option><option value="0">Inactive</option></select></div>
+            </div>
+            <label class="user-check"><input id="editUserPoAutoIssue" name="po_auto_issue" type="checkbox"> Auto-issue this user's POs</label>
+            <p class="muted" id="editUserPasswordStatus"></p>
+            <details id="editUserPasswordDetails"><summary>Reset password</summary><label for="editUserPassword">New temporary password</label><input id="editUserPassword" name="password" type="password" autocomplete="new-password"><p class="muted">Leave blank to keep the current password. A reset signs the user out and requires a password change.</p></details>
+            <div class="bad" id="userEditorError" role="alert"></div>
+            <div class="user-editor-actions"><button class="btn danger" id="deleteEditedUser" type="button">Delete user</button><button class="btn" id="cancelUserEditor" type="button">Cancel</button><button class="btn primary" id="saveEditedUser" type="submit">Save changes</button></div>
+          </form>
+        </dialog>
         <div class="panel" style="grid-column:1 / -1">
           <h2>Role Permissions</h2>
           <p class="muted">Control what each role can see or change. Admin is always full access so you cannot lock yourself out.</p>
@@ -10174,12 +10369,15 @@ HTML = r"""
     }
     const isTemporaryViewControl = target => {
       return target.closest('.cost-filter')
+        || target.closest('.user-filters')
+        || target.matches('#officePoSearch, #officePoStatusFilter, #closedPoSearch, #closedPoStatusFilter, #projectPoSearch, #projectPoStatusFilter')
         || target.closest('#financialProfitTrend')
         || target.closest('#emailTestPanel')
         || target.closest('#projectMaterials')
         || target.id === 'showAllCosts';
     };
     const markUnsaved = event => {
+      if (event.target.closest('#userEditForm')) return;
       if (isTemporaryViewControl(event.target)) return;
       if (event.target.matches('input, textarea, select') && event.target.type !== 'file' && event.target.id !== 'projectSelect') {
         if (!event.target.closest('#officePoTable, #closedPoTable, #projectPoTable')) hasNonPoUnsavedChanges = true;
@@ -14428,15 +14626,20 @@ HTML = r"""
       const bucketById = Object.fromEntries((nteData.buckets || []).map(b => [b.id, b]));
       const subById = {};
       (nteData.buckets || []).forEach(b => (b.subbuckets || []).forEach(s => subById[s.id] = s));
-      tableEl.innerHTML = `<thead><tr><th>Created</th><th>Bucket</th><th>Status</th><th>Total</th><th>Labor</th><th>Material</th><th>Equipment</th><th>Requested</th><th>Approved</th><th>Approver</th><th>Backup</th><th>Approval</th><th>Reason</th></tr></thead>
+      const editable = a => canEditPermission('nte_tracking') && a.status === 'Pending' && !a.signed_file;
+      const amountCell = (a, field, label) => editable(a)
+        ? `<input style="min-width:120px" type="number" step="0.01" aria-label="${label} for addition ${a.id}" data-nte-addition="${a.id}" data-field="${field}" value="${Number(a[field] || 0).toFixed(2)}">`
+        : money(a[field]);
+      tableEl.innerHTML = `<thead><tr><th>Created</th><th>Bucket</th><th>Status</th><th>Total</th><th>Labor</th><th>Material</th><th>Equipment</th><th>Corrections</th><th>Requested</th><th>Approved</th><th>Approver</th><th>Backup</th><th>Approval</th><th>Reason</th></tr></thead>
         <tbody>${additions.map(a => `<tr>
           <td>${htmlEscape((a.created_at || '').replace('T', ' '))}<div class="muted">${htmlEscape(a.created_by_username || '')}</div></td>
           <td>${htmlEscape(bucketById[a.bucket_id]?.name || '')}</td>
           <td>${htmlEscape(a.status || '')}</td>
-          <td>${money(a.amount)}</td>
-          <td>${money(a.labor_amount)}</td>
-          <td>${money(a.material_amount)}</td>
-          <td>${money(a.equipment_amount)}</td>
+          <td data-nte-addition-total="${a.id}">${money(a.amount)}</td>
+          <td>${amountCell(a, 'labor_amount', 'Labor')}</td>
+          <td>${amountCell(a, 'material_amount', 'Material')}</td>
+          <td>${amountCell(a, 'equipment_amount', 'Equipment')}</td>
+          <td>${editable(a) ? `<button class="btn primary" data-save-nte-addition="${a.id}" type="button">Save amounts</button><div class="muted" data-nte-addition-result="${a.id}" role="status" aria-live="polite"></div>` : '<span class="muted">Only pending, unsigned additions can be corrected.</span>'}</td>
           <td>${htmlEscape(a.requested_date || '')}</td>
           <td>${htmlEscape(a.approved_date || '')}</td>
           <td>${htmlEscape(a.approver || '')}</td>
@@ -14452,6 +14655,27 @@ HTML = r"""
           </td>
           <td>${htmlEscape(a.reason || '')}</td>
         </tr>`).join('')}</tbody>`;
+      tableEl.querySelectorAll('[data-nte-addition]').forEach(input => input.addEventListener('input', () => {
+        const id = input.dataset.nteAddition;
+        const total = [...tableEl.querySelectorAll(`[data-nte-addition="${id}"]`)].reduce((sum, el) => sum + Number(el.value || 0), 0);
+        tableEl.querySelector(`[data-nte-addition-total="${id}"]`).textContent = money(total);
+      }));
+      tableEl.querySelectorAll('[data-save-nte-addition]').forEach(btn => btn.onclick = async () => {
+        const id = btn.dataset.saveNteAddition;
+        const result = tableEl.querySelector(`[data-nte-addition-result="${id}"]`);
+        const fields = {};
+        const inputs = [...tableEl.querySelectorAll(`[data-nte-addition="${id}"]`)];
+        if (inputs.some(input => !input.reportValidity())) return;
+        inputs.forEach(input => fields[input.dataset.field] = input.value);
+        btn.disabled = true;
+        try {
+          await api(`/api/nte-additions/${id}`, { method:'PUT', body: JSON.stringify(fields) });
+          markSaved();
+          await loadNteTracking(false);
+        } catch (error) {
+          result.textContent = error.message || 'Unable to save amounts. Try again.';
+        } finally { btn.disabled = false; }
+      });
       tableEl.querySelectorAll('[data-upload-nte-addition-signed]').forEach(btn => btn.onclick = async () => {
         const id = btn.dataset.uploadNteAdditionSigned;
         const input = tableEl.querySelector(`[data-nte-addition-signed-file="${id}"]`);
@@ -15614,79 +15838,158 @@ HTML = r"""
       editingCustomerInvoice = null;
     }
 
+    let adminUsers = [];
+    let editingAdminUser = null;
+    let adminUserBeforeEdit = null;
+    let savingAdminUser = false;
+
+    function filterAdminUsers(users, search, role, status) {
+      const terms = String(search || '').toLowerCase().trim().split(/\s+/).filter(Boolean);
+      return users.filter(user => {
+        const identity = `${user.display_name || ''} ${user.username || ''}`.toLowerCase();
+        return terms.every(term => identity.includes(term))
+          && (!role || user.role === role)
+          && (!status || (status === 'active' && Number(user.active) === 1)
+            || (status === 'inactive' && Number(user.active) === 0)
+            || (status === 'password' && Number(user.must_change_password) === 1));
+      });
+    }
+
+    function renderUsers() {
+      const users = filterAdminUsers(adminUsers, document.getElementById('usersSearch').value,
+        document.getElementById('usersRoleFilter').value, document.getElementById('usersStatusFilter').value);
+      document.getElementById('usersCount').textContent = `(${adminUsers.length})`;
+      document.getElementById('usersResults').textContent = `${users.length} of ${adminUsers.length} people shown`;
+      document.getElementById('usersTable').innerHTML = `
+        <thead><tr><th>Person</th><th>Role</th><th>PO auto-issue</th><th>Status</th><th></th></tr></thead>
+        <tbody>${users.length ? users.map(user => `<tr>
+          <td><strong>${htmlEscape(user.display_name || user.username || '')}</strong><div class="muted">${htmlEscape(user.username || '')}</div>${String(user.id) === String(state.currentUser?.id) ? '<small class="muted">You</small>' : ''}</td>
+          <td>${htmlEscape(user.role || '')}</td>
+          <td>${Number(user.po_auto_issue) ? 'Enabled' : 'Off'}</td>
+          <td><span class="${Number(user.active) ? 'good' : 'muted'}">${Number(user.active) ? 'Active' : 'Inactive'}</span>${Number(user.must_change_password) ? '<div class="muted">Needs password change</div>' : ''}</td>
+          <td><button class="btn" data-edit-user="${user.id}" aria-label="Edit ${htmlEscape(user.display_name || user.username || 'user')}" type="button">Edit</button></td>
+        </tr>`).join('') : '<tr><td colspan="5">No people match these filters. Try another name or clear the filters.</td></tr>'}</tbody>`;
+      document.querySelectorAll('#usersTable [data-edit-user]').forEach(button => {
+        button.onclick = () => openUserEditor(button.dataset.editUser);
+      });
+    }
+
+    function editedUserPayload() {
+      const payload = {
+        username: document.getElementById('editUserName').value,
+        display_name: document.getElementById('editUserDisplayName').value,
+        role: document.getElementById('editUserRole').value,
+        active: document.getElementById('editUserActive').value,
+        po_auto_issue: document.getElementById('editUserPoAutoIssue').checked ? 1 : 0,
+      };
+      const password = document.getElementById('editUserPassword').value;
+      if (password) payload.password = password;
+      return payload;
+    }
+
+    function userEditorHasChanges() {
+      if (!editingAdminUser) return false;
+      const payload = editedUserPayload();
+      return payload.username !== (editingAdminUser.username || '')
+        || payload.display_name !== (editingAdminUser.display_name || '')
+        || payload.role !== editingAdminUser.role
+        || Number(payload.active) !== Number(editingAdminUser.active)
+        || payload.po_auto_issue !== Number(editingAdminUser.po_auto_issue || 0)
+        || Boolean(payload.password);
+    }
+
+    function closeUserEditor(discard = false) {
+      if (savingAdminUser) return false;
+      if (!discard && userEditorHasChanges() && !window.confirm('Discard unsaved changes for this user?')) return false;
+      document.getElementById('userEditor').close();
+      document.getElementById('userEditForm').reset();
+      hasUnsavedChanges = adminUserBeforeEdit?.unsaved || false;
+      hasNonPoUnsavedChanges = adminUserBeforeEdit?.nonPo || false;
+      editingAdminUser = null;
+      adminUserBeforeEdit = null;
+      return true;
+    }
+
+    function openUserEditor(id) {
+      const user = adminUsers.find(user => String(user.id) === String(id));
+      if (!user || state.currentUser?.role !== 'Admin') return;
+      editingAdminUser = user;
+      adminUserBeforeEdit = { unsaved: hasUnsavedChanges, nonPo: hasNonPoUnsavedChanges };
+      document.getElementById('userEditForm').reset();
+      document.getElementById('userEditorSubtitle').textContent = user.display_name || user.username;
+      document.getElementById('editUserName').value = user.username || '';
+      document.getElementById('editUserDisplayName').value = user.display_name || '';
+      const roles = rolePermissionsData?.roles || ['User','Read Only','TX/Read Only','Field PO','Admin'];
+      document.getElementById('editUserRole').innerHTML = roles.map(role => `<option ${user.role === role ? 'selected' : ''}>${htmlEscape(role)}</option>`).join('');
+      document.getElementById('editUserActive').value = String(Number(user.active));
+      document.getElementById('editUserPoAutoIssue').checked = Boolean(Number(user.po_auto_issue));
+      document.getElementById('editUserPasswordDetails').open = false;
+      document.getElementById('editUserPasswordStatus').textContent = Number(user.must_change_password) ? 'This user must change their password at next login.' : '';
+      document.getElementById('userEditorError').textContent = '';
+      document.getElementById('deleteEditedUser').hidden = String(user.id) === String(state.currentUser?.id);
+      document.getElementById('userEditor').showModal();
+      document.getElementById('editUserDisplayName').focus();
+    }
+
     async function loadUsers() {
       if (state.currentUser?.role !== 'Admin') return;
       if (!rolePermissionsData) rolePermissionsData = await api('/api/role-permissions');
-      const users = await api('/api/users');
-      const roleOptions = (rolePermissionsData?.roles || ['User','Read Only','TX/Read Only','Field PO','Admin']);
-      const usersCountEl = document.getElementById('usersCount');
-      if (usersCountEl) usersCountEl.textContent = `(${users.length} ${users.length === 1 ? 'user' : 'users'})`;
-      document.getElementById('usersTable').innerHTML = `
-        <thead><tr><th>Username</th><th>Name</th><th>Role</th><th>PO Trust</th><th>Status</th><th>Password</th><th></th></tr></thead>
-        <tbody>${users.map(u => `<tr data-user-row="${u.id}">
-          <td><input data-user-field="${u.id}" data-field="username" value="${htmlEscape(u.username || '')}" autocapitalize="none" autocorrect="off" spellcheck="false"></td>
-          <td><input data-user-field="${u.id}" data-field="display_name" value="${htmlEscape(u.display_name || '')}"></td>
-          <td><select data-user-role="${u.id}">${roleOptions.map(role => `<option ${u.role === role ? 'selected' : ''}>${htmlEscape(role)}</option>`).join('')}</select></td>
-          <td><label><input data-user-po-auto-issue="${u.id}" type="checkbox" ${Number(u.po_auto_issue || 0) ? 'checked' : ''}> Auto-issue</label></td>
-          <td><select data-user-active="${u.id}"><option value="1" ${u.active ? 'selected' : ''}>Active</option><option value="0" ${!u.active ? 'selected' : ''}>Inactive</option></select>${Number(u.must_change_password || 0) ? '<div class="muted">Must change password</div>' : ''}</td>
-          <td><input data-user-password="${u.id}" type="password" placeholder="New password optional"></td>
-          <td>
-            <button class="btn" data-save-user="${u.id}" type="button">Save</button>
-            ${String(state.currentUser?.id || '') === String(u.id) ? '<div class="muted" style="margin-top:6px">Current user</div>' : `<button class="btn danger" data-delete-user="${u.id}" data-delete-username="${htmlEscape(u.username || '')}" type="button" style="margin-top:6px">Delete</button>`}
-            <div class="bad" data-user-error="${u.id}" style="margin-top:6px"></div>
-          </td>
-        </tr>`).join('')}</tbody>`;
-      document.querySelectorAll('#usersTable [data-user-field], #usersTable [data-user-role], #usersTable [data-user-po-auto-issue], #usersTable [data-user-active], #usersTable [data-user-password]').forEach(el => {
-        const markRowDirty = () => {
-          el.closest('tr')?.classList.add('user-dirty');
-          hasUnsavedChanges = true;
-        };
-        el.oninput = markRowDirty;
-        el.onchange = markRowDirty;
-      });
-      document.querySelectorAll('[data-save-user]').forEach(btn => btn.onclick = async () => {
-        const id = btn.dataset.saveUser;
-        const row = btn.closest('tr');
-        const payload = {
-          username: row.querySelector(`[data-user-field="${id}"][data-field="username"]`)?.value || '',
-          display_name: row.querySelector(`[data-user-field="${id}"][data-field="display_name"]`)?.value || '',
-          role: row.querySelector(`[data-user-role="${id}"]`)?.value || 'User',
-          po_auto_issue: row.querySelector(`[data-user-po-auto-issue="${id}"]`)?.checked ? 1 : 0,
-          active: row.querySelector(`[data-user-active="${id}"]`)?.value || '1',
-        };
-        const password = row.querySelector(`[data-user-password="${id}"]`)?.value || '';
-        if (password) payload.password = password;
-        const errorEl = row.querySelector(`[data-user-error="${id}"]`);
-        if (errorEl) errorEl.textContent = '';
+      adminUsers = await api('/api/users');
+      const roleFilter = document.getElementById('usersRoleFilter');
+      const selectedRole = roleFilter.value;
+      const roles = rolePermissionsData?.roles || ['User','Read Only','TX/Read Only','Field PO','Admin'];
+      roleFilter.innerHTML = '<option value="">All roles</option>' + roles.map(role => `<option>${htmlEscape(role)}</option>`).join('');
+      roleFilter.value = roles.includes(selectedRole) ? selectedRole : '';
+      document.getElementById('usersSearch').oninput = renderUsers;
+      roleFilter.onchange = renderUsers;
+      document.getElementById('usersStatusFilter').onchange = renderUsers;
+      document.getElementById('clearUsersFilters').onclick = () => {
+        ['usersSearch','usersRoleFilter','usersStatusFilter'].forEach(id => { document.getElementById(id).value = ''; });
+        renderUsers();
+        document.getElementById('usersSearch').focus();
+      };
+      const trackUserEdit = () => {
+        hasUnsavedChanges = Boolean(adminUserBeforeEdit?.unsaved || userEditorHasChanges());
+      };
+      document.getElementById('userEditForm').oninput = trackUserEdit;
+      document.getElementById('userEditForm').onchange = trackUserEdit;
+      document.getElementById('cancelUserEditor').onclick = () => closeUserEditor();
+      document.getElementById('userEditor').oncancel = event => { event.preventDefault(); closeUserEditor(); };
+      document.getElementById('userEditForm').onsubmit = async event => {
+        event.preventDefault();
+        if (savingAdminUser || !editingAdminUser) return;
+        savingAdminUser = true;
+        const button = document.getElementById('saveEditedUser');
+        button.disabled = true;
+        button.textContent = 'Saving...';
+        document.getElementById('userEditorError').textContent = '';
         try {
-          await api(`/api/users/${id}`, { method:'PUT', body: JSON.stringify(payload) });
-        } catch (err) {
-          if (errorEl) errorEl.textContent = err.message || 'Could not save user.';
-          row.classList.add('user-dirty');
-          hasUnsavedChanges = true;
-          return;
-        }
-        row.querySelector(`[data-user-password="${id}"]`).value = '';
-        if (password) {
-          const statusCell = row.querySelector(`[data-user-active="${id}"]`)?.closest('td');
-          if (statusCell && !statusCell.querySelector('.muted')) statusCell.insertAdjacentHTML('beforeend', '<div class="muted">Must change password</div>');
-        }
-        row.classList.remove('user-dirty');
-        if (!document.querySelector('#usersTable tr.user-dirty')) markSaved();
-      });
-      document.querySelectorAll('[data-delete-user]').forEach(btn => btn.onclick = async () => {
-        const id = btn.dataset.deleteUser;
-        const username = btn.dataset.deleteUsername || 'this user';
-        if (!confirm(`Delete ${username}? This removes the account and signs them out everywhere.`)) return;
-        try {
-          await api(`/api/users/${id}`, { method:'DELETE' });
+          await api(`/api/users/${editingAdminUser.id}`, { method: 'PUT', body: JSON.stringify(editedUserPayload()) });
+          savingAdminUser = false;
+          closeUserEditor(true);
           await loadUsers();
         } catch (err) {
-          const row = btn.closest('tr');
-          const errorEl = row?.querySelector(`[data-user-error="${id}"]`);
-          if (errorEl) errorEl.textContent = err.message || 'Could not delete user.';
+          document.getElementById('userEditorError').textContent = err.message || 'Could not save user.';
+        } finally {
+          savingAdminUser = false;
+          button.disabled = false;
+          button.textContent = 'Save changes';
         }
-      });
+      };
+      document.getElementById('deleteEditedUser').onclick = async () => {
+        if (savingAdminUser || !editingAdminUser || String(editingAdminUser.id) === String(state.currentUser?.id)) return;
+        if (!window.confirm(`Delete ${editingAdminUser.username}? This removes the account and signs them out everywhere.`)) return;
+        savingAdminUser = true;
+        try {
+          await api(`/api/users/${editingAdminUser.id}`, { method: 'DELETE' });
+          savingAdminUser = false;
+          closeUserEditor(true);
+          await loadUsers();
+        } catch (err) {
+          document.getElementById('userEditorError').textContent = err.message || 'Could not delete user.';
+        } finally { savingAdminUser = false; }
+      };
+      renderUsers();
       renderRolePermissions();
     }
 
@@ -19444,59 +19747,6 @@ class Handler(BaseHTTPRequestHandler):
                         ),
                     ).rowcount
                 return json_response(self, {"updated": updated})
-            if parsed.path.startswith("/api/purchase-order-invoices/"):
-                actor = current_user(self)
-                if not can_edit_permission(actor, "po_review"):
-                    return json_response(self, {"error": "Office PO access required."}, 403)
-                invoice_id = parsed.path.rsplit("/", 1)[-1]
-                invoice_amount = money(data.get("invoice_amount"))
-                with db() as con:
-                    invoice = con.execute("SELECT * FROM purchase_order_invoices WHERE id = ?", (invoice_id,)).fetchone()
-                    if not invoice:
-                        return json_response(self, {"error": "PO invoice not found."}, 404)
-                    po = con.execute("SELECT * FROM purchase_orders WHERE id = ?", (invoice["po_id"],)).fetchone()
-                    if not po:
-                        return json_response(self, {"error": "PO not found."}, 404)
-                    cost_record_id = invoice["cost_record_id"]
-                    if invoice_amount:
-                        cost_record_id = sync_po_invoice_cost_record(
-                            con,
-                            po,
-                            invoice["invoice_file"],
-                            actor,
-                            invoice_amount,
-                            cost_record_id,
-                        )
-                    elif cost_record_id:
-                        con.execute("DELETE FROM cost_records WHERE id = ? AND raw_cost_source = 'PO invoice upload'", (cost_record_id,))
-                        cost_record_id = None
-                    con.execute(
-                        "UPDATE purchase_order_invoices SET invoice_amount = ?, cost_record_id = ? WHERE id = ?",
-                        (invoice_amount, cost_record_id, invoice_id),
-                    )
-                    con.execute(
-                        """
-                        UPDATE purchase_orders
-                        SET invoice_file = ?,
-                            invoice_uploaded_at = ?,
-                            invoice_uploaded_by_user_id = ?,
-                            invoice_uploaded_by_username = ?,
-                            invoice_cost_record_id = ?,
-                            updated_at = ?
-                        WHERE id = ?
-                        """,
-                        (
-                            invoice["invoice_file"],
-                            invoice["uploaded_at"],
-                            invoice["uploaded_by_user_id"],
-                            invoice["uploaded_by_username"],
-                            cost_record_id,
-                            datetime.now().isoformat(timespec="seconds"),
-                            po["id"],
-                        ),
-                    )
-                log_activity(actor, "updated PO vendor invoice amount", "Purchase Order", po["po_number"], {"invoice_file": invoice["invoice_file"], "invoice_amount": invoice_amount, "cost_record_id": cost_record_id})
-                return json_response(self, {"ok": True, "invoice_amount": invoice_amount, "cost_record_id": cost_record_id})
             if parsed.path == "/api/vendor-invoice/allocate":
                 actor = current_user(self)
                 project_id = data.get("project_id")
@@ -19636,6 +19886,59 @@ class Handler(BaseHTTPRequestHandler):
                 return json_response(self, {"error": "Login required"}, 401)
             if not require_editor(self):
                 return json_response(self, {"error": "Read-only users cannot make changes."}, 403)
+            if parsed.path.startswith("/api/purchase-order-invoices/"):
+                actor = current_user(self)
+                if not can_edit_permission(actor, "po_review"):
+                    return json_response(self, {"error": "Office PO access required."}, 403)
+                invoice_id = parsed.path.rsplit("/", 1)[-1]
+                invoice_amount = money(data.get("invoice_amount"))
+                with db() as con:
+                    invoice = con.execute("SELECT * FROM purchase_order_invoices WHERE id = ?", (invoice_id,)).fetchone()
+                    if not invoice:
+                        return json_response(self, {"error": "PO invoice not found."}, 404)
+                    po = con.execute("SELECT * FROM purchase_orders WHERE id = ?", (invoice["po_id"],)).fetchone()
+                    if not po:
+                        return json_response(self, {"error": "PO not found."}, 404)
+                    cost_record_id = invoice["cost_record_id"]
+                    if invoice_amount:
+                        cost_record_id = sync_po_invoice_cost_record(
+                            con,
+                            po,
+                            invoice["invoice_file"],
+                            actor,
+                            invoice_amount,
+                            cost_record_id,
+                        )
+                    elif cost_record_id:
+                        con.execute("DELETE FROM cost_records WHERE id = ? AND raw_cost_source = 'PO invoice upload'", (cost_record_id,))
+                        cost_record_id = None
+                    con.execute(
+                        "UPDATE purchase_order_invoices SET invoice_amount = ?, cost_record_id = ? WHERE id = ?",
+                        (invoice_amount, cost_record_id, invoice_id),
+                    )
+                    con.execute(
+                        """
+                        UPDATE purchase_orders
+                        SET invoice_file = ?,
+                            invoice_uploaded_at = ?,
+                            invoice_uploaded_by_user_id = ?,
+                            invoice_uploaded_by_username = ?,
+                            invoice_cost_record_id = ?,
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            invoice["invoice_file"],
+                            invoice["uploaded_at"],
+                            invoice["uploaded_by_user_id"],
+                            invoice["uploaded_by_username"],
+                            cost_record_id,
+                            datetime.now().isoformat(timespec="seconds"),
+                            po["id"],
+                        ),
+                    )
+                log_activity(actor, "updated PO vendor invoice amount", "Purchase Order", po["po_number"], {"invoice_file": invoice["invoice_file"], "invoice_amount": invoice_amount, "cost_record_id": cost_record_id})
+                return json_response(self, {"ok": True, "invoice_amount": invoice_amount, "cost_record_id": cost_record_id})
             if parsed.path.startswith("/api/users/"):
                 if not require_admin(self):
                     return json_response(self, {"error": "Admin required"}, 403)
@@ -19826,6 +20129,40 @@ class Handler(BaseHTTPRequestHandler):
                     log_activity(actor, action_detail[0], "Purchase Order", current_po["po_number"], action_detail[1])
                 log_activity(actor, "updated PO", "Purchase Order", current_po["po_number"], {"status": status, "vendor": vendor, "estimated_amount": money(data.get("estimated_amount"))})
                 return json_response(self, {"ok": True})
+            if re.fullmatch(r"/api/nte-additions/\d+", parsed.path):
+                actor = current_user(self)
+                if not can_edit_permission(actor, "nte_tracking"):
+                    return json_response(self, {"error": "T&M NTE edit access required."}, 403)
+                addition_id = parsed.path.rsplit("/", 1)[-1]
+                fields = ("labor_amount", "material_amount", "equipment_amount")
+                try:
+                    amounts = [float(data[field]) for field in fields]
+                    if any(not math.isfinite(value) for value in amounts):
+                        raise ValueError()
+                    amounts = [round(value, 2) for value in amounts]
+                except (KeyError, TypeError, ValueError, OverflowError):
+                    return json_response(self, {"error": "Enter valid Labor, Material, and Equipment amounts."}, 400)
+                total = round(sum(amounts), 2)
+                if not math.isfinite(total):
+                    return json_response(self, {"error": "The total addition is too large."}, 400)
+                if not total:
+                    return json_response(self, {"error": "The total addition must not be zero."}, 400)
+                with db() as con:
+                    addition = con.execute("SELECT * FROM nte_bucket_additions WHERE id = ?", (addition_id,)).fetchone()
+                    if not addition:
+                        return json_response(self, {"error": "NTE addition not found."}, 404)
+                    if addition["status"] != "Pending" or addition["signed_file"]:
+                        return json_response(self, {"error": "Only pending, unsigned additions can be corrected."}, 409)
+                    con.execute(
+                        "UPDATE nte_bucket_additions SET amount = ?, labor_amount = ?, material_amount = ?, equipment_amount = ? WHERE id = ?",
+                        (total, *amounts, addition_id),
+                    )
+                log_activity(actor, "corrected NTE budget addition amounts", "T&M NTE", str(addition["bucket_id"]), {
+                    "addition_id": addition_id,
+                    "before": {field: addition[field] for field in ("amount", *fields)},
+                    "after": dict(zip(("amount", *fields), (total, *amounts))),
+                })
+                return json_response(self, {"ok": True, "amount": total})
             if parsed.path.startswith("/api/nte-buckets/"):
                 actor = current_user(self)
                 if not can_edit_permission(actor, "nte_tracking"):
