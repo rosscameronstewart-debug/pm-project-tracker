@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Bought vs Sold Review — User Guide</title>
+<style>
+body{margin:0;background:#f2f5f9;color:#172638;font:16px/1.6 "Segoe UI",Arial,sans-serif}header{background:#172638;color:#fff;border-bottom:4px solid #e4b320;padding:24px max(24px,calc((100vw - 1040px)/2))}header p{margin:0;color:#ced9e5}h1{font-size:30px;margin:0 0 5px}h2{font-size:23px;line-height:1.3;margin-top:32px;border-top:1px solid #d9e1ea;padding-top:24px;scroll-margin-top:20px}h3{font-size:18px;margin-bottom:5px}main{max-width:1040px;margin:24px auto;padding:30px;background:#fff;border:1px solid #d9e1ea;border-radius:10px;box-sizing:border-box}a{color:#1764a7}p{margin:10px 0}li{margin:8px 0}table{border-collapse:collapse;width:100%;margin:16px 0;font-size:15px}th,td{padding:12px;vertical-align:top;text-align:left;border:1px solid #d9e1ea}th{background:#edf2f8}.note{background:#fff4cc;border-left:4px solid #dab02e;padding:14px 18px;margin:18px 0}.example{background:#edf5ff;border-left:4px solid #2974b8;padding:14px 18px;margin:16px 0}.toolbar{display:flex;gap:16px;align-items:center;flex-wrap:wrap;margin-bottom:18px}.button,button{font:inherit;padding:9px 14px;border:1px solid #b7c6d5;border-radius:6px;background:#edf4fb;color:#1764a7;text-decoration:none;cursor:pointer}.toc{columns:2;padding-left:22px}.small{font-size:14px;color:#52667b}.table-wrap{overflow:auto}@media(max-width:650px){main{padding:18px;margin:12px}.toc{columns:1}h1{font-size:25px}header{padding:20px}}@media print{body{background:white;font-size:11pt}header{background:white;color:#172638;padding:0 0 15px;border-bottom:2px solid #172638}header p{color:#52667b}main{border:0;padding:0;margin:20px 0;max-width:none}.toolbar{display:none}h2,h3{break-after:avoid}tr,.note,.example{break-inside:avoid}a{color:inherit}thead{display:table-header-group}@page{margin:18mm}}
+</style>
+</head>
+<body>
+<header><h1>Bought vs Sold Review</h1><p>User guide · Twin Peaks Electrical &amp; Automation · Updated October 27, 2026</p></header>
+<main>
+<div class="toolbar"><a class="button" href="/?tab=boughtVsSold">Open Bought vs Sold Review</a><button type="button" onclick="window.print()">Print / Save as PDF</button></div>
+<p>This page helps the office check whether material purchased on a PO invoice has been listed on a Field Wise ticket. It compares purchase items and quantities with eligible ticket items, keeps investigations organized, and carries unresolved purchases forward.</p>
+<div class="note"><strong>A possible match is a suggestion.</strong> A person must verify the units and confirm the quantity. “Not confirmed” does not prove the material was never sold. This review does not create customer invoices, change billing, or post accounting costs.</div>
+<nav aria-label="Guide contents"><strong>In this guide</strong><ol class="toc"><li><a href="#daily">Daily routine</a></li><li><a href="#scope">Which purchases appear</a></li><li><a href="#missing-invoices">POs without an invoice</a></li><li><a href="#uploads">Seven-day uploads and history</a></li><li><a href="#sold">What counts as sold</a></li><li><a href="#timing">The 1–3 day allowance</a></li><li><a href="#queues">Queues, counts and filters</a></li><li><a href="#matching">How matches are suggested</a></li><li><a href="#confirm">Confirming and undoing quantities</a></li><li><a href="#issues">Issue groups and statuses</a></li><li><a href="#exceptions">Exception messages</a></li><li><a href="#history">History, exports and permissions</a></li><li><a href="#offline">Live data, limits and backups</a></li></ol></nav>
+
+<h2 id="daily">1. Daily routine</h2>
+<ol>
+<li>Attach vendor invoices to their POs through <strong>Purchase Orders → Office PO Review</strong>. Check the PO's job and customer assignment. This comparison reads those attachments.</li>
+<li>Export the <strong>complete last seven days of Field Wise ticket lines</strong>, across the customers/jobs you intend to review. Include all ticket statuses and all line types. Do not narrow the export to only suspected missing material.</li>
+<li>Open <strong>Purchase Orders → Bought vs Sold Review</strong>. Choose the Excel file, set <strong>Export covers through</strong> to the final day actually covered, and select <strong>Import and compare</strong>. Use the export's coverage date, which may differ from its filename or the day you upload it.</li>
+<li>Review <strong>Open issues</strong>, <strong>Needs attention</strong>, and <strong>Overdue review</strong>. Open the invoice, check candidate ticket lines, confirm verified quantities, or flag an issue describing what needs investigation.</li>
+<li>Update investigation statuses and notes as work progresses. On the next day, upload another complete seven-day export. Unresolved purchases remain available; overlap does not add the same sales again.</li>
+</ol>
+<p><strong>Refresh</strong> checks the invoices currently attached in this application and recomputes the comparison against the already imported Field Wise history. Refresh does not fetch new Field Wise tickets; those require another export upload.</p>
+
+<h2 id="scope">2. Which purchases appear</h2>
+<p>The working queue starts with purchases dated <strong>October 27, 2026</strong> or later. It is a fixed starting date, not a rolling seven-day purchase cutoff. Unresolved purchases stay in scope as they get older.</p>
+<ul>
+<li>The comparison starts from <strong>invoice attachments on POs</strong>, not estimated PO amounts or manually entered PO descriptions.</li>
+<li>Each reliably extracted invoice item becomes a review row. An invoice without usable extracted items appears as one parsing placeholder, rather than an invented item.</li>
+<li>If the invoice date is missing or unreadable, an attachment uploaded on or after the starting date remains available for date review. Its upload date is not substituted for the purchase date.</li>
+<li>Once an unreadable date is corrected, a purchase dated before October 27 leaves this queue. Its original attachment is not deleted.</li>
+<li>Future invoice dates are flagged for review. PO status alone does not clear a material comparison: a closed or voided PO with an attached invoice can still appear when its purchase date is in scope.</li>
+</ul>
+<p>Parsing reads product codes, descriptions, quantities, costs and dates from supported invoice layouts. A missing file, unreadable scan or unsupported layout needs source review. A reconciled total is useful validation, but you should still inspect the item and its units before confirmation.</p>
+
+<h2 id="missing-invoices">3. POs without an invoice</h2>
+<div class="note"><strong>A PO with no attached invoice does not appear in this comparison.</strong> There is currently no “Missing invoice” queue here.</div>
+<p>Use <strong>Purchase Orders → Office PO Review</strong>, find the PO, and look for <strong>No vendor invoice</strong>. Upload the invoice there when it becomes available. Adjust the Office PO Review status filter, or check <strong>Closed POs</strong>, if the PO is outside the active list.</p>
+<p>A missing invoice means the purchase detail is unavailable. It is different from an attached invoice whose purchased quantity has not been confirmed against tickets.</p>
+
+<h2 id="uploads">4. Seven-day uploads and retained history</h2>
+<p>The selected through date and the preceding six calendar days define the import window. For example, a through date of October 27 covers October 21–27, inclusive.</p>
+<ul>
+<li>The same file for the same window is recognized as already loaded and adds no duplicate sales.</li>
+<li>Overlapping windows retain one active version of each ticket. Revised quantities, descriptions, jobs, customers or statuses replace that ticket's prior active version; history is retained.</li>
+<li>Repeated identical lines within a ticket are retained as separate lines. They are not automatically discarded as duplicates.</li>
+<li>A previously loaded ticket missing from a new <strong>complete</strong> export for its date window is marked inactive. This is why a partial, filtered or incomplete export can produce misleading results.</li>
+<li>Tickets outside the incoming window remain in history. They are not erased just because they leave the seven-day export.</li>
+<li>Rows outside the chosen window are rejected. A new export whose through date is older than the latest loaded window is also rejected to protect newer corrections. Historical backfill is not part of the normal daily upload.</li>
+</ul>
+<p>The application does not independently certify that an export includes every customer or ticket. The person uploading it must verify completeness. If an old ticket changes after it has left the seven-day window, that correction is not automatically fetched; flag it for a separately reviewed correction.</p>
+
+<h2 id="sold">5. What “sold” means in this review</h2>
+<p>Only ticket lines in <strong>Submitted, Approved, or Invoiced</strong> status are eligible for quantity confirmation. Draft, Awaiting Signature, Closed, and other statuses do not qualify under the selected business rule. They remain visible when relevant.</p>
+<p>“Sold” here means an eligible line is on a Field Wise ticket. A Submitted or Approved ticket is not proof that the customer has already been invoiced or paid. Ticket credits and returns require review.</p>
+<p>All uploaded line types are retained for history. Only a suitable material catalogue link creates a purchase-item candidate; a ticket being on the same job does not by itself establish that the purchase was sold.</p>
+
+<h2 id="timing">6. The 1–3 day allowance</h2>
+<p>The calculation uses <strong>calendar days</strong>, including weekends:</p>
+<div class="example"><strong>Age = latest covered sales date − invoice purchase date.</strong><br>Age 0–3 days: within the waiting allowance.<br>Age greater than 3 days: review any unconfirmed quantity, provided the necessary sales history is covered.</div>
+<p>The assessment stops at the latest loaded sales day that is not in the future. It does not assume what sold on a later day that has not been uploaded. Every calendar day from purchase through the assessment date must be covered before an overdue flag is shown.</p>
+<div class="example">Purchase October 27; loaded history through October 30: <strong>3 days, waiting</strong>.<br>Purchase October 27; complete history through October 31: <strong>4 days, needs review</strong> if quantity remains unconfirmed.<br>If any intervening day is missing, the result is <strong>Insufficient sales history</strong> instead.</div>
+<p>A purchase after the latest covered date needs a newer sales export. An unknown invoice date cannot be aged. Some over-three-day items first need a parsing, duplicate, credit or fee issue resolved. An active investigation takes priority in the queue display.</p>
+
+<h2 id="queues">7. Queues, counts and filters</h2>
+<div class="table-wrap"><table><thead><tr><th>Queue</th><th>What it contains</th></tr></thead><tbody>
+<tr><td>All purchases</td><td>Every in-scope purchase review row, including parsing placeholders.</td></tr>
+<tr><td>Waiting · 0–3 days</td><td>Rows within the allowance, with enough loaded history to assess their age.</td></tr>
+<tr><td>Overdue review</td><td>Rows older than three covered days with quantities still requiring confirmation.</td></tr>
+<tr><td>Needs attention</td><td>Other date, coverage, source or comparison conditions that need checking.</td></tr>
+<tr><td>Open issues</td><td>Rows with an investigation whose status is not Resolved. This takes priority over the other queues, even if its quantity has been confirmed.</td></tr>
+<tr><td>Confirmed sold</td><td>Fully confirmed quantities with no open investigation taking priority.</td></tr>
+</tbody></table></div>
+<p>Queue counts are <strong>review rows, not unique POs or dollars</strong>. A row is assigned to one queue other than All purchases. In Data coverage and comparison details, PO invoice records counts distinct in-scope attachments; ticket lines retained includes all imported line types; confirmed quantity links counts allocations, not units.</p>
+<p>Search checks PO number, job, vendor, item description and part code. Dropdowns filter review state, issue group, issue status and timing. Selecting a queue resets those dropdowns but keeps the search text. Clear the search if expected rows are hidden. The table shows up to 100 rows per page; use Previous and Next for more.</p>
+
+<h2 id="matching">8. How candidate matches are suggested</h2>
+<p>The review links the Field Wise item's exact catalogue label to its part number, then compares that part number with the invoice product code. Matching ignores letter case and normalizes spacing; DSG catalogue numbers printed as “Pn:” are handled explicitly when unambiguous.</p>
+<p>A confirmable candidate also needs the <strong>same PO job number and customer</strong>, an eligible sold status, and usable source quantities. Similar wording alone is not an automatic match. Missing catalogue links and different job/customer assignments remain review exceptions.</p>
+<p>Candidate ticket quantities can appear beside more than one purchase of the same part. They are <strong>not additive</strong> and have not been reserved merely because they are displayed.</p>
+<p>Purchase cost and ticket selling price are separate. Markup means they need not be equal. The comparison does not calculate markup or declare a match based on equal dollar values. A suggested line can still have a different quantity or unit basis.</p>
+
+<h2 id="confirm">9. Confirming quantities and undoing mistakes</h2>
+<ol>
+<li>Use <strong>Open invoice</strong> and inspect the source. Verify the candidate ticket number, job, customer, item, quantity and status.</li>
+<li>Select <strong>Review / confirm quantity</strong> on an eligible candidate row. Choose the specific ticket line.</li>
+<li>Enter the <strong>purchased quantity covered by this ticket</strong>. You can confirm part of a purchase and allocate the rest later.</li>
+<li>Enter the <strong>purchased units covered by one ticket unit</strong>, and describe the verified conversion in the notes. Do not assume a blank or unknown unit is “each.”</li>
+<li>Select <strong>Confirm quantity</strong>. The row shows confirmed and remaining unconfirmed purchased quantities.</li>
+</ol>
+<div class="example">If one ticket unit means one box containing 10 purchased pieces, enter <strong>10 purchased units per ticket unit</strong>. Confirming 20 purchased pieces consumes 2 ticket units.<br><strong>Ticket quantity consumed = purchased quantity confirmed ÷ purchased units per ticket unit.</strong></div>
+<p>The application prevents confirmation beyond the remaining purchase quantity and prevents using the same ticket quantity twice. It does not choose the allocation for you.</p>
+<p>Use <strong>Undo confirmation</strong> for a mistaken allocation. Its history remains. A changed source item, disallowed ticket status, or relevant ticket return can make a prior confirmation require rechecking. Moving between Submitted, Approved and Invoiced alone does not invalidate an otherwise unchanged line.</p>
+
+<h2 id="issues">10. Investigations, groups and statuses</h2>
+<p>Select <strong>Flag issue</strong>, enter a group and a clear description, choose a status, and add update notes. Groups are labels you type, such as “Missing on ticket,” “Wrong job,” “Quantity check,” or “Parser review.” They do not assign the issue to an employee.</p>
+<div class="table-wrap"><table><thead><tr><th>Status</th><th>How to use it</th></tr></thead><tbody><tr><td>Open</td><td>Identified and awaiting investigation.</td></tr><tr><td>In progress</td><td>Someone is actively checking the issue.</td></tr><tr><td>Waiting on information</td><td>Waiting for an invoice, ticket correction or other information.</td></tr><tr><td>Resolved</td><td>The investigation has been addressed. Record what was done in the notes.</td></tr></tbody></table></div>
+<p>Use <strong>Update issue</strong> to change the group, description, status or notes. If another review changed the same issue, saving is blocked until you refresh rather than overwriting that work.</p>
+<div class="note"><strong>Issue resolution and sold quantities are independent.</strong> Marking an issue Resolved does not mark its quantity sold. Confirming a quantity does not automatically resolve its investigation.</div>
+<p>If a source document or line changes, the original investigation remains under <strong>Issues with changed or unavailable source lines</strong>. Update that retained issue separately. Closing it does not transfer an old quantity confirmation to a replacement line.</p>
+
+<h2 id="exceptions">11. Common exception messages</h2>
+<div class="table-wrap"><table><thead><tr><th>Message or condition</th><th>Next action</th></tr></thead><tbody>
+<tr><td>Needs invoice parsing</td><td>Open the attachment. Check readability and whether its layout needs parser support. Do not enter an invented purchase item or quantity.</td></tr>
+<tr><td>Invoice lines do not reconcile</td><td>Check extracted items against the invoice total, including tax, shipping and fees.</td></tr>
+<tr><td>Needs invoice date review / future purchase date</td><td>Check the actual invoice date. A due date, upload date or incorrectly read future date must not start the aging clock.</td></tr>
+<tr><td>Outside accumulated sales coverage / insufficient history</td><td>Check the loaded dates and gaps. Upload the next complete daily export when appropriate. Do not infer an unsold purchase from absent history.</td></tr>
+<tr><td>Possible different job/customer</td><td>Verify the PO coding and the ticket. Correct the actual source or record an investigation; a possible match on another job cannot be confirmed here.</td></tr>
+<tr><td>Listed on ticket — status does not count as sold</td><td>Verify the ticket's real status. A future upload must show an eligible status before it qualifies.</td></tr>
+<tr><td>No exact item link</td><td>Inspect the part code, catalogue mapping and available tickets. No exact link is not proof that no sale exists.</td></tr>
+<tr><td>Duplicate document attachment</td><td>Check whether the same document was attached more than once before allocating quantities.</td></tr>
+<tr><td>Credit / return; ticket credit / return</td><td>Reconcile the credit or return against the original purchase and ticket before confirming a net quantity.</td></tr>
+<tr><td>Tax / freight / fee</td><td>Review separately from ordinary material quantities. These rows are not automatically matched as saleable pieces.</td></tr>
+</tbody></table></div>
+<p>Some source fixes require updating the PO, correcting Field Wise and uploading the revised export, or updating the parser/catalogue mapping. The issue form records the investigation; it does not edit source invoice text, dates or ticket lines.</p>
+
+<h2 id="history">12. History, exports and permissions</h2>
+<p><strong>Review history</strong> shows issue changes, quantity confirmations and reversals, with the reviewer and recorded time. The screen shows the latest 15 events; older events remain stored. Recent daily uploads shows the latest 30 imports, their covered windows and source row counts.</p>
+<p><strong>Export this view</strong> downloads the current queue/search/filter results as CSV, including all matching rows across pages. It includes purchase details, confirmed quantity, timing, review state and issue group/status/description. It is a report, not a restorable backup, and does not include the complete investigation history or all notes.</p>
+<p>This page uses <strong>Office PO Review</strong> access. Viewers can inspect and export. Editors can upload, confirm or undo quantities, and save issues. An administrator controls those permissions.</p>
+<p>Searching, changing filters and selecting queues do not alter purchase or ticket records. Saved investigations and confirmations persist across restarts. Discarding an unsaved issue draft loses that draft only; it does not erase its previously saved version.</p>
+
+<h2 id="offline">13. Live data, limits and backups</h2>
+<p>Open <strong>Purchase Orders → Bought vs Sold Review</strong> in the live Company Dashboard. The review reads invoice attachments from the server's current PO records when it loads or you select Refresh. Staff with permission use the same shared review history, investigations and quantity confirmations.</p>
+<p>Field Wise data still comes from the complete seven-day export uploaded by the office each day. The review does not connect directly to Field Wise. Check the latest loaded coverage date before drawing a conclusion about a purchase.</p>
+<p>The live application retains the fixed October 27, 2026 starting date. Deploying an update does not import a local trial database or replace live projects, POs, invoices or customer billing.</p>
+<p>Normal dashboard database backups include comparison history, investigations, confirmations and parser results. Original invoice attachments and uploaded Field Wise export files also need file backups. A database download alone does not package those files.</p>
+<p>This tool currently has no missing-invoice queue, automatic Field Wise connection, automatic customer billing, fuzzy match acceptance, automatic unit conversion, or automatic “everything is sold” conclusion. Where data is incomplete, keep a documented issue until the source can be checked.</p>
+<p class="small">Guide version: October 27, 2026. This document describes the current implementation; review it when the workflow changes.</p>
+</main>
+</body>
+</html>

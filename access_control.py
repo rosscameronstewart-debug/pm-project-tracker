@@ -6,10 +6,10 @@ PROJECT_READ = ('projects','project_setup','fieldwise','review_exceptions','vend
                 'customer_billing','customer_dashboard','nte_tracking','archived_projects')
 
 READ = {
+    'material-review': ('po_review',),
     'project-materials': ('projects','po_requests','po_review','vendor_invoices'),
     'job-order-report': ('job_order_report','po_requests','po_review'),
     'fieldwise-audit-omissions': ('fieldwise_audit',),
-    'po-invoice-audit-omissions': ('po_review',),
     'vendor-price-catalogs': ('vendor_price_catalog',),
     'fieldwise-parts-catalogs': ('vendor_price_catalog',),
     'fieldwise-parts': ('vendor_price_catalog','po_requests','po_review'),
@@ -26,10 +26,10 @@ READ = {
     'company-calendar': ('company_calendar',),
 }
 WRITE = {
+    'material-review': ('po_review',),
     'projects': ('project_setup',), 'subprojects': ('project_setup',), 'change-orders': ('project_setup',),
     'internal-rates': ('project_setup',), 'bids': ('bids',),
     'fieldwise-audit': ('fieldwise_audit',), 'fieldwise-audit-omissions': ('fieldwise_audit',),
-    'po-invoice-audit': ('po_review',), 'po-invoice-audit-omissions': ('po_review',),
     'vendor-price-catalogs': ('vendor_price_catalog',), 'fieldwise-parts-catalogs': ('vendor_price_catalog',),
     'import-fieldwise': ('fieldwise',), 'import-vendor-invoice': ('vendor_invoices',),
     'customer-invoices': ('customer_billing',), 'customer-invoice-allocations': ('customer_billing',),
@@ -55,6 +55,8 @@ def requirement(method, path, query=None):
         return ('admin',)
     if path in ('/nte-weekly-report','/nte-weekly-report.pdf','/nte-budget-addition-approval.pdf','/nte-budget-reallocation-approval.pdf'):
         return ('nte_tracking',) if method == 'GET' else ()
+    if path in ('/bought-vs-sold', '/bought-vs-sold-guide'):
+        return ('po_review',) if method == 'GET' else ()
     if not path.startswith('/api/'):
         return ()
     key = path.split('/')[2]

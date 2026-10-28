@@ -8,3 +8,8 @@ __pycache__/
 *.log
 .env
 .agents/
+# Local exports, copied data and research history are not application source.
+outputs/
+data-*/
+deliverables/
+Bakken Opportunity Alert/

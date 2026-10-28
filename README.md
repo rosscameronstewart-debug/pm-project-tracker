@@ -22,6 +22,9 @@ Then open:
 http://127.0.0.1:8765
 ```
 
+The daily **Purchase Orders → Bought vs Sold Review** workflow and the isolated
+offline launcher are documented in [Daily Bought vs Sold Review](docs/bought-vs-sold-review.md).
+
 ## Server Bind Address
 
 By default the app binds to `127.0.0.1` for local development.

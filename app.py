@@ -1,6 +1,5 @@
 import cgi
 import csv
-import difflib
 import hashlib
 import hmac
 import json
@@ -18,6 +17,7 @@ import time
 import traceback
 import company_calendar
 import project_materials
+import material_review
 import access_control
 import session_security
 from datetime import datetime, timedelta
@@ -2055,7 +2055,7 @@ def init_db():
               location TEXT,
               first_seen_ticket_date TEXT,
               last_seen_ticket_date TEXT,
-              source TEXT DEFAULT 'Field Wise PO Invoice Audit',
+              source TEXT DEFAULT 'Field Wise import',
               first_seen_at TEXT NOT NULL,
               last_seen_at TEXT NOT NULL,
               active INTEGER DEFAULT 1
@@ -2132,37 +2132,6 @@ def init_db():
               omitted_by_username TEXT,
               created_at TEXT NOT NULL,
               UNIQUE(ticket_number, order_number)
-            );
-
-            CREATE TABLE IF NOT EXISTS po_invoice_audit_omissions (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              ticket_number TEXT NOT NULL,
-              order_number TEXT NOT NULL,
-              customer TEXT,
-              project_name TEXT,
-              item TEXT,
-              description TEXT,
-              reason TEXT,
-              omitted_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-              omitted_by_username TEXT,
-              created_at TEXT NOT NULL,
-              UNIQUE(ticket_number, order_number, item, description)
-            );
-
-            CREATE TABLE IF NOT EXISTS po_invoice_audit_acceptances (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              audit_run_id TEXT NOT NULL,
-              ticket_number TEXT NOT NULL,
-              order_number TEXT NOT NULL,
-              customer TEXT,
-              project_name TEXT,
-              item TEXT,
-              description TEXT,
-              reason TEXT,
-              accepted_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-              accepted_by_username TEXT,
-              created_at TEXT NOT NULL,
-              UNIQUE(audit_run_id, ticket_number, order_number, item, description)
             );
 
             CREATE TABLE IF NOT EXISTS vendor_price_catalogs (
@@ -3074,409 +3043,6 @@ def fieldwise_audit_result(path):
     }
 
 
-def normalized_order_key(value):
-    return str(value or "").strip().upper()
-
-
-def material_match_words(value):
-    stop_words = {
-        "the", "and", "for", "with", "from", "field", "ticket", "material",
-        "invoice", "vendor", "po", "tpe", "each", "misc", "miscellaneous",
-    }
-    words = re.findall(r"[a-z0-9]+", str(value or "").lower())
-    return {w for w in words if len(w) >= 3 and w not in stop_words}
-
-
-def possible_fieldwise_material_matches(invoice, purchase_lines, limit=3):
-    invoice_text = " ".join(
-        str(invoice.get(k) or "")
-        for k in ("vendor", "description")
-    )
-    invoice_words = material_match_words(invoice_text)
-    if not invoice_words:
-        return []
-    invoice_norm = " ".join(sorted(invoice_words))
-    invoice_order_key = normalized_order_key(invoice.get("job_number"))
-    candidates = []
-    for line in purchase_lines:
-        if normalized_order_key(line.get("order_number")) == invoice_order_key:
-            continue
-        line_text = " ".join(str(line.get(k) or "") for k in ("item", "description"))
-        line_words = material_match_words(line_text)
-        if not line_words:
-            continue
-        shared = invoice_words & line_words
-        overlap = len(shared) / max(1, min(len(invoice_words), len(line_words)))
-        similarity = difflib.SequenceMatcher(None, invoice_norm, " ".join(sorted(line_words))).ratio()
-        amount_score = 0
-        invoice_amount = money(invoice.get("invoice_amount"))
-        line_amount = money(line.get("amount"))
-        if invoice_amount > 0 and line_amount > 0:
-            amount_score = max(0, 1 - abs(invoice_amount - line_amount) / max(invoice_amount, line_amount))
-        score = (overlap * 0.55) + (similarity * 0.35) + (amount_score * 0.10)
-        if score < 0.42 and len(shared) < 2:
-            continue
-        candidates.append({
-            **line,
-            "match_score": round(score, 3),
-            "shared_terms": ", ".join(sorted(shared)[:6]),
-        })
-    candidates.sort(key=lambda r: (r["match_score"], money(r.get("amount"))), reverse=True)
-    return candidates[:limit]
-
-
-def looks_like_purchase_material_line(item, description):
-    text = f"{item or ''} {description or ''}".lower()
-    if not text.strip():
-        return False
-    excluded = (
-        "foreman", "apprentice", "journeyman", "labor", "operator", "shop",
-        " reg", " ot", "regular time", "overtime", "work truck", "truck ",
-        " trailer", "rental", "equipment rental", "service call",
-    )
-    included = (
-        "wire", "cable", "conduit", "emt", "rigid", "pvc", "fitting",
-        "coupling", "connector", "anchor", "bracket", "strut", "panel",
-        "breaker", "mcc", "vfd", "drive", "meter", "lug", "pipe", "bolt",
-        "nut", "washer", "dottie", "curb", "light", "switch", "receptacle",
-        "material", "transformer", "disconnect",
-    )
-    if any(word in text for word in included):
-        return True
-    if any(word in text for word in excluded):
-        return False
-    return True
-
-
-def parse_fieldwise_po_invoice_export(path):
-    if openpyxl is None:
-        raise RuntimeError("Excel import needs openpyxl, but it is not available.")
-    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
-    ws = wb["LineItems"] if "LineItems" in wb.sheetnames else wb[wb.sheetnames[0]]
-    rows_iter = ws.iter_rows(values_only=True)
-    try:
-        headers = [str(v or "").strip() for v in next(rows_iter)]
-    except StopIteration:
-        return {"line_count": 0, "purchase_lines": [], "job_orders": []}
-    header_map = {h.lower(): i for i, h in enumerate(headers)}
-    required = ["customer name", "ticket date", "ticket number", "order number", "item", "description", "quantity", "rate", "sub total"]
-    missing = [h for h in required if h not in header_map]
-    if missing:
-        raise RuntimeError(f"Missing required Field Wise export columns: {', '.join(missing)}")
-
-    def cell(row, name):
-        idx = header_map.get(name.lower())
-        if idx is None or idx >= len(row):
-            return ""
-        return row[idx]
-
-    def optional_cell(row, names):
-        for name in names:
-            idx = header_map.get(name.lower())
-            if idx is not None and idx < len(row):
-                value = str(row[idx] or "").strip()
-                if value:
-                    return value
-        return ""
-
-    line_count = 0
-    purchase_lines = []
-    job_orders_by_number = {}
-    for row in rows_iter:
-        if not row or not any(row):
-            continue
-        line_count += 1
-        amount = money(cell(row, "sub total"))
-        ticket_number = str(cell(row, "ticket number") or "").strip()
-        order_number = str(cell(row, "order number") or "").strip()
-        item = str(cell(row, "item") or "").strip()
-        description = str(cell(row, "description") or "").strip()
-        customer = str(cell(row, "customer name") or "").strip()
-        ticket_date = date_text(cell(row, "ticket date"))
-        project_name = optional_cell(row, ("project name", "project", "location name", "job name"))
-        location = optional_cell(row, ("location", "location name", "ship to", "site"))
-        if order_number:
-            normalized_order = normalized_order_key(order_number)
-            existing = job_orders_by_number.setdefault(normalized_order, {
-                "order_number": order_number,
-                "customer": customer,
-                "project_name": project_name,
-                "location": location,
-                "first_seen_ticket_date": ticket_date,
-                "last_seen_ticket_date": ticket_date,
-            })
-            if customer and not existing["customer"]:
-                existing["customer"] = customer
-            if project_name and not existing["project_name"]:
-                existing["project_name"] = project_name
-            if location and not existing["location"]:
-                existing["location"] = location
-            if ticket_date:
-                if not existing["first_seen_ticket_date"] or ticket_date < existing["first_seen_ticket_date"]:
-                    existing["first_seen_ticket_date"] = ticket_date
-                if not existing["last_seen_ticket_date"] or ticket_date > existing["last_seen_ticket_date"]:
-                    existing["last_seen_ticket_date"] = ticket_date
-        if not ticket_number or not order_number or amount <= 0:
-            continue
-        if not looks_like_purchase_material_line(item, description):
-            continue
-        purchase_lines.append({
-            "ticket_number": ticket_number,
-            "order_number": order_number,
-            "customer": customer,
-            "ticket_date": ticket_date,
-            "status": str(cell(row, "status") or "").strip() if "status" in header_map else "",
-            "item": item,
-            "description": description,
-            "quantity": money(cell(row, "quantity")),
-            "rate": money(cell(row, "rate")),
-            "amount": amount,
-        })
-    return {"line_count": line_count, "purchase_lines": purchase_lines, "job_orders": list(job_orders_by_number.values())}
-
-
-def upsert_external_job_orders(con, job_orders):
-    now = datetime.now().isoformat(timespec="seconds")
-    added = 0
-    updated = 0
-    skipped_tracked = 0
-    for job in job_orders or []:
-        order_number = str(job.get("order_number") or "").strip()
-        if not order_number:
-            continue
-        tracked = con.execute(
-            """
-            SELECT 1
-            FROM (
-              SELECT job_number FROM subprojects
-              UNION ALL
-              SELECT job_number FROM change_orders
-            )
-            WHERE UPPER(TRIM(COALESCE(job_number, ''))) = ?
-            LIMIT 1
-            """,
-            (normalized_order_key(order_number),),
-        ).fetchone()
-        if tracked:
-            skipped_tracked += 1
-            continue
-        existing_external = con.execute(
-            "SELECT id FROM external_job_orders WHERE order_number = ?",
-            (order_number,),
-        ).fetchone()
-        con.execute(
-            """
-            INSERT INTO external_job_orders (
-              order_number, customer, project_name, location,
-              first_seen_ticket_date, last_seen_ticket_date,
-              first_seen_at, last_seen_at, active
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
-            ON CONFLICT(order_number) DO UPDATE SET
-              customer = COALESCE(NULLIF(excluded.customer, ''), external_job_orders.customer),
-              project_name = COALESCE(NULLIF(excluded.project_name, ''), external_job_orders.project_name),
-              location = COALESCE(NULLIF(excluded.location, ''), external_job_orders.location),
-              first_seen_ticket_date = CASE
-                WHEN external_job_orders.first_seen_ticket_date IS NULL OR external_job_orders.first_seen_ticket_date = '' THEN excluded.first_seen_ticket_date
-                WHEN excluded.first_seen_ticket_date IS NULL OR excluded.first_seen_ticket_date = '' THEN external_job_orders.first_seen_ticket_date
-                WHEN excluded.first_seen_ticket_date < external_job_orders.first_seen_ticket_date THEN excluded.first_seen_ticket_date
-                ELSE external_job_orders.first_seen_ticket_date
-              END,
-              last_seen_ticket_date = CASE
-                WHEN excluded.last_seen_ticket_date IS NULL OR excluded.last_seen_ticket_date = '' THEN external_job_orders.last_seen_ticket_date
-                WHEN external_job_orders.last_seen_ticket_date IS NULL OR external_job_orders.last_seen_ticket_date = '' THEN excluded.last_seen_ticket_date
-                WHEN excluded.last_seen_ticket_date > external_job_orders.last_seen_ticket_date THEN excluded.last_seen_ticket_date
-                ELSE external_job_orders.last_seen_ticket_date
-              END,
-              last_seen_at = excluded.last_seen_at,
-              active = 1
-            """,
-            (
-                order_number,
-                str(job.get("customer") or "").strip(),
-                str(job.get("project_name") or "").strip(),
-                str(job.get("location") or "").strip(),
-                str(job.get("first_seen_ticket_date") or "").strip(),
-                str(job.get("last_seen_ticket_date") or "").strip(),
-                now,
-                now,
-            ),
-        )
-        if existing_external:
-            updated += 1
-        else:
-            added += 1
-    return {"added": added, "updated": updated, "count": added + updated, "skipped_tracked": skipped_tracked}
-
-
-def po_invoice_audit_result(path, audit_run_id=None):
-    audit_run_id = audit_run_id or f"po-invoice-audit-{datetime.now().strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(4)}"
-    export = parse_fieldwise_po_invoice_export(path)
-    purchase_lines = export.get("purchase_lines", [])
-    with db() as con:
-        imported_job_orders = upsert_external_job_orders(con, export.get("job_orders", []))
-        acceptance_rows = con.execute(
-            """
-            SELECT *
-            FROM po_invoice_audit_acceptances
-            WHERE audit_run_id = ?
-            ORDER BY created_at DESC, ticket_number, order_number
-            """,
-            (audit_run_id,),
-        ).fetchall()
-        invoice_rows = con.execute(
-            """
-            SELECT
-              poi.id AS po_invoice_id,
-              poi.po_id,
-              poi.invoice_file,
-              COALESCE(poi.invoice_amount, 0) AS invoice_amount,
-              poi.uploaded_at,
-              po.po_number,
-              TRIM(COALESCE(po.job_number, '')) AS job_number,
-              po.job_label,
-              COALESCE(NULLIF(po.customer_name, ''), p.customer, '') AS customer,
-              COALESCE(p.name, po.job_label, '') AS project_name,
-              po.vendor,
-              po.description,
-              po.status,
-              COALESCE(sp.code, co.co_number, cg.name, '') AS reference_code,
-              CASE
-                WHEN sp.id IS NOT NULL THEN 'Subproject'
-                WHEN co.id IS NOT NULL THEN COALESCE(co.order_type, 'Change Order')
-                WHEN cg.id IS NOT NULL THEN 'COG'
-                ELSE 'PO'
-              END AS item_type
-            FROM purchase_orders po
-            JOIN purchase_order_invoices poi ON poi.po_id = po.id
-            LEFT JOIN projects p ON p.id = po.project_id
-            LEFT JOIN subprojects sp ON sp.id = po.subproject_id
-            LEFT JOIN change_orders co ON co.id = po.change_order_id
-            LEFT JOIN cog_categories cg ON cg.id = po.cog_category_id
-            WHERE COALESCE(poi.invoice_amount, 0) > 0
-              AND COALESCE(po.status, '') <> 'Voided'
-            ORDER BY poi.uploaded_at DESC, poi.id DESC
-            """
-        ).fetchall()
-
-    fieldwise_by_order = {}
-    for line in purchase_lines:
-        order_key = normalized_order_key(line.get("order_number"))
-        if not order_key:
-            continue
-        bucket = fieldwise_by_order.setdefault(order_key, {"count": 0, "amount": 0, "tickets": set(), "latest_date": ""})
-        bucket["count"] += 1
-        bucket["amount"] += money(line.get("amount"))
-        if line.get("ticket_number"):
-            bucket["tickets"].add(str(line.get("ticket_number")))
-        if str(line.get("ticket_date") or "") > bucket["latest_date"]:
-            bucket["latest_date"] = str(line.get("ticket_date") or "")
-    acceptances_by_key = {
-        "|".join([
-            normalized_order_key(r["ticket_number"]),
-            normalized_order_key(r["order_number"]),
-            str(r["item"] or "").strip().lower(),
-            str(r["description"] or "").strip().lower(),
-        ]): dict(r)
-        for r in acceptance_rows
-    }
-
-    needs_invoice = []
-    covered = []
-    omitted = []
-    po_job_keys = set()
-    for invoice_row in invoice_rows:
-        invoice = dict(invoice_row)
-        order_key = normalized_order_key(invoice.get("job_number"))
-        if order_key:
-            po_job_keys.add(order_key)
-        matched = fieldwise_by_order.get(order_key)
-        audit_ticket_number = f"{invoice.get('po_number') or ''}#{invoice.get('po_invoice_id') or ''}"
-        invoice_file = invoice.get("invoice_file") or ""
-        audit_row = {
-            "ticket_number": audit_ticket_number,
-            "display_ticket_number": invoice.get("po_number") or audit_ticket_number,
-            "order_number": invoice.get("job_number") or "",
-            "customer": invoice.get("customer") or "",
-            "project_name": invoice.get("project_name") or "",
-            "item_type": invoice.get("item_type") or "PO Invoice",
-            "reference_code": invoice.get("reference_code") or invoice_file,
-            "status": invoice.get("status") or "",
-            "ticket_date": str(invoice.get("uploaded_at") or "")[:10],
-            "item": invoice.get("vendor") or "",
-            "description": invoice.get("description") or invoice_file,
-            "quantity": int(matched["count"]) if matched else 0,
-            "rate": 0,
-            "amount": money(invoice.get("invoice_amount")),
-            "po_id": invoice.get("po_id"),
-            "po_invoice_id": invoice.get("po_invoice_id"),
-            "po_number": invoice.get("po_number") or "",
-            "po_invoice_file": invoice_file,
-            "po_uploaded_at": invoice.get("uploaded_at") or "",
-            "matched_fieldwise_count": int(matched["count"]) if matched else 0,
-            "matched_fieldwise_amount": money(matched["amount"]) if matched else 0,
-            "matched_fieldwise_tickets": ", ".join(sorted(matched["tickets"])) if matched else "",
-            "last_fieldwise_ticket_date": matched["latest_date"] if matched else "",
-        }
-        if matched:
-            covered.append(audit_row)
-            continue
-        possible_matches = possible_fieldwise_material_matches(invoice, purchase_lines)
-        audit_row["possible_fieldwise_matches"] = possible_matches
-        audit_row["possible_fieldwise_match_count"] = len(possible_matches)
-        if possible_matches:
-            audit_row["possible_fieldwise_match_summary"] = "; ".join(
-                [
-                    "Ticket {ticket} / Order {order} / {date} / {amount} ({terms})".format(
-                        ticket=m.get("ticket_number") or "",
-                        order=m.get("order_number") or "",
-                        date=m.get("ticket_date") or "",
-                        amount=f"${money(m.get('amount')):,.2f}",
-                        terms=m.get("shared_terms") or "similar text",
-                    )
-                    for m in possible_matches
-                ]
-            )
-        omit_key = "|".join([
-            normalized_order_key(audit_ticket_number),
-            order_key,
-            str(audit_row["item"] or "").strip().lower(),
-            str(audit_row["description"] or "").strip().lower(),
-        ])
-        acceptance = acceptances_by_key.get(omit_key)
-        if acceptance:
-            omitted.append({**audit_row, "acceptance_id": acceptance["id"], "omission_reason": acceptance["reason"] or "", "omitted_by_username": acceptance["accepted_by_username"] or "", "omitted_at": acceptance["created_at"] or ""})
-        else:
-            needs_invoice.append(audit_row)
-
-    untracked = [line for line in purchase_lines if normalized_order_key(line.get("order_number")) not in po_job_keys]
-    sort_key = lambda r: (str(r.get("project_name") or ""), str(r.get("order_number") or ""), str(r.get("ticket_number") or ""), str(r.get("item") or ""))
-    needs_invoice.sort(key=sort_key)
-    covered.sort(key=sort_key)
-    omitted.sort(key=sort_key)
-    untracked.sort(key=lambda r: (str(r.get("order_number") or ""), str(r.get("ticket_number") or "")))
-    return {
-        "audit_run_id": audit_run_id,
-        "summary": {
-            "export_line_count": export.get("line_count", 0),
-            "purchase_line_count": len(purchase_lines),
-            "po_invoice_count": len(invoice_rows),
-            "needs_invoice_count": len(needs_invoice),
-            "covered_count": len(covered),
-            "omitted_count": len(omitted),
-            "untracked_count": len(untracked),
-            "external_job_order_count": imported_job_orders["count"],
-            "external_job_order_added": imported_job_orders["added"],
-            "external_job_order_updated": imported_job_orders["updated"],
-            "external_job_order_skipped_tracked": imported_job_orders["skipped_tracked"],
-        },
-        "needs_invoice": needs_invoice,
-        "covered": covered[:250],
-        "omitted": omitted,
-        "untracked": untracked[:250],
-    }
-
-
 def normalized_header(value):
     return re.sub(r"[^a-z0-9]+", " ", str(value or "").strip().lower()).strip()
 
@@ -3789,7 +3355,7 @@ def job_reference_for_po(con, job_key):
               COALESCE(NULLIF(project_name, ''), 'Field Wise Import') AS project_name,
               '' AS project_code,
               source AS reference_code,
-              'Imported from daily Field Wise PO Invoice Audit export' AS description
+              'Imported Field Wise job order' AS description
             FROM external_job_orders
             WHERE id = ?
               AND COALESCE(active, 1) = 1
@@ -6833,6 +6399,42 @@ def parse_richland_pump_invoice(text):
             "total_due": total_due, "item_lines": item_lines}
 
 
+def parse_rj_mann_invoice(text):
+    """RJ Mann invoice table; never treat remaining balance as purchase cost."""
+    invoice_number = first_regex([r'Invoice\s+No\.?\s*:\s*([A-Za-z0-9.-]+)'], text, flags=re.IGNORECASE)
+    # Anchor Date, excluding Due Date and Ship Date in the same header.
+    invoice_date = date_text(first_regex([r'^.*?(?<!Due )(?<!Ship )\bDate:\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{4})'], text, flags=re.IGNORECASE | re.MULTILINE))
+    order_number = first_regex([r'RO\s*#\s+CUSTOMER\s+PO\s+CONTACT\s*\n\s*([A-Za-z0-9-]+)'], text, flags=re.IGNORECASE)
+    total_text = first_regex([r'Total\s+Invoice\s+Amount\s+(-?[0-9,]+\.[0-9]{2})'], text, flags=re.IGNORECASE)
+    subtotal_text = first_regex([r'\bSubtotal\s+(-?[0-9,]+\.[0-9]{2})'], text, flags=re.IGNORECASE)
+    tax_text = first_regex([r'^.*?\bTax\s+(-?[0-9,]+\.[0-9]{2})\s*$'], text, flags=re.IGNORECASE | re.MULTILINE)
+    table = re.search(r'QTY\.?\s+ITEM\s+DESCRIPTION\s+UNIT\s+PRICE\s+AMOUNT\s*\n(.+?)(?=\n[^\n]*(?:ATTENTION:\s*REMIT\s+TO:|\bSubtotal\b))', text, flags=re.IGNORECASE | re.DOTALL)
+    if not invoice_number or not invoice_date or not total_text or not subtotal_text or not table:
+        raise RuntimeError('RJ Mann invoice header, item table or totals could not be read. Review the invoice before importing.')
+    total_due, subtotal = parse_money_text(total_text), parse_money_text(subtotal_text)
+    tax = parse_money_text(tax_text) if tax_text else 0
+    row_pattern = re.compile(r'^(-?[0-9,]+(?:\.[0-9]+)?)\s+([A-Za-z0-9./_+-]+)\s+(.+?)\s+(-?[0-9,]+\.[0-9]{2,4})\s+(-?[0-9,]+\.[0-9]{2})$')
+    item_lines = []
+    for raw in table.group(1).splitlines():
+        line = raw.strip()
+        if not line or re.fullmatch(r'Page:\s*\d+\s+of\s+\d+', line, flags=re.IGNORECASE):
+            continue
+        match = row_pattern.fullmatch(line)
+        if not match:
+            raise RuntimeError('RJ Mann item row could not be read completely. Review the item before importing.')
+        qty_text, code, description, rate_text, amount_text = match.groups()
+        qty, rate, amount = parse_money_text(qty_text), parse_money_text(rate_text), parse_money_text(amount_text)
+        if not qty or abs(qty * rate - amount) > .02:
+            raise RuntimeError('RJ Mann item quantity and price do not reconcile. Review the invoice before importing.')
+        item_lines.append(dict(product_code=code, description=description, qty=qty, unit_price=rate, amount=amount))
+    if not item_lines or abs(sum(row['amount'] for row in item_lines) - subtotal) > .02 or abs(subtotal + tax - total_due) > .02:
+        raise RuntimeError('RJ Mann items, tax and invoice total do not reconcile. Review missing lines or charges before importing.')
+    if tax:
+        item_lines.append(dict(product_code='Sales Tax', description='Sales tax', qty=1, unit_price=tax, amount=tax))
+    return dict(vendor='RJ Mann & Associates, Inc.', invoice_number=invoice_number, invoice_date=invoice_date,
+                order_number=order_number, total_due=total_due, item_lines=item_lines)
+
+
 def parse_amazon_order_invoice(text):
     invoice_number = first_regex([
         r"Amazon\.com\s+order\s+number\s*:\s*([0-9]{3}-[0-9]{7}-[0-9]{7})",
@@ -6893,7 +6495,9 @@ def parse_amazon_order_invoice(text):
             "order_number": order_number, "total_due": total_due, "item_lines": item_lines}
 
 
-def import_vendor_invoice_pdf(path, project_id, preview_only=False):
+def import_vendor_invoice_pdf(path, project_id, preview_only=False, preview_details=False):
+    if preview_details:
+        preview_only = True
     if pdfplumber is None:
         raise RuntimeError("Vendor invoice PDF import needs pdfplumber, but it is not available.")
     text = extract_pdf_text(path)
@@ -6903,7 +6507,15 @@ def import_vendor_invoice_pdf(path, project_id, preview_only=False):
     source_file = Path(path).name
     lower = text.lower()
     compact_lower = re.sub(r"\s+", "", lower)
-    if re.search(r"final\s+details\s+for\s+order\s*#", lower) and "amazon.com" in lower:
+    if re.search(r'\br\.?\s*j\.?\s*mann\s*(?:&|and)\s*associates\b', lower):
+        rj_mann = parse_rj_mann_invoice(text)
+        vendor = rj_mann['vendor']
+        invoice_number = rj_mann['invoice_number']
+        invoice_date = rj_mann['invoice_date']
+        order_number = rj_mann['order_number']
+        total_due = rj_mann['total_due']
+        item_lines = rj_mann['item_lines']
+    elif re.search(r"final\s+details\s+for\s+order\s*#", lower) and "amazon.com" in lower:
         amazon = parse_amazon_order_invoice(text)
         vendor = amazon["vendor"]
         invoice_number = amazon["invoice_number"]
@@ -7362,8 +6974,18 @@ def import_vendor_invoice_pdf(path, project_id, preview_only=False):
             else:
                 ordered, description, shipped, price, extension = line
                 item = ''; qty = money(shipped or ordered)
-            parsed.append({'item':item,'description':description,'qty':qty,'unit':unit})
-        return {'items':parsed,'vendor':vendor,'invoice_number':invoice_number,'date':date_text(invoice_date)}
+            result_line = {'item':item,'description':description,'qty':qty,'unit':unit}
+            if preview_details:
+                line_amount = parse_money_text(line.get('amount', line.get('extension'))) if isinstance(line,dict) else parse_money_text(extension)
+                result_line.update(line_number=len(parsed)+1, amount=line_amount, unit_cost=(line_amount/qty if qty else 0))
+            parsed.append(result_line)
+        preview = {'items':parsed,'vendor':vendor,'invoice_number':invoice_number,'date':date_text(invoice_date)}
+        if preview_details:
+            line_total = sum(line['amount'] for line in parsed)
+            preview.update(order_reference=order_number,total_due=total_due,line_total=line_total,
+                           total_difference=round(total_due-line_total,2),
+                           parse_status='Reconciled lines' if parsed and abs(total_due-line_total)<=.02 else 'Needs parser review')
+        return preview
 
     matched_subproject = None
     if order_number:
@@ -8961,7 +8583,6 @@ HTML = r"""
           <button data-tab="fieldPoSearch" data-nav-area="po" data-nav-level="sub">PO Search</button>
           <button data-tab="officePo" data-nav-area="po" data-nav-level="sub">Office PO Review</button>
           <button data-tab="closedPo" data-nav-area="po" data-nav-level="sub">Closed POs</button>
-          <button data-tab="poInvoiceAudit" data-nav-area="po" data-nav-level="sub">Invoice Audit</button>
           <button data-tab="vendorPriceCatalog" data-nav-area="po" data-nav-level="sub">Price Catalog</button>
           <button data-tab="cogSetup" data-nav-area="po" data-nav-level="sub">COG's Setup</button>
         </div>
@@ -9093,23 +8714,6 @@ HTML = r"""
         <div class="muted" id="closedPoCount" style="margin-top:8px"></div>
         <div class="table-wrap" style="margin-top:10px"><table id="closedPoTable"></table></div>
       </div>
-    </section>
-
-    <section id="poInvoiceAudit" class="tab hidden">
-      <form class="panel" id="poInvoiceAuditForm">
-        <h2>PO Invoice Audit</h2>
-        <p class="muted">Upload the all-customer Field Wise line export to find uploaded PO vendor invoices that do not appear on Field Wise material lines yet.</p>
-        <label>Field Wise Ticket Export</label>
-        <input id="poInvoiceAuditFile" type="file" accept=".xlsx,.xlsm" required>
-        <div class="actions">
-          <button class="btn primary" type="submit">Run Audit</button>
-          <button class="btn" id="exportPoInvoiceAuditMissing" type="button" disabled>Export Missing Field Wise Lines</button>
-        </div>
-        <p id="poInvoiceAuditResult" class="muted"></p>
-        <div id="poInvoiceAuditSummary" class="grid cols-4" style="margin-top:12px"></div>
-        <div id="poInvoiceAuditTables" style="margin-top:12px"></div>
-        <div id="poInvoiceAuditOmissions" style="margin-top:12px"></div>
-      </form>
     </section>
 
     <section id="vendorPriceCatalog" class="tab hidden">
@@ -10171,8 +9775,6 @@ HTML = r"""
     let rolePermissionsData = null;
     let fieldWiseAuditData = null;
     let fieldWiseAuditOmissions = [];
-    let poInvoiceAuditData = null;
-    let poInvoiceAuditOmissions = [];
     let vendorPriceCatalogs = [];
     let fieldwisePartsCatalogs = [];
     const collapsedHierarchyNodes = new Set();
@@ -10284,7 +9886,6 @@ HTML = r"""
       fieldPoSearch: 'po_requests',
       officePo: 'po_review',
       closedPo: 'po_review',
-      poInvoiceAudit: 'po_review',
       vendorPriceCatalog: 'vendor_price_catalog',
       cogSetup: 'cog_setup',
       mccQuotes: 'mcc_quotes',
@@ -10491,7 +10092,7 @@ HTML = r"""
 
     function navOptionsForTab(tabName) {
       const projectTabs = ['projectMaterials','dashboard','newMasterProject','setup','import','review','invoices','billing','customerDashboard','nteTracking','projectPo','archivedProjects'];
-      const poTabs = ['fieldPoSearch','fieldPo','officePo','closedPo','poInvoiceAudit','vendorPriceCatalog','cogSetup'];
+      const poTabs = ['fieldPoSearch','fieldPo','officePo','closedPo','vendorPriceCatalog','cogSetup'];
       const quotingTabs = ['mccQuotes','mccQuoteSetup'];
       const homeTabs = ['home','bids','jobOrderReport','admin','activity'];
       if (projectTabs.includes(tabName)) return 'project';
@@ -10645,7 +10246,6 @@ HTML = r"""
       if (tabName === 'fieldPoSearch') loadFieldPoSearch();
       if (tabName === 'officePo') loadOfficePos();
       if (tabName === 'closedPo') loadClosedPos();
-      if (tabName === 'poInvoiceAudit') loadPoInvoiceAuditOmissions();
       if (tabName === 'vendorPriceCatalog') loadVendorPriceCatalogs();
       if (tabName === 'cogSetup') loadCogSetup();
       if (tabName === 'mccQuotes') loadMccQuoteBuilder();
@@ -12726,180 +12326,6 @@ HTML = r"""
       const a = document.createElement('a');
       a.href = url;
       a.download = `missing-fieldwise-tickets-${new Date().toISOString().slice(0,10)}.csv`;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
-    }
-
-    function poInvoiceAuditRowsTable(title, rows, emptyText, options={}) {
-      const shown = rows.slice(0, 300);
-      const showOmitAction = Boolean(options.showOmitAction);
-      const actionHeader = showOmitAction ? '<th>Action</th>' : '';
-      const omitRowPayload = row => htmlEscape(btoa(unescape(encodeURIComponent(JSON.stringify({
-        ticket_number: row.ticket_number || '',
-        order_number: row.order_number || '',
-        customer: row.customer || '',
-        project_name: row.project_name || '',
-        item: row.item || '',
-        description: row.description || ''
-      })))));
-      return `<div class="panel" style="margin-top:14px">
-        <h2>${htmlEscape(title)}</h2>
-        <div class="muted">${rows.length} line(s)${rows.length > shown.length ? `, showing first ${shown.length}` : ''}</div>
-        <div class="table-wrap" style="margin-top:10px"><table>${shown.length ? `<thead><tr><th>PO / Ticket</th><th>Job / Order</th><th>Customer</th><th>Project</th><th>Vendor / Item</th><th>Description</th><th>Date</th><th>Matches</th><th>Possible Elsewhere</th><th>Amount</th>${actionHeader}</tr></thead><tbody>${shown.map(r => `
-          <tr>
-            <td><strong>${htmlEscape(r.display_ticket_number || r.po_number || r.ticket_number || '')}</strong>${r.po_invoice_file ? `<div><a class="pdf-link" href="/uploads/${encodeURIComponent(r.po_invoice_file)}" target="_blank" rel="noopener">Open Invoice</a></div>` : ''}</td>
-            <td>${htmlEscape(r.order_number || '')}</td>
-            <td>${htmlEscape(r.customer || '')}</td>
-            <td>${htmlEscape(r.project_name || '')}<div class="muted">${htmlEscape(r.reference_code || '')}</div></td>
-            <td>${htmlEscape(r.item || '')}</td>
-            <td>${htmlEscape(r.description || '')}</td>
-            <td>${htmlEscape(r.ticket_date || '')}</td>
-            <td>${Number(r.matched_fieldwise_count ?? r.quantity ?? 0).toLocaleString()}${r.matched_fieldwise_tickets ? `<div class="muted">${htmlEscape(r.matched_fieldwise_tickets)}</div>` : ''}</td>
-            <td>${r.possible_fieldwise_match_summary ? `<span class="warn">Maybe</span><div class="muted">${htmlEscape(r.possible_fieldwise_match_summary)}</div>` : '<span class="muted">None</span>'}</td>
-            <td>${money(r.amount || 0)}</td>
-            ${showOmitAction ? `<td><button class="btn" type="button" data-omit-po-invoice-row="${omitRowPayload(r)}">Accept For This Audit</button></td>` : ''}
-          </tr>`).join('')}</tbody>` : `<tbody><tr><td>${htmlEscape(emptyText)}</td></tr></tbody>`}</table></div>
-      </div>`;
-    }
-
-    function renderPoInvoiceAuditOmissions() {
-      const el = document.getElementById('poInvoiceAuditOmissions');
-      if (!el) return;
-      const rows = poInvoiceAuditOmissions || [];
-      el.innerHTML = `<div class="panel">
-        <h2>Accepted PO Invoice Audit Lines</h2>
-        <p class="muted">These PO invoice lines are accepted only for the audit run they were marked in. Future imports can flag the same PO again.</p>
-        <div class="table-wrap" style="margin-top:10px"><table>${rows.length ? `<thead><tr><th>Audit Run</th><th>PO</th><th>Job / Order</th><th>Customer</th><th>Project</th><th>Vendor</th><th>Reason</th><th>Accepted By</th><th>Date</th><th></th></tr></thead><tbody>${rows.map(r => `
-          <tr>
-            <td>${htmlEscape(r.audit_run_id || '')}</td>
-            <td><strong>${htmlEscape(r.ticket_number || '')}</strong></td>
-            <td>${htmlEscape(r.order_number || '')}</td>
-            <td>${htmlEscape(r.customer || '')}</td>
-            <td>${htmlEscape(r.project_name || '')}</td>
-            <td>${htmlEscape(r.item || '')}</td>
-            <td>${htmlEscape(r.reason || '')}</td>
-            <td>${htmlEscape(r.accepted_by_username || r.omitted_by_username || '')}</td>
-            <td>${htmlEscape((r.created_at || '').replace('T', ' '))}</td>
-            <td><button class="btn danger" type="button" data-delete-po-invoice-omission="${r.id}">Remove</button></td>
-          </tr>`).join('')}</tbody>` : '<tbody><tr><td>No PO invoice audit lines have been accepted yet.</td></tr></tbody>'}</table></div>
-      </div>`;
-      document.querySelectorAll('[data-delete-po-invoice-omission]').forEach(btn => btn.onclick = async () => {
-        if (!window.confirm('Remove this accepted audit note? The line can show as missing again if this audit is reviewed.')) return;
-        await api(`/api/po-invoice-audit-omissions/${btn.dataset.deletePoInvoiceOmission}`, { method: 'DELETE' });
-        await loadPoInvoiceAuditOmissions();
-      });
-    }
-
-    async function loadPoInvoiceAuditOmissions() {
-      poInvoiceAuditOmissions = await api('/api/po-invoice-audit-omissions');
-      renderPoInvoiceAuditOmissions();
-    }
-
-    async function markPoInvoiceLineOmitted(row) {
-      const reason = await requestAuditReason({
-        title: 'Accept For This Audit',
-        message: `Why is PO ${row.display_ticket_number || row.po_number || row.ticket_number} / job ${row.order_number} OK for this audit without a matching Field Wise material line?`,
-        defaultReason: 'Not billable on this audit period'
-      });
-      if (reason === null) return;
-      await api('/api/po-invoice-audit-omissions', {
-        method: 'POST',
-        body: JSON.stringify({
-          audit_run_id: poInvoiceAuditData?.audit_run_id || '',
-          ticket_number: row.ticket_number,
-          order_number: row.order_number,
-          customer: row.customer,
-          project_name: row.project_name,
-          item: row.item,
-          description: row.description,
-          reason
-        })
-      });
-      if (poInvoiceAuditData?.needs_invoice) {
-        poInvoiceAuditData.needs_invoice = poInvoiceAuditData.needs_invoice.filter(r => !(
-          String(r.ticket_number || '') === String(row.ticket_number || '')
-          && String(r.order_number || '') === String(row.order_number || '')
-          && String(r.item || '') === String(row.item || '')
-          && String(r.description || '') === String(row.description || '')
-        ));
-        if (poInvoiceAuditData.summary) {
-          poInvoiceAuditData.summary.needs_invoice_count = Math.max(0, Number(poInvoiceAuditData.summary.needs_invoice_count || 0) - 1);
-          poInvoiceAuditData.summary.omitted_count = Number(poInvoiceAuditData.summary.omitted_count || 0) + 1;
-        }
-        renderPoInvoiceAudit();
-      }
-      await loadPoInvoiceAuditOmissions();
-    }
-
-    function renderPoInvoiceAudit() {
-      const result = poInvoiceAuditData;
-      const summaryEl = document.getElementById('poInvoiceAuditSummary');
-      const tablesEl = document.getElementById('poInvoiceAuditTables');
-      const exportBtn = document.getElementById('exportPoInvoiceAuditMissing');
-      if (!result) {
-        summaryEl.innerHTML = '';
-        tablesEl.innerHTML = '';
-        exportBtn.disabled = true;
-        return;
-      }
-      const s = result.summary || {};
-      summaryEl.innerHTML = [
-        ['PO Invoices', s.po_invoice_count || 0, 'Uploaded PO vendor invoices scanned'],
-        ['Missing Field Wise', s.needs_invoice_count || 0, 'PO invoices not found on Field Wise material lines'],
-        ['Covered', s.covered_count || 0, 'Job/order found on Field Wise export'],
-        ['Accepted', s.omitted_count || 0, 'Accepted for this audit only']
-      ].map(([label, value, hint]) => `<div class="kpi"><div class="label">${htmlEscape(label)}</div><div class="value">${value}</div><div class="hint">${htmlEscape(hint)}</div></div>`).join('');
-      tablesEl.innerHTML = [
-        poInvoiceAuditRowsTable('PO Vendor Invoices Missing Field Wise Material', result.needs_invoice || [], 'No PO vendor invoices are missing from Field Wise material lines.', { showOmitAction: true }),
-        poInvoiceAuditRowsTable('Accepted In This Audit', result.omitted || [], 'No lines have been accepted for this audit yet.'),
-        poInvoiceAuditRowsTable('PO Vendor Invoices Found On Field Wise', result.covered || [], 'No covered PO invoices found.'),
-        poInvoiceAuditRowsTable('Field Wise Material Without Matching PO', result.untracked || [], 'No Field Wise material lines are missing a matching PO.')
-      ].join('');
-      document.querySelectorAll('[data-omit-po-invoice-row]').forEach(btn => btn.onclick = async () => {
-        try {
-          const row = JSON.parse(decodeURIComponent(escape(atob(btn.dataset.omitPoInvoiceRow || ''))));
-          if (!row?.ticket_number || !row?.order_number) {
-            throw new Error('This audit row is missing a ticket or order number.');
-          }
-          await markPoInvoiceLineOmitted(row);
-        } catch (err) {
-          alert(err.message || 'Could not mark this line OK.');
-        }
-      });
-      exportBtn.disabled = !(result.needs_invoice || []).length;
-      enableResizableTables(document.getElementById('poInvoiceAudit'));
-    }
-
-    function downloadPoInvoiceAuditCsv() {
-      if (!poInvoiceAuditData?.needs_invoice?.length) return;
-      const headers = ['PO Number','Job / Order','Customer','Project','Type','Reference','Invoice Date','Vendor','Description','Invoice File','Invoice Amount','Field Wise Matches','Field Wise Tickets','Field Wise Amount','Possible Field Wise Match'];
-      const lines = [headers.map(csvCell).join(',')];
-      poInvoiceAuditData.needs_invoice.forEach(r => {
-        lines.push([
-          r.display_ticket_number || r.po_number || r.ticket_number,
-          r.order_number,
-          r.customer,
-          r.project_name,
-          r.item_type,
-          r.reference_code,
-          r.ticket_date,
-          r.item,
-          r.description,
-          r.po_invoice_file || '',
-          r.amount || 0,
-          r.matched_fieldwise_count || 0,
-          r.matched_fieldwise_tickets || '',
-          r.matched_fieldwise_amount || 0,
-          r.possible_fieldwise_match_summary || ''
-        ].map(csvCell).join(','));
-      });
-      const blob = new Blob([lines.join('\r\n')], { type: 'text/csv' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `po-invoice-audit-missing-${new Date().toISOString().slice(0,10)}.csv`;
       document.body.appendChild(a);
       a.click();
       a.remove();
@@ -16489,29 +15915,6 @@ HTML = r"""
     };
     document.getElementById('omitUntrackedAuditTickets').onchange = () => renderFieldWiseAudit();
     document.getElementById('exportMissingTickets').onclick = () => downloadMissingTicketCsv();
-    document.getElementById('poInvoiceAuditForm').onsubmit = async e => {
-      e.preventDefault();
-      const fileInput = e.target.querySelector('input[type="file"]');
-      const resultEl = document.getElementById('poInvoiceAuditResult');
-      if (!fileInput.files.length) {
-        resultEl.textContent = 'Choose the Field Wise ticket export first.';
-        return;
-      }
-      resultEl.textContent = 'Running PO invoice audit...';
-      const data = new FormData();
-      data.append('file', fileInput.files[0]);
-      try {
-        poInvoiceAuditData = await api('/api/po-invoice-audit', { method: 'POST', body: data });
-        const s = poInvoiceAuditData.summary || {};
-        resultEl.textContent = `Audit complete. Material lines needing PO invoice review: ${s.needs_invoice_count || 0}. Covered by PO invoice uploads: ${s.covered_count || 0}. Imported job orders: ${s.external_job_order_added || 0} new, ${s.external_job_order_updated || 0} updated.`;
-        renderPoInvoiceAudit();
-      } catch (err) {
-        poInvoiceAuditData = null;
-        renderPoInvoiceAudit();
-        resultEl.textContent = `Audit failed: ${err.message}`;
-      }
-    };
-    document.getElementById('exportPoInvoiceAuditMissing').onclick = () => downloadPoInvoiceAuditCsv();
     document.getElementById('vendorPriceCatalogForm').onsubmit = async e => {
       e.preventDefault();
       const resultEl = document.getElementById('vendorPriceCatalogResult');
@@ -16711,6 +16114,7 @@ HTML = r"""
 
 
 HTML = company_calendar.integrate(HTML)
+HTML = material_review.integrate(HTML)
 HTML = HTML.replace('</script>', project_materials.SCRIPT+'</script>', 1)
 
 
@@ -16768,6 +16172,8 @@ class Handler(BaseHTTPRequestHandler):
                 return download_response(self, sqlite_backup_bytes(), filename, "application/vnd.sqlite3")
             if parsed.path == "/":
                 return text_response(self, HTML)
+            if parsed.path in ("/bought-vs-sold", "/bought-vs-sold-guide", "/api/material-review"):
+                return material_review.handle(sys.modules[__name__], self, parsed.path, user)
             if parsed.path == "/api/company-calendar":
                 if not can_view_permission(user, "company_calendar"):
                     return json_response(self, {"error": "Work Calendar access required."}, 403)
@@ -16941,7 +16347,7 @@ class Handler(BaseHTTPRequestHandler):
                           COALESCE(NULLIF(ejo.project_name, ''), 'Field Wise Import') AS project_name,
                           '' AS project_code,
                           ejo.source AS reference_code,
-                          'Imported from daily Field Wise PO Invoice Audit export' AS description,
+                          'Imported Field Wise job order' AS description,
                           '' AS project_description,
                           ejo.location,
                           'Imported' AS status
@@ -16961,20 +16367,6 @@ class Handler(BaseHTTPRequestHandler):
                         SELECT *
                         FROM fieldwise_audit_omissions
                         ORDER BY created_at DESC, ticket_number, order_number
-                        """
-                    ),
-                )
-            if parsed.path == "/api/po-invoice-audit-omissions":
-                if not can_view_permission(user, "po_review"):
-                    return json_response(self, {"error": "PO review access required."}, 403)
-                return json_response(
-                    self,
-                    rows(
-                        """
-                        SELECT *
-                        FROM po_invoice_audit_acceptances
-                        ORDER BY created_at DESC, ticket_number, order_number
-                        LIMIT 500
                         """
                     ),
                 )
@@ -17493,6 +16885,8 @@ class Handler(BaseHTTPRequestHandler):
                 return logout_response(self)
             if not current_user(self):
                 return json_response(self, {"error": "Login required"}, 401)
+            if parsed.path in ("/api/material-review/upload", "/api/material-review/confirm", "/api/material-review/issue", "/api/material-review/unconfirm"):
+                return material_review.handle(sys.modules[__name__], self, parsed.path, current_user(self))
             if parsed.path == "/api/company-calendar":
                 actor = current_user(self)
                 if not can_edit_permission(actor, "company_calendar"):
@@ -18739,54 +18133,6 @@ class Handler(BaseHTTPRequestHandler):
                     )
                 log_activity(user, "marked ticket OK to omit", "Field Wise Audit", f"{ticket_number} / {order_number}", {"customer": data.get("customer"), "project_name": data.get("project_name"), "reason": data.get("reason")})
                 return json_response(self, {"ok": True})
-            if parsed.path == "/api/po-invoice-audit-omissions":
-                user = current_user(self)
-                if not can_edit_permission(user, "po_review"):
-                    return json_response(self, {"error": "PO review edit access required."}, 403)
-                data = parse_json(self)
-                audit_run_id = str(data.get("audit_run_id") or "").strip()
-                ticket_number = str(data.get("ticket_number") or "").strip()
-                order_number = str(data.get("order_number") or "").strip()
-                item = str(data.get("item") or "").strip()
-                description = str(data.get("description") or "").strip()
-                if not audit_run_id:
-                    return json_response(self, {"error": "Run the audit again before accepting a line."}, 400)
-                if not ticket_number:
-                    return json_response(self, {"error": "Ticket number is required."}, 400)
-                if not order_number:
-                    return json_response(self, {"error": "Order number is required."}, 400)
-                with db() as con:
-                    con.execute(
-                        """
-                        INSERT INTO po_invoice_audit_acceptances (
-                          audit_run_id, ticket_number, order_number, customer, project_name, item, description, reason,
-                          accepted_by_user_id, accepted_by_username, created_at
-                        )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(audit_run_id, ticket_number, order_number, item, description) DO UPDATE SET
-                          customer = excluded.customer,
-                          project_name = excluded.project_name,
-                          reason = excluded.reason,
-                          accepted_by_user_id = excluded.accepted_by_user_id,
-                          accepted_by_username = excluded.accepted_by_username,
-                          created_at = excluded.created_at
-                        """,
-                        (
-                            audit_run_id,
-                            ticket_number,
-                            order_number,
-                            str(data.get("customer") or "").strip(),
-                            str(data.get("project_name") or "").strip(),
-                            item,
-                            description,
-                            str(data.get("reason") or "").strip(),
-                            user["id"],
-                            user["username"],
-                            datetime.now().isoformat(timespec="seconds"),
-                        ),
-                    )
-                log_activity(user, "accepted PO invoice audit line", "Purchase Orders", f"{ticket_number} / {order_number}", {"audit_run_id": audit_run_id, "item": item, "reason": data.get("reason")})
-                return json_response(self, {"ok": True})
             if parsed.path == "/api/fieldwise-audit":
                 form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": self.headers.get("Content-Type")})
                 file_item = form["file"] if "file" in form else None
@@ -18805,30 +18151,6 @@ class Handler(BaseHTTPRequestHandler):
                         path.unlink()
                     except Exception:
                         pass
-                return json_response(self, result)
-            if parsed.path == "/api/po-invoice-audit":
-                user = current_user(self)
-                if not can_view_permission(user, "po_review"):
-                    return json_response(self, {"error": "PO review access required."}, 403)
-                form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": self.headers.get("Content-Type")})
-                file_item = form["file"] if "file" in form else None
-                if file_item is None or not getattr(file_item, "filename", ""):
-                    return json_response(self, {"error": "Choose a Field Wise ticket export."}, 400)
-                safe_name = Path(file_item.filename).name
-                if Path(safe_name).suffix.lower() not in (".xlsx", ".xlsm"):
-                    return json_response(self, {"error": "PO invoice audit export must be an Excel file."}, 400)
-                path = UPLOAD_DIR / f"{datetime.now().strftime('%Y%m%d%H%M%S')}-po-invoice-audit-{safe_name}"
-                with open(path, "wb") as f:
-                    f.write(file_item.file.read())
-                try:
-                    audit_run_id = f"{datetime.now().strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(4)}"
-                    result = po_invoice_audit_result(path, audit_run_id)
-                finally:
-                    try:
-                        path.unlink()
-                    except Exception:
-                        pass
-                log_activity(user, "ran PO invoice audit", "Purchase Orders", safe_name, {**result.get("summary", {}), "audit_run_id": result.get("audit_run_id")})
                 return json_response(self, result)
             if parsed.path == "/api/vendor-price-catalogs":
                 actor = current_user(self)
@@ -20983,18 +20305,6 @@ class Handler(BaseHTTPRequestHandler):
                 if not deleted:
                     return json_response(self, {"error": "Omission note not found."}, 404)
                 log_activity(current_user(self), "removed OK-to-omit note", "Field Wise Audit", f"{omission['ticket_number']} / {omission['order_number']}" if omission else omission_id)
-                return json_response(self, {"ok": True})
-            if parsed.path.startswith("/api/po-invoice-audit-omissions/"):
-                actor = current_user(self)
-                if not can_edit_permission(actor, "po_review"):
-                    return json_response(self, {"error": "PO review edit access required."}, 403)
-                omission_id = parsed.path.rsplit("/", 1)[-1]
-                with db() as con:
-                    omission = con.execute("SELECT * FROM po_invoice_audit_acceptances WHERE id = ?", (omission_id,)).fetchone()
-                    deleted = con.execute("DELETE FROM po_invoice_audit_acceptances WHERE id = ?", (omission_id,)).rowcount
-                if not deleted:
-                    return json_response(self, {"error": "PO invoice audit acceptance note not found."}, 404)
-                log_activity(actor, "removed PO invoice audit acceptance", "Purchase Orders", f"{omission['ticket_number']} / {omission['order_number']}" if omission else omission_id)
                 return json_response(self, {"ok": True})
             if parsed.path.startswith("/api/vendor-price-catalogs/"):
                 actor = current_user(self)
