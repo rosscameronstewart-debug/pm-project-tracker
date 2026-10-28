@@ -6,6 +6,7 @@ from accounting data, under the same data directory as the application database.
 import cgi
 import hashlib
 import json
+import re
 import sqlite3
 import threading
 from collections import Counter
@@ -235,13 +236,61 @@ def handle(app, handler, path, user):
         return app.json_response(handler, {'error': str(exc)}, getattr(exc, 'status', 400))
 
 
+def _scope_review_css(css):
+    """Scope our small stylesheet, including its media queries, to this tab."""
+    result = []
+    offset = 0
+    while offset < len(css):
+        start = css.find('{', offset)
+        if start < 0:
+            break
+        selector = css[offset:start].strip()
+        depth = 1
+        end = start + 1
+        while depth and end < len(css):
+            depth += (css[end] == '{') - (css[end] == '}')
+            end += 1
+        if depth:
+            raise ValueError('Unbalanced review stylesheet')
+        body = css[start + 1:end - 1]
+        if selector.startswith('@media'):
+            result.append(selector + '{' + _scope_review_css(body) + '}')
+        else:
+            selectors = ['#boughtVsSold' if s.strip() == 'body' else '#boughtVsSold ' + s.strip()
+                         for s in selector.split(',')]
+            result.append(','.join(selectors) + '{' + body + '}')
+        offset = end
+    return '\n'.join(result)
+
+
 def integrate(html):
+    source = material_review_ui.HTML
+    css = source.split('<style>', 1)[1].split('</style>', 1)[0]
+    content = source.split('<body>', 1)[1].split('<script>', 1)[0]
+    script = source.split('<script>', 1)[1].split('</script>', 1)[0]
+    # Keep this component in the same document as the dashboard. Independent
+    # IDs, scoped styles and an isolated script prevent interference with POs.
+    ids = re.findall(r'\bid="([^"]+)"', content)
+    content = re.sub(r'\b(id|for)="([^"]+)"', lambda m: m[1] + '="mr-' + m[2] + '"', content)
+    content = content.replace('<main>', '<div class="material-review-content">').replace('</main>', '</div>')
+    css = re.sub(r'\bmain\b', '.material-review-content', css)
+    css = re.sub(r'#(' + '|'.join(re.escape(i) for i in ids) + r')\b', lambda m: '#mr-' + m[1], css)
+    script = re.sub(r"document\.getElementById\('([^']+)'\)", lambda m: "document.getElementById('mr-" + m[1] + "')", script)
+    script = script.replace('document.querySelectorAll(', "document.getElementById('boughtVsSold').querySelectorAll(")
+    initial_load = "load().catch(e=>document.getElementById('mr-message').textContent=e.message);"
+    assert script.endswith(initial_load + '\n'), 'Review loader anchor changed'
+    script = script[:-len(initial_load + '\n')] + 'window.loadBoughtVsSoldReview=()=>{' + initial_load + '};\n'
+    html = html.replace('</head>', '<style>' + _scope_review_css(css) + '</style></head>', 1)
+    html = html.replace('</script>', '\n(()=>{\n' + script + '\n})();\n</script>', 1)
     anchor = '<button data-tab="closedPo" data-nav-area="po" data-nav-level="sub">Closed POs</button>'
     html = html.replace(anchor, anchor + '\n<button data-tab="boughtVsSold" data-nav-area="po" data-nav-level="sub">Bought vs Sold Review</button>', 1)
-    html = html.replace('<section id="vendorPriceCatalog"', '''<section id="boughtVsSold" class="tab hidden">
-      <iframe id="boughtVsSoldFrame" title="Bought vs Sold Review" style="width:100%;height:calc(100vh - 130px);min-height:750px;border:0;border-radius:8px"></iframe>
-    </section><section id="vendorPriceCatalog"''', 1)
+    html = html.replace('<section id="vendorPriceCatalog"', '<section id="boughtVsSold" class="tab hidden">' + content + '</section><section id="vendorPriceCatalog"', 1)
     html = html.replace("closedPo: 'po_review',", "closedPo: 'po_review', boughtVsSold: 'po_review',", 1)
     html = html.replace("'closedPo',", "'closedPo','boughtVsSold',", 1)
-    html = html.replace("if (tabName === 'closedPo') loadClosedPos();", "if (tabName === 'closedPo') loadClosedPos();\n      if (tabName === 'boughtVsSold') { const f=document.getElementById('boughtVsSoldFrame'); if(!f.getAttribute('src')) f.src='/bought-vs-sold'; }", 1)
+    # This component saves through its own forms; its filters must not trigger
+    # the dashboard's generic unsaved-changes warning.
+    filter_anchor = 'const isTemporaryViewControl = target => {\n      return '
+    assert filter_anchor in html, 'Dashboard filter handler changed'
+    html = html.replace(filter_anchor, filter_anchor + "target.closest('#boughtVsSold') || ", 1)
+    html = html.replace("if (tabName === 'closedPo') loadClosedPos();", "if (tabName === 'closedPo') loadClosedPos();\n      if (tabName === 'boughtVsSold') window.loadBoughtVsSoldReview?.();", 1)
     return html
