@@ -275,6 +275,18 @@ def integrate(html):
     content = content.replace('<main>', '<div class="material-review-content">').replace('</main>', '</div>')
     css = re.sub(r'\bmain\b', '.material-review-content', css)
     css = re.sub(r'#(' + '|'.join(re.escape(i) for i in ids) + r')\b', lambda m: '#mr-' + m[1], css)
+    # The review has light panels even when the surrounding dashboard is dark.
+    # Explicit control colors prevent inherited white text on white buttons.
+    css += '''
+      body{color-scheme:light}
+      button,input,select,textarea{color:#172231;background:#fff}
+      label,td,th{color:#172231}
+      details,dialog{background:#fff;color:#172231}
+      details summary{background:transparent;color:#1764a7}
+      .filters input,.filters select{width:auto;max-width:100%;min-width:0}
+      .filters>div{min-width:0}
+      input::file-selector-button{background:#e9f1fa;color:#172231;border:1px solid #b7c6d5;border-radius:4px;padding:4px 8px}
+    '''
     script = re.sub(r"document\.getElementById\('([^']+)'\)", lambda m: "document.getElementById('mr-" + m[1] + "')", script)
     script = script.replace('document.querySelectorAll(', "document.getElementById('boughtVsSold').querySelectorAll(")
     initial_load = "load().catch(e=>document.getElementById('mr-message').textContent=e.message);"
