@@ -281,6 +281,9 @@ def integrate(html):
       body{color-scheme:light}
       button,input,select,textarea{color:#172231;background:#fff}
       label,td,th{color:#172231}
+      td{background:#fff}
+      .badge{color:#172231}
+      input::placeholder,textarea::placeholder{color:#687b8c;opacity:1}
       details,dialog{background:#fff;color:#172231}
       details summary{background:transparent;color:#1764a7}
       .filters input,.filters select{width:auto;max-width:100%;min-width:0}
