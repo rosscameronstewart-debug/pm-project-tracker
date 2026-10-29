@@ -1286,7 +1286,7 @@ def nte_budget_approval_pdf_bytes(kind, item_id):
         from reportlab.lib.pagesizes import letter
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
         from reportlab.lib.units import inch
-        from reportlab.platypus import Image, SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+        from reportlab.platypus import Image, SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, KeepTogether
     except Exception as exc:
         raise RuntimeError("PDF export needs reportlab installed. Run pip install -r requirements.txt.") from exc
 
@@ -1383,23 +1383,34 @@ def nte_budget_approval_pdf_bytes(kind, item_id):
         story.append(Paragraph("<b>Notes</b>", styles["Small"]))
         story.append(Paragraph(html_escape(record["notes"]), styles["Small"]))
     story.append(Spacer(1, 0.28 * inch))
-    story.append(Paragraph("Customer Approval", styles["Heading2"]))
-    signature_rows = [
-        ["Authorized Signature", ""],
-        ["Printed Name", ""],
-        ["Title", ""],
-        ["Date", ""],
-    ]
-    signature_table = Table(signature_rows, colWidths=[1.7 * inch, 4.7 * inch], rowHeights=[0.48 * inch] * 4)
-    signature_table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#eaf0f5")),
-        ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
-        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#8da0b4")),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    def signature_block():
+        table = Table(
+            [[Paragraph(f"<b>{label}</b>", styles["Small"]), ""]
+             for label in ("Authorized Signature", "Printed Name", "Title", "Date")],
+            colWidths=[1.0 * inch, 2.1 * inch], rowHeights=[0.48 * inch] * 4,
+        )
+        table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#eaf0f5")),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#8da0b4")),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ]))
+        return table
+
+    signatures = Table([
+        [Paragraph("Customer Approval", styles["Heading2"]),
+         Paragraph("Twin Peaks Approval", styles["Heading2"])],
+        [signature_block(), signature_block()],
+    ], colWidths=[3.2 * inch, 3.2 * inch])
+    signatures.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
     ]))
-    story.append(signature_table)
-    story.append(Spacer(1, 0.14 * inch))
-    story.append(Paragraph("Please sign and return this document. The signed copy will be attached to the tracker record.", styles["Muted"]))
+    story.append(KeepTogether([
+        signatures,
+        Spacer(1, 0.14 * inch),
+        Paragraph("Please sign and return this document. The signed copy will be attached to the tracker record.", styles["Muted"]),
+    ]))
     doc.build(story)
     return buffer.getvalue()
 
