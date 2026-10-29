@@ -1,0 +1,35 @@
+Invoice
+INV445813
+Please Send Payments to: 10/28/2026
+Automation-X Corporation
+P.O. Box 30106 Due Date: 11/27/2026
+Total Due: $2,427.84
+Bill To Ship To PO: Stock
+SO: SO393698
+Ship Date: 10/21/2026
+5 Code Item Quantity Unit Price Tax Rate Amount
+1 -70616 Beijer HMI 640013905 1 $2,200.00 0% $2,200.00
+Beijer HMI 640013905: Human machine interface, X2 Extreme 7"
+rugged, panel-mount, graphic touch aluminum operator terminal.
+2 -75259 Beijer Adapter Plate 100-1157 1 $113.83 0% $113.83
+Beijer Adapter Plate 100-1157: Adaptor plate from QTERM-A7 to X2
+extreme 7
+3 -01277 Line Memo
+ITEMS ARE SPECIAL ORDER. SHIPPING IS NOT INCLUDED.
+4 -93165 Tariff Surcharge 1 $86.22 0% $86.22
+Line 1: $82.50
+Line 2: $3.72
+1 of 2
+INV445813
+Invoice
+INV445813
+Please Send Payments to: 10/28/2026
+Automation-X Corporation
+P.O. Box 30106 Due Date: 11/27/2026
+Total Due: $2,427.84
+*** Please Note *** Subtotal: $2,400.05
+Shipping & Handling: $27.79
+Total Tax: $0.00
+Total: $2,427.84
+2 of 2
+INV445813

@@ -6524,6 +6524,67 @@ def parse_amazon_order_invoice(text):
             "order_number": order_number, "total_due": total_due, "item_lines": item_lines}
 
 
+def parse_automation_x_invoice(text):
+    """Read invoice rows, never the appended sales order or packing slips."""
+    text = re.split(r"^(?:Sales Order|Packing Slip)\s*$", text, maxsplit=1, flags=re.M)[0]
+    invoice_ids = set(re.findall(r"^Invoice\s*\n(INV[\w-]+)\s*$", text, re.M | re.I))
+    dates = set(re.findall(r"Please Send Payments to:\s*(\d{1,2}/\d{1,2}/\d{4})", text, re.I))
+    if len(invoice_ids) != 1 or len(dates) != 1:
+        raise RuntimeError("Automation-X invoice number or invoice date is missing or ambiguous.")
+    amount = r"(-?[\d,]+\.\d{2})"
+    subtotal = re.search(r"Subtotal:\s*\$" + amount, text, re.I)
+    total = re.search(r"^Total:\s*\$" + amount + r"\s*$", text, re.M | re.I)
+    due = set(parse_money_text(v) for v in re.findall(r"Total Due:\s*\$" + amount, text, re.I))
+    if not subtotal or not total or len(due) != 1 or abs(next(iter(due)) - parse_money_text(total.group(1))) > .02:
+        raise RuntimeError("Automation-X invoice totals could not be verified.")
+    row_pattern = re.compile(r"^\d+\s+(\S+)\s+(.+?)\s+(-?\d+(?:\.\d+)?)\s+\$" + amount + r"\s+\d+(?:\.\d+)?%\s+\$" + amount + r"\s*$")
+    items, active, in_items = [], None, False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if re.search(r"Code\s+Item\s+Quantity\s+Unit Price\s+Tax Rate\s+Amount", line, re.I):
+            in_items = True
+            continue
+        if not in_items:
+            continue
+        if re.search(r"Subtotal:", line, re.I) or line.lower() == 'invoice':
+            in_items, active = False, None
+            continue
+        row = row_pattern.match(line)
+        if row:
+            code, description, qty, price, extension = row.groups()
+            qty, price, extension = map(parse_money_text, (qty, price, extension))
+            if abs(round(qty * price, 2) - extension) > .02:
+                raise RuntimeError(f"Automation-X item {code} quantity and price do not reconcile.")
+            if description.casefold() == 'tariff surcharge':
+                description += f' (vendor code {code})'
+                code = 'Tariff'
+            active = dict(product_code=code, description=description, qty=qty, unit_price=price, amount=extension)
+            items.append(active)
+        elif re.match(r"^\d+\s+\S+\s+Line Memo\s*$", line, re.I):
+            active = None
+        elif re.match(r"^\d+\s+-\d+\s", line):
+            raise RuntimeError("An Automation-X item row is unreadable; review the invoice.")
+        elif active and line and not re.fullmatch(r"\d+ of \d+|INV[\w-]+", line, re.I):
+            active['description'] += ' ' + line
+    if not items or abs(sum(x['amount'] for x in items) - parse_money_text(subtotal.group(1))) > .02:
+        raise RuntimeError("Automation-X item lines do not reconcile to the invoice subtotal.")
+    for code, label, pattern in (
+        ('Shipping', 'Shipping & handling', r"Shipping & Handling:\s*\$" + amount),
+        ('Sales Tax', 'Sales tax', r"Total Tax:\s*\$" + amount),
+    ):
+        charge = re.search(pattern, text, re.I)
+        if charge and parse_money_text(charge.group(1)):
+            value = parse_money_text(charge.group(1))
+            items.append(dict(product_code=code,description=label,qty=1,unit_price=value,amount=value))
+    total_due = parse_money_text(total.group(1))
+    if abs(sum(x['amount'] for x in items) - total_due) > .02:
+        raise RuntimeError("Automation-X material and separate charges do not reconcile to the invoice total.")
+    return dict(vendor='Automation-X Corporation',invoice_number=next(iter(invoice_ids)),
+                invoice_date=date_text(next(iter(dates))),
+                order_number=first_regex([r"\bPO:\s*([^\n]+)"],text,flags=re.I),
+                total_due=total_due,item_lines=items)
+
+
 def parse_eagle_automation_invoice(text):
     """Vanzandt / Eagle invoices: printed item rows plus separate charges."""
     header = re.search(r"Date\s+Invoice\s*#\s*\n(\d{1,2}/\d{1,2}/\d{2,4})\s+(INV[\w-]+)", text, re.I)
@@ -6587,7 +6648,20 @@ def import_vendor_invoice_pdf(path, project_id, preview_only=False, preview_deta
     source_file = Path(path).name
     lower = text.lower()
     compact_lower = re.sub(r"\s+", "", lower)
-    if 'eagle automation' in lower and re.search(r'Qty\.\s+Item\s+Description', text, re.I):
+    if 'automation-x corporation' in lower and re.search(r'^Invoice\s*\nINV', text, re.M | re.I):
+        # A single upload may bundle orders, packing slips and correspondence.
+        # Only pages headed Invoice are purchase evidence for this parser.
+        with pdfplumber.open(path) as pdf:
+            invoice_pages = [page.extract_text() or '' for page in pdf.pages]
+        invoice_text = '\n'.join(t for t in invoice_pages if re.match(r'^\s*Invoice\s*\nINV', t, re.I))
+        ax = parse_automation_x_invoice(invoice_text)
+        vendor = ax['vendor']
+        invoice_number = ax['invoice_number']
+        invoice_date = ax['invoice_date']
+        order_number = ax['order_number']
+        total_due = ax['total_due']
+        item_lines = ax['item_lines']
+    elif 'eagle automation' in lower and re.search(r'Qty\.\s+Item\s+Description', text, re.I):
         eagle = parse_eagle_automation_invoice(text)
         vendor = eagle['vendor']
         invoice_number = eagle['invoice_number']
