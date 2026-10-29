@@ -3921,6 +3921,27 @@ def panel_shop_labor_records_from_tables(tables, work_description):
     return records
 
 
+def fieldwise_labor_with_time_fallback(billable_records, time_records):
+    """Use printed billable labor once; time entries only fill absent classes.
+
+    Billable and time sections can disagree on hours, so hours are deliberately
+    excluded from the identity. Keep the printed billable quantity and price.
+    """
+    def identity(record):
+        return re.sub(r"[\s-]+", " ", record["item"]).strip().casefold()
+
+    billed = {identity(r) for r in billable_records if r["cost_type"] == "Labor"}
+    result = list(billable_records)
+    seen_fallback = set()
+    for record in time_records:
+        key = identity(record)
+        fallback_key = (key, record["qty"])
+        if key not in billed and fallback_key not in seen_fallback:
+            result.append(record)
+            seen_fallback.add(fallback_key)
+    return result
+
+
 def fieldwise_time_entry_labor_records_from_text(text, work_description):
     records = []
     in_time_entries = False
@@ -6218,10 +6239,9 @@ def import_fieldwise_pdf(path, project_id):
             for row in table:
                 add_fieldwise_item_row(row, page_number)
 
-    for record in panel_shop_labor_records_from_tables(tables, work_description):
-        add_extracted_record(record)
-    for record in fieldwise_time_entry_labor_records_from_text(text, work_description):
-        add_extracted_record(record)
+    time_records = panel_shop_labor_records_from_tables(tables, work_description)
+    time_records.extend(fieldwise_time_entry_labor_records_from_text(text, work_description))
+    records = fieldwise_labor_with_time_fallback(records, time_records)
 
     if not records:
         amount_text = first_regex([r"TOTAL\s*\$?\s*([0-9,]+\.[0-9]{2})"], text)

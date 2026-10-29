@@ -1,9 +1,57 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 import app
 
 
 class LaborCategoryTests(unittest.TestCase):
+    def test_pdf_import_stores_customer_sales_once_and_keeps_internal_cost_separate(self):
+        page = MagicMock()
+        page.extract_text.return_value = ('Field Ticket #16346\nJob # 604 Palermo\nTicket Date 10/2/2026\n'
+            'Work Description\nInstall wiring\nLabor\nTime Entries\nName Date\n'
+            'Jared Brown 10/2/2026 Journeyman Reg 8.00\nBillable Entries\n')
+        page.extract_tables.return_value = [[['Work Type / Comp Item','Qty','Rate','Total'],
+            ['Jared Brown - Journeyman - Reg','8.00','$97.00','$776.00']]]
+        pdf = MagicMock()
+        pdf.__enter__.return_value.pages = [page]
+        with patch.object(app.pdfplumber, 'open', return_value=pdf), \
+             patch.object(app, 'one', return_value=None), patch.object(app, 'execute') as execute, \
+             patch.object(app, 'raw_rate_for', return_value={'raw_rate':81.02,'category':'Journeyman ST','source':'Project rate set'}):
+            result = app.import_fieldwise_pdf('ticket16346.pdf',1006)
+        inserts = [call for call in execute.call_args_list if 'INSERT INTO cost_records' in call.args[0]]
+        self.assertEqual(result['count'],1)
+        self.assertEqual(len(inserts),1)
+        values = inserts[0].args[1]
+        self.assertEqual(values[10],8)
+        self.assertAlmostEqual(values[11],81.02)
+        self.assertAlmostEqual(values[12],648.16)
+        self.assertEqual(values[13:15],(97,776))
+
+    def test_billable_labor_takes_precedence_over_duplicate_time_entries(self):
+        billed = [dict(cost_type='Labor', item='Jared Brown - Journeyman - Reg',
+                       qty=8, rate=97, amount=776)]
+        time = [dict(billed[0], rate=0, amount=0)]
+        result = app.fieldwise_labor_with_time_fallback(billed, time)
+        self.assertEqual(result, billed)
+        self.assertEqual(sum(r['amount'] for r in result), 776)
+
+    def test_overtime_name_spacing_does_not_create_second_labor_entry(self):
+        billed = [dict(cost_type='Labor', item='Jared Brown - Journeyman OT',
+                       qty=1, rate=145.5, amount=145.5)]
+        time = [dict(billed[0], item='Jared Brown - Journeyman - OT', rate=0, amount=0)]
+        self.assertEqual(app.fieldwise_labor_with_time_fallback(billed, time), billed)
+
+    def test_printed_billable_hours_win_over_conflicting_time_hours(self):
+        billed = [dict(cost_type='Labor', item='Jared Brown - Journeyman - Reg',
+                       qty=5, rate=97, amount=485)]
+        time = [dict(billed[0], qty=4, rate=0, amount=0)]
+        self.assertEqual(app.fieldwise_labor_with_time_fallback(billed, time), billed)
+
+    def test_unbilled_people_and_classes_remain_available_for_review(self):
+        billed = [dict(cost_type='Labor', item='Jared Brown - Journeyman - Reg',
+                       qty=8, rate=97, amount=776)]
+        missing = dict(billed[0], item='Other Person - Journeyman - Reg', rate=0, amount=0)
+        self.assertEqual(app.fieldwise_labor_with_time_fallback(billed, [missing]), billed + [missing])
+
     def test_confirmed_aliases(self):
         for item,expected in [
             ('Jerry Nguyen - Panel Shop Labor','Panel Shop ST'),
