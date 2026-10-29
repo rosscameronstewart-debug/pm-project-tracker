@@ -14,10 +14,10 @@ class NteAdditionUpdateTests(unittest.TestCase):
             CREATE TABLE nte_bucket_additions (
                 id INTEGER PRIMARY KEY, bucket_id INTEGER, amount REAL,
                 labor_amount REAL, material_amount REAL, equipment_amount REAL,
-                status TEXT, signed_file TEXT, support_file TEXT, created_at TEXT, reason TEXT
+                status TEXT, signed_file TEXT, support_file TEXT, created_at TEXT, reason TEXT, notes TEXT
             );
             INSERT INTO nte_bucket_additions VALUES
-                (1, 2, -771912, -51912, -720000, 0, 'Pending', '', 'backup.pdf', '2026-10-26', 'Bucket Decrease');
+                (1, 2, -771912, -51912, -720000, 0, 'Pending', '', 'backup.pdf', '2026-10-26', 'Bucket Decrease', 'Original notes');
         ''')
         self.handler = app.Handler.__new__(app.Handler)
         self.handler.path = '/api/nte-additions/1'
@@ -81,6 +81,29 @@ class NteAdditionUpdateTests(unittest.TestCase):
         row=self.con.execute('SELECT reason,amount FROM nte_bucket_additions').fetchone()
         self.assertEqual(row['reason'],'Updated explanation')
         self.assertEqual(row['amount'],-12391.20)
+
+    def test_notes_only_edit_is_audited_and_preserves_other_fields(self):
+        with patch.object(app, 'parse_json', return_value={'notes':' Corrected notes\nSecond line '}), patch.object(
+            app, 'json_response', side_effect=lambda _, payload, status=200: (status, payload)
+        ):
+            self.assertEqual(self.handler.do_PUT()[0],200)
+        row=self.con.execute('SELECT * FROM nte_bucket_additions').fetchone()
+        self.assertEqual(row['notes'],'Corrected notes\nSecond line')
+        self.assertEqual(row['reason'],'Bucket Decrease')
+        self.assertEqual(row['amount'],-771912)
+        self.assertEqual(self.log.call_args.args[4]['before'],{'notes':'Original notes'})
+
+    def test_notes_reason_and_amounts_save_together(self):
+        self.assertEqual(self.update(reason='New reason',notes='New notes')[0],200)
+        row=self.con.execute('SELECT * FROM nte_bucket_additions').fetchone()
+        self.assertEqual((row['reason'],row['notes'],row['amount']),('New reason','New notes',-12391.20))
+
+    def test_notes_lock_and_validation(self):
+        self.assertEqual(self.update(notes=None)[0],400)
+        for status,signed in [('Approved',''),('Pending','signed.pdf'),('Rejected','')]:
+            self.con.execute('UPDATE nte_bucket_additions SET status=?,signed_file=?',(status,signed))
+            self.assertEqual(self.update(notes='Changed')[0],409)
+            self.assertEqual(self.con.execute('SELECT notes FROM nte_bucket_additions').fetchone()[0],'Original notes')
 
     def test_reason_is_locked_after_approval_or_signature(self):
         for status,signed in [('Approved',''),('Pending','signed.pdf'),('Rejected','')]:

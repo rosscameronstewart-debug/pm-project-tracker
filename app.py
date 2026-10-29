@@ -14108,7 +14108,7 @@ HTML = r"""
       const amountCell = (a, field, label) => editable(a)
         ? `<input style="min-width:120px" type="number" step="0.01" aria-label="${label} for addition ${a.id}" data-nte-addition="${a.id}" data-field="${field}" value="${Number(a[field] || 0).toFixed(2)}">`
         : money(a[field]);
-      tableEl.innerHTML = `<thead><tr><th>Created</th><th>Bucket</th><th>Status</th><th>Total</th><th>Labor</th><th>Material</th><th>Equipment</th><th>Corrections</th><th>Requested</th><th>Approved</th><th>Approver</th><th>Backup</th><th>Approval</th><th>Reason</th></tr></thead>
+      tableEl.innerHTML = `<thead><tr><th>Created</th><th>Bucket</th><th>Status</th><th>Total</th><th>Labor</th><th>Material</th><th>Equipment</th><th>Corrections</th><th>Requested</th><th>Approved</th><th>Approver</th><th>Backup</th><th>Approval</th><th>Reason</th><th>Notes</th></tr></thead>
         <tbody>${additions.map(a => `<tr>
           <td>${htmlEscape((a.created_at || '').replace('T', ' '))}<div class="muted">${htmlEscape(a.created_by_username || '')}</div></td>
           <td>${htmlEscape(bucketById[a.bucket_id]?.name || '')}</td>
@@ -14132,6 +14132,7 @@ HTML = r"""
             </div>
           </td>
           <td>${editable(a) ? `<textarea data-nte-addition-reason="${a.id}" aria-label="Reason for addition ${a.id}" rows="3" style="min-width:220px">${htmlEscape(a.reason || '')}</textarea>` : htmlEscape(a.reason || '')}</td>
+          <td>${editable(a) ? `<textarea data-nte-addition-notes="${a.id}" aria-label="Notes for addition ${a.id}" rows="3" style="min-width:260px">${htmlEscape(a.notes || '')}</textarea>` : htmlEscape(a.notes || '')}</td>
         </tr>`).join('')}</tbody>`;
       tableEl.querySelectorAll('[data-nte-addition]').forEach(input => input.addEventListener('input', () => {
         const id = input.dataset.nteAddition;
@@ -14146,6 +14147,7 @@ HTML = r"""
         if (inputs.some(input => !input.reportValidity())) return;
         inputs.forEach(input => fields[input.dataset.field] = input.value);
         fields.reason = tableEl.querySelector(`[data-nte-addition-reason="${id}"]`).value;
+        fields.notes = tableEl.querySelector(`[data-nte-addition-notes="${id}"]`).value;
         btn.disabled = true;
         try {
           await api(`/api/nte-additions/${id}`, { method:'PUT', body: JSON.stringify(fields) });
@@ -19531,12 +19533,13 @@ class Handler(BaseHTTPRequestHandler):
                         if not total:
                             return json_response(self, {"error": "The total addition must not be zero."}, 400)
                         updates.update(zip(("amount", *fields), (total, *amounts)))
-                    if "reason" in data:
-                        if not isinstance(data["reason"], str):
-                            return json_response(self, {"error": "Enter the reason as text."}, 400)
-                        updates["reason"] = data["reason"].strip()
+                    for text_field in ("reason", "notes"):
+                        if text_field in data:
+                            if not isinstance(data[text_field], str):
+                                return json_response(self, {"error": f"Enter the {text_field} as text."}, 400)
+                            updates[text_field] = data[text_field].strip()
                     if not updates:
-                        return json_response(self, {"error": "Enter amounts or a reason to update."}, 400)
+                        return json_response(self, {"error": "Enter amounts, a reason, or notes to update."}, 400)
                     updated = con.execute(
                         "UPDATE nte_bucket_additions SET " + ", ".join(field + " = ?" for field in updates) +
                         " WHERE id = ? AND status = 'Pending' AND COALESCE(signed_file, '') = ''",
