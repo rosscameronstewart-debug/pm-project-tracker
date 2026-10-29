@@ -6,11 +6,11 @@ import app
 
 class NteCompletionTests(unittest.TestCase):
     def test_used_totals_mix_forced_and_normal_sections_and_restore_on_clear(self):
-        forced = {'current_budget':1000,'actual_cost':200,'completion':{'completion_percent':100,'use_full_budget':True}}
-        normal = {'current_budget':500,'actual_cost':150,'completion':{'completion_percent':50}}
+        forced = {'current_budget':1000,'actual_cost':100,'sales_to_date':200,'completion':{'completion_percent':100,'use_full_budget':True}}
+        normal = {'current_budget':500,'actual_cost':75,'sales_to_date':150,'completion':{'completion_percent':50}}
         self.assertEqual(sum(app.nte_reported_budget_used(b) for b in [forced,normal]),1150)
         self.assertEqual(1500-sum(app.nte_reported_budget_used(b) for b in [forced,normal]),350)
-        self.assertEqual(forced['actual_cost'],200)
+        self.assertEqual(forced['actual_cost'],100)
         forced['completion']['use_full_budget']=False
         self.assertEqual(app.nte_reported_budget_used(forced),200)
         forced['completion'].update(use_full_budget=True,completion_percent=90)
@@ -18,11 +18,11 @@ class NteCompletionTests(unittest.TestCase):
 
     def test_reports_show_each_subbucket_completion_and_full_budget_override(self):
         bucket = {'name':'606 - E-Rack - Palermo 13-1', 'current_budget':123912,
-                  'actual_cost':28027.28, 'remaining':95884.72,
+                  'actual_cost':20000, 'sales_to_date':28027.28, 'remaining':95884.72,
                   'completion':{'completion_percent':100,'use_full_budget':1}, 'subbuckets':[]}
         bucket.update(app.nte_completion_estimate(28027.28,123912,100,True))
         for name,budget,actual in [('Labor',51912,10793.16),('Material',72000,16934.12)]:
-            sub={'name':name,'cost_type':name,'current_budget':budget,'actual_cost':actual,
+            sub={'name':name,'cost_type':name,'current_budget':budget,'actual_cost':actual/2,'sales_to_date':actual,
                  'remaining':budget-actual,'completion_percent':100,'use_full_budget':True}
             sub.update(app.nte_completion_estimate(actual,budget,100,True))
             bucket['subbuckets'].append(sub)
@@ -35,9 +35,9 @@ class NteCompletionTests(unittest.TestCase):
             html=app.nte_weekly_report_html(1)
             self.assertEqual(html.count('100.0% complete'),5)
             self.assertEqual(html.count('<span style="width:100%">'),3)
-            self.assertIn('20.8% of budget spent',html)
-            self.assertIn('23.5% of budget spent',html)
-            self.assertIn('Projected cost not yet recorded',html)
+            self.assertIn('20.8% of NTE recorded',html)
+            self.assertIn('23.5% of NTE recorded',html)
+            self.assertIn('Budget override above recorded sales',html)
             self.assertIn('<div class="label">Used</div><div class="value">$123,912.00</div>',html)
             self.assertIn('<div class="label">Remaining</div><div class="value good">$0.00</div>',html)
             self.assertIn('Includes full budget overrides',html)
@@ -62,10 +62,10 @@ class NteCompletionTests(unittest.TestCase):
         self.assertEqual(result['estimated_completion_status'], 'Full budget override')
         self.assertEqual(actual, 28027.28)
 
-    def test_clearing_override_restores_actual_based_projection(self):
+    def test_clearing_override_restores_sales_plus_remaining_budget(self):
         self.assertEqual(app.nte_completion_estimate(200, 1000, 100, False)['estimated_cost_at_completion'], 200)
-        self.assertEqual(app.nte_completion_estimate(200, 1000, 50, False)['estimated_cost_at_completion'], 400)
-        self.assertEqual(app.nte_completion_estimate(200, 1000, 0, False)['estimated_cost_at_completion'], 0)
+        self.assertEqual(app.nte_completion_estimate(200, 1000, 50, False)['estimated_cost_at_completion'], 700)
+        self.assertEqual(app.nte_completion_estimate(200, 1000, 0, False)['estimated_cost_at_completion'], 1200)
 
     def test_override_tracks_budget_changes_and_subbucket_totals(self):
         labor = app.nte_completion_estimate(10793.16, 51912, 100, True)
@@ -74,7 +74,7 @@ class NteCompletionTests(unittest.TestCase):
         self.assertEqual(app.nte_completion_estimate(200, 1500, 100, True)['estimated_cost_at_completion'], 1500)
 
     def test_override_does_not_apply_to_partial_completion_or_negative_remaining(self):
-        self.assertEqual(app.nte_completion_estimate(200, 1000, 50, True)['estimated_cost_at_completion'], 400)
+        self.assertEqual(app.nte_completion_estimate(200, 1000, 50, True)['estimated_cost_at_completion'], 700)
         result = app.nte_completion_estimate(1200, 1000, 100, True)
         self.assertEqual(result['estimated_cost_at_completion'], 1000)
         self.assertEqual(result['estimated_cost_to_complete'], 0)

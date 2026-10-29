@@ -25,6 +25,15 @@ http://127.0.0.1:8765
 The daily **Purchase Orders → Bought vs Sold Review** workflow and the isolated
 offline launcher are documented in [Daily Bought vs Sold Review](docs/bought-vs-sold-review.md).
 
+## T&M NTE forecast
+
+Estimated Final Sales equals recorded sales to date plus the current NTE budget
+multiplied by the percentage of work remaining. Missing sales values remain
+flagged as provisional; internal costs are not substituted. Existing full-budget
+overrides at 100% completion still apply. Dashboard, HTML and PDF reports use the
+same calculation. Sales-forecast history is stored separately from the former
+cost-based projection history.
+
 ## Server Bind Address
 
 By default the app binds to `127.0.0.1` for local development.
