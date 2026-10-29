@@ -3,14 +3,77 @@ HTML = r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport
 body{font:15px Segoe UI,Arial,sans-serif;margin:0;background:#f3f6fa;color:#172231}main{max-width:1500px;margin:auto;padding:22px}h1{margin:0 0 12px}h2{margin-top:0}.banner{background:#fff0bd;padding:12px;border-radius:7px}.panel{padding:18px;background:white;border:1px solid #d5dfeb;border-radius:9px;margin:16px 0}button,input,select,textarea{font:inherit;padding:9px;border:1px solid #b7c6d5;border-radius:6px}button{cursor:pointer;background:#e9f1fa}button.primary{background:#246bb0;color:white}button:disabled{opacity:.5;cursor:default}label{display:block;font-weight:600;margin:12px 0 5px}.filters,.stats,.actions{display:flex;gap:12px;flex-wrap:wrap;align-items:center}.stats>div{padding:10px;min-width:150px}.stats strong{font-size:27px;display:block}.muted{color:#52667c;font-size:13px}p{line-height:1.5}.scroll{max-height:630px;overflow:auto}table{width:100%;min-width:1450px;border-collapse:collapse}td,th{padding:11px;vertical-align:top;text-align:left;border-bottom:1px solid #d5dfeb}th{background:#e9f0f7;position:sticky;top:0}td:nth-child(2){min-width:280px}td:last-child{min-width:250px}a{color:#1764aa}.badge{background:#fff3cb;padding:4px;border-radius:5px;display:inline-block}.money{white-space:nowrap}dialog{max-width:680px;width:calc(100% - 50px);border:1px solid #bbcbdc;border-radius:10px;padding:22px;max-height:88vh;overflow:auto}dialog::backdrop{background:#0007}dialog input,dialog select,dialog textarea{width:100%;box-sizing:border-box}#message,#matchError{white-space:pre-wrap}.danger{color:#a12828}@media(max-width:650px){main{padding:12px}.panel{padding:12px}}
 
 .app-header{background:#162534;color:white;border-bottom:3px solid #e4b320;padding:17px 25px;font-weight:700;font-size:19px;display:flex;justify-content:space-between}.app-header small{font-size:13px;font-weight:400}.app-shell{max-width:1680px;margin:auto;display:grid;grid-template-columns:220px minmax(0,1fr);gap:22px;padding:22px}.app-shell main{padding:0;min-width:0;width:100%;box-sizing:border-box}.sidebar{background:white;border:1px solid #d5dfeb;border-radius:8px;padding:14px;align-self:start}.sidebar p{padding:10px;margin:3px 0;color:#53657a}.sidebar .nav-parent{color:#172231;font-weight:700;background:#eef3f9}.sidebar a{display:block;background:#246bb0;color:white;padding:12px 9px;border-radius:5px;margin:5px 0 5px 12px;text-decoration:none;font-weight:600}.sidebar small{color:#66788c}.eyebrow{color:#64768a;font-size:13px;margin:0 0 8px}.queue-tabs{display:flex;gap:9px;flex-wrap:wrap;margin:18px 0}.queue-tabs button{background:white;min-width:135px;text-align:left}.queue-tabs button strong{display:block;font-size:24px;margin-top:4px}.queue-tabs button[aria-pressed=true]{border:2px solid #246bb0;background:#edf5ff}.steps{display:flex;gap:20px;flex-wrap:wrap;color:#36516b;margin:16px 0}.panel h2{font-size:18px}.banner{font-size:13px;margin:12px 0}details summary{cursor:pointer;color:#246bb0}.stats{font-size:13px}.stats strong{font-size:20px}@media(max-width:850px){.app-shell{display:block;padding:12px}.sidebar{margin-bottom:18px}.sidebar p,.sidebar small{display:none}.sidebar a{margin:0}.app-header{font-size:16px}.app-header small{font-size:11px}}
+
+#purchaseTable{table-layout:fixed;width:1730px;min-width:0}
+#purchaseTable th{z-index:2;padding-right:24px;word-break:normal;overflow-wrap:normal}
+#purchaseTable td{min-width:0;overflow-wrap:anywhere;word-break:normal}
+#purchaseTable .money .muted{white-space:normal}
+#purchaseTable .review-resize-handle{position:absolute;top:0;right:0;width:12px;height:100%;padding:0;border:0;border-radius:0;background:transparent;cursor:col-resize;touch-action:none;z-index:3}
+#purchaseTable .review-resize-handle::after{content:"";position:absolute;top:9px;bottom:9px;left:5px;width:2px;background:#a1b3c7}
+#purchaseTable .review-resize-handle:hover::after,#purchaseTable .review-resize-handle:focus-visible::after{background:#1764aa}
+#purchaseTable.review-column-resizing{cursor:col-resize;user-select:none}
 </style></head><body><main><div style="display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap"><h1>Bought vs Sold Review</h1><a href="/bought-vs-sold-guide" target="_blank" rel="noopener" style="padding:9px 14px;border:1px solid #b7c6d5;border-radius:6px;background:white;font-weight:600;text-decoration:none">How this works</a></div><p>Make sure purchased materials make it onto a Field Wise ticket.</p><div class="steps"><span><b>1.</b> Upload seven days of tickets</span><span><b>2.</b> Review overdue items and exceptions</span><span><b>3.</b> Verify sold quantities</span></div><p class="banner"><b>BOUGHT VS SOLD.</b> Review uses PO invoice attachments in this application. New or changed attachments are checked when you open or refresh this review. Confirmations do not change customer billing.</p><details><summary>Starting date and daily review rules</summary><p id="workflow"></p></details><div class="queue-tabs" id="queues" aria-label="Review queues"></div>
 <section class="panel"><h2>Upload the last seven days from Field Wise</h2><p>Upload the complete rolling seven-day export each day. Overlapping sales are not added twice. Changed tickets replace their prior version; the history is retained. Tickets no longer present in a complete loaded window are marked inactive. Earlier history outside that window stays available.</p>
 <form id="upload"><div class="filters"><div><label for="file">Field Wise ticket lines</label><input type="file" id="file" accept=".xlsx,.xlsm" required></div><div><label for="through">Export covers through</label><input type="date" id="through" required></div><button type="submit" class="primary" id="uploadBtn">Import and compare</button></div></form><p id="message" role="status"></p><p class="muted">Sold statuses: Submitted, Approved, Invoiced. Other statuses are retained but do not qualify for confirmation. Confirm the export's through date; the window is that date and the preceding six days.</p></section>
 <details class="panel"><summary>Data coverage and comparison details</summary><div class="stats" id="stats"></div><p id="coverage"></p><p class="muted">Cost and selling price are shown separately. Matching does not require equal prices because material may be marked up. Exact catalogue links are suggestions, not confirmations. Units and quantity must be verified. Candidate ticket quantities may appear against more than one purchase; they are not additive and cannot be confirmed twice.</p><div id="states"></div><p id="stale" class="danger"></p></details>
-<section class="panel"><h2>Purchase-line review</h2><div class="filters"><input type="search" id="search" placeholder="PO, job, vendor, part or description" aria-label="Search lines"><select id="state" aria-label="Filter state"><option value="">All states</option></select><select id="issueGroupFilter" aria-label="Issue group filter"><option value="">All issue groups</option></select><select id="issueStatusFilter" aria-label="Issue status filter"><option value="">All issue statuses</option><option>Open</option><option>In progress</option><option>Waiting on information</option><option>Resolved</option></select><button type="button" id="exportCsv">Export this view</button><select id="timing" aria-label="Timing filter"><option value="">All purchase ages</option></select><button id="refresh" type="button">Refresh</button></div><p id="count"></p><div class="actions"><button id="prev">Previous</button><span id="page"></span><button id="next">Next</button></div><div class="scroll"><table><thead><tr><th>PO / job / vendor</th><th>Purchased line</th><th>Bought quantity / unit</th><th>Purchase cost</th><th>Confirmed sold / remaining</th><th>Purchase timing / review state</th><th>Possible Field Wise sales</th></tr></thead><tbody id="rows"></tbody></table></div></section>
+<section class="panel"><h2>Purchase-line review</h2><div class="filters"><input type="search" id="search" placeholder="PO, job, vendor, part or description" aria-label="Search lines"><select id="state" aria-label="Filter state"><option value="">All states</option></select><select id="issueGroupFilter" aria-label="Issue group filter"><option value="">All issue groups</option></select><select id="issueStatusFilter" aria-label="Issue status filter"><option value="">All issue statuses</option><option>Open</option><option>In progress</option><option>Waiting on information</option><option>Resolved</option></select><button type="button" id="exportCsv">Export this view</button><select id="timing" aria-label="Timing filter"><option value="">All purchase ages</option></select><button id="refresh" type="button">Refresh</button><button id="resetColumnWidths" type="button">Reset column widths</button></div><p class="muted">Drag a column header’s right edge to resize. Widths are remembered in this browser.</p><p id="count"></p><div class="actions"><button id="prev">Previous</button><span id="page"></span><button id="next">Next</button></div><div class="scroll"><table id="purchaseTable"><colgroup><col style="width:220px"><col style="width:400px"><col style="width:140px"><col style="width:170px"><col style="width:170px"><col style="width:250px"><col style="width:380px"></colgroup><thead><tr><th>PO / job / vendor</th><th>Purchased line</th><th>Bought quantity / unit</th><th>Purchase cost</th><th>Confirmed sold / remaining</th><th>Purchase timing / review state</th><th>Possible Field Wise sales</th></tr></thead><tbody id="rows"></tbody></table></div></section>
 <section class="panel" id="orphanPanel" hidden><h2>Issues with changed or unavailable source lines</h2><p>These investigations keep their original purchase details. Closing one does not confirm the replacement line sold.</p><div id="orphanIssues"></div></section><section class="panel"><h2>Review history</h2><div id="events"></div></section><section class="panel"><h2>Recent daily uploads</h2><div id="imports"></div></section>
 <dialog id="issueDialog"><form id="issueForm"><h2>Investigate purchase line</h2><p id="issueContext"></p><label for="issueGroup">Issue group</label><input id="issueGroup" maxlength="100" required placeholder="e.g. Missing on ticket, Wrong job, Parser review"><label for="issueDescription">What needs to be figured out?</label><textarea id="issueDescription" rows="3" maxlength="4000" required></textarea><label for="issueStatus">Status</label><select id="issueStatus"><option>Open</option><option>In progress</option><option>Waiting on information</option><option>Resolved</option></select><label for="issueNotes">Updates / resolution notes</label><textarea id="issueNotes" rows="3" maxlength="4000"></textarea><p>Resolving an issue does not mark any quantity sold.</p><p id="issueError" role="alert"></p><button class="primary" type="submit">Save issue</button> <button id="cancelIssue" type="button">Cancel</button></form></dialog><dialog id="match"><form id="matchForm"><h2>Confirm a material sale</h2><p id="buyContext"></p><label for="sale">Matching ticket line</label><select id="sale" required></select><p id="saleContext"></p><label for="qty">Purchased quantity covered by this ticket</label><input id="qty" type="number" step="any" min="0.000001" required><label for="factor">Purchased units covered by one ticket unit</label><input id="factor" type="number" step="any" min="0.000001" placeholder="Verify first, e.g. 1 for EA to EA" required><label for="unitNote">Verified units / conversion notes</label><textarea id="unitNote" rows="3" required placeholder="Example: 1 EA purchased = 1 EA sold. Confirmed against invoice and ticket."></textarea><p id="matchError" class="danger" role="alert"></p><div class="actions"><button class="primary" type="submit">Confirm quantity</button><button id="cancelMatch" type="button">Cancel</button></div></form></dialog>
 </main><script>
+function initPurchaseColumns(){
+  const table=document.getElementById('purchaseTable');
+  const headers=Array.from(table.querySelectorAll('thead th'));
+  const columns=Array.from(table.querySelectorAll('colgroup col'));
+  const defaults=[220,400,140,170,170,250,380], minimums=[160,180,120,140,140,180,220];
+  const storageKey='pm:material-review:column-widths:v1';
+  let widths=defaults.slice();
+  try {
+    const saved=JSON.parse(localStorage.getItem(storageKey)||'null');
+    if(Array.isArray(saved)&&saved.length===defaults.length&&saved.every(v=>typeof v==='number'&&Number.isFinite(v))){
+      widths=saved.map((v,i)=>Math.max(minimums[i],Math.min(1400,Math.round(v))));
+    }
+  }catch{}
+  const handles=[];
+  function apply(){
+    columns.forEach((col,i)=>col.style.width=widths[i]+'px');
+    table.style.width=widths.reduce((a,b)=>a+b,0)+'px';
+    handles.forEach((handle,i)=>handle.setAttribute('aria-valuenow',widths[i]));
+  }
+  function save(){try{localStorage.setItem(storageKey,JSON.stringify(widths));}catch{}}
+  headers.forEach((header,i)=>{
+    const name=header.textContent.trim(),handle=document.createElement('button');
+    handle.type='button';handle.className='review-resize-handle';
+    handle.setAttribute('role','separator');handle.setAttribute('aria-orientation','vertical');
+    handle.setAttribute('aria-label','Resize '+name+' column');
+    handle.setAttribute('aria-valuemin',minimums[i]);handle.setAttribute('aria-valuemax','1400');
+    handle.title='Drag to resize; arrow keys adjust width; Home restores this column';
+    function change(value){widths[i]=Math.max(minimums[i],Math.min(1400,Math.round(value)));apply();}
+    handle.addEventListener('pointerdown',event=>{
+      if(event.button!==0)return;
+      event.preventDefault();event.stopPropagation();
+      const start=event.clientX,initial=widths[i],pointer=event.pointerId;
+      table.classList.add('review-column-resizing');
+      const move=e=>{if(e.pointerId===pointer){e.preventDefault();change(initial+e.clientX-start);}};
+      const finish=()=>{
+        table.classList.remove('review-column-resizing');save();
+        window.removeEventListener('pointermove',move);window.removeEventListener('pointerup',finish);
+        window.removeEventListener('pointercancel',finish);window.removeEventListener('blur',finish);
+      };
+      window.addEventListener('pointermove',move);window.addEventListener('pointerup',finish);
+      window.addEventListener('pointercancel',finish);window.addEventListener('blur',finish);
+    });
+    handle.addEventListener('keydown',event=>{
+      if(!['ArrowLeft','ArrowRight','Home'].includes(event.key))return;
+      event.preventDefault();event.stopPropagation();
+      change(event.key==='Home'?defaults[i]:widths[i]+(event.key==='ArrowLeft'?-1:1)*(event.shiftKey?50:10));save();
+    });
+    handles.push(handle);header.appendChild(handle);
+  });
+  document.getElementById('resetColumnWidths').addEventListener('click',()=>{widths=defaults.slice();apply();save();});
+  apply();
+}
+initPurchaseColumns();
+
 let data=null,page=0,currentBuy=null,firstLoad=true,queue='all',editingIssue=null,issueDraft='';const size=100;const esc=s=>String(s??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;');const money=n=>Number(n||0).toLocaleString('en-US',{style:'currency',currency:'USD'});
 async function api(url,opts={}){const r=await fetch(url,opts);const v=await r.json();if(!r.ok)throw Error(v.error||'Request failed');return v;}
 function queueFor(b){if(b.issue&&b.issue.status!=='Resolved')return 'issues';if(b.timing_state==='Confirmed sold')return 'confirmed';if(b.timing_state.startsWith('Within 0'))return 'waiting';if(b.timing_state==='Over 3 days — review unconfirmed quantity')return 'overdue';return 'attention';}
