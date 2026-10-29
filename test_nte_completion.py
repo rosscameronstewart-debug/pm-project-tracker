@@ -65,7 +65,25 @@ class NteCompletionTests(unittest.TestCase):
     def test_clearing_override_restores_sales_plus_remaining_budget(self):
         self.assertEqual(app.nte_completion_estimate(200, 1000, 100, False)['estimated_cost_at_completion'], 200)
         self.assertEqual(app.nte_completion_estimate(200, 1000, 50, False)['estimated_cost_at_completion'], 700)
-        self.assertEqual(app.nte_completion_estimate(200, 1000, 0, False)['estimated_cost_at_completion'], 1200)
+        self.assertEqual(app.nte_completion_estimate(200, 1000, 0, False)['estimated_cost_at_completion'], 1000)
+
+    def test_html_and_pdf_include_unstarted_budget_in_total_and_subbucket(self):
+        sub={'name':'Labor','cost_type':'Labor','current_budget':342343,'sales_to_date':0,'completion_percent':0}
+        sub.update(app.nte_completion_estimate(0,342343,0))
+        bucket={'name':'AC','current_budget':342343,'sales_to_date':0,'completion':{},'subbuckets':[sub]}
+        bucket.update(app.nte_completion_estimate(0,342343,0))
+        with patch.object(app,'one',return_value={'project_code':'TEST','name':'Zero completion','customer':'Test'}), \
+             patch.object(app,'nte_summary',return_value={'buckets':[bucket]}), \
+             patch.object(app,'save_nte_weekly_kpi_snapshot'), patch.object(app,'nte_kpi_history',return_value=[]):
+            html=app.nte_weekly_report_html(1)
+            self.assertIn('<div class="label">Estimated Final Sales</div><div class="value ">$342,343.00</div>',html)
+            self.assertIn('Full budget assumed',html)
+            import pdfplumber
+            with pdfplumber.open(BytesIO(app.nte_weekly_report_pdf_bytes(1))) as report:
+                text='\n'.join(p.extract_text() or '' for p in report.pages)
+            self.assertIn('$342,343.00',text)
+            self.assertIn('Full budget assumed',text)
+            self.assertNotIn('Needs field completion percent',text)
 
     def test_override_tracks_budget_changes_and_subbucket_totals(self):
         labor = app.nte_completion_estimate(10793.16, 51912, 100, True)
