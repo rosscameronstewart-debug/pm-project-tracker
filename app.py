@@ -14097,7 +14097,7 @@ HTML = r"""
           <td>${amountCell(a, 'labor_amount', 'Labor')}</td>
           <td>${amountCell(a, 'material_amount', 'Material')}</td>
           <td>${amountCell(a, 'equipment_amount', 'Equipment')}</td>
-          <td>${editable(a) ? `<button class="btn primary" data-save-nte-addition="${a.id}" type="button">Save amounts</button><div class="muted" data-nte-addition-result="${a.id}" role="status" aria-live="polite"></div>` : '<span class="muted">Only pending, unsigned additions can be corrected.</span>'}</td>
+          <td>${editable(a) ? `<button class="btn primary" data-save-nte-addition="${a.id}" type="button">Save changes</button><div class="muted" data-nte-addition-result="${a.id}" role="status" aria-live="polite"></div>` : '<span class="muted">Only pending, unsigned additions can be corrected.</span>'}</td>
           <td>${htmlEscape(a.requested_date || '')}</td>
           <td>${htmlEscape(a.approved_date || '')}</td>
           <td>${htmlEscape(a.approver || '')}</td>
@@ -14111,7 +14111,7 @@ HTML = r"""
               <button class="btn" data-upload-nte-addition-signed="${a.id}" type="button">Upload Signed</button>
             </div>
           </td>
-          <td>${htmlEscape(a.reason || '')}</td>
+          <td>${editable(a) ? `<textarea data-nte-addition-reason="${a.id}" aria-label="Reason for addition ${a.id}" rows="3" style="min-width:220px">${htmlEscape(a.reason || '')}</textarea>` : htmlEscape(a.reason || '')}</td>
         </tr>`).join('')}</tbody>`;
       tableEl.querySelectorAll('[data-nte-addition]').forEach(input => input.addEventListener('input', () => {
         const id = input.dataset.nteAddition;
@@ -14125,13 +14125,14 @@ HTML = r"""
         const inputs = [...tableEl.querySelectorAll(`[data-nte-addition="${id}"]`)];
         if (inputs.some(input => !input.reportValidity())) return;
         inputs.forEach(input => fields[input.dataset.field] = input.value);
+        fields.reason = tableEl.querySelector(`[data-nte-addition-reason="${id}"]`).value;
         btn.disabled = true;
         try {
           await api(`/api/nte-additions/${id}`, { method:'PUT', body: JSON.stringify(fields) });
           markSaved();
           await loadNteTracking(false);
         } catch (error) {
-          result.textContent = error.message || 'Unable to save amounts. Try again.';
+          result.textContent = error.message || 'Unable to save changes. Try again.';
         } finally { btn.disabled = false; }
       });
       tableEl.querySelectorAll('[data-upload-nte-addition-signed]').forEach(btn => btn.onclick = async () => {
@@ -19489,34 +19490,46 @@ class Handler(BaseHTTPRequestHandler):
                     return json_response(self, {"error": "T&M NTE edit access required."}, 403)
                 addition_id = parsed.path.rsplit("/", 1)[-1]
                 fields = ("labor_amount", "material_amount", "equipment_amount")
-                try:
-                    amounts = [float(data[field]) for field in fields]
-                    if any(not math.isfinite(value) for value in amounts):
-                        raise ValueError()
-                    amounts = [round(value, 2) for value in amounts]
-                except (KeyError, TypeError, ValueError, OverflowError):
-                    return json_response(self, {"error": "Enter valid Labor, Material, and Equipment amounts."}, 400)
-                total = round(sum(amounts), 2)
-                if not math.isfinite(total):
-                    return json_response(self, {"error": "The total addition is too large."}, 400)
-                if not total:
-                    return json_response(self, {"error": "The total addition must not be zero."}, 400)
                 with db() as con:
                     addition = con.execute("SELECT * FROM nte_bucket_additions WHERE id = ?", (addition_id,)).fetchone()
                     if not addition:
                         return json_response(self, {"error": "NTE addition not found."}, 404)
                     if addition["status"] != "Pending" or addition["signed_file"]:
                         return json_response(self, {"error": "Only pending, unsigned additions can be corrected."}, 409)
-                    con.execute(
-                        "UPDATE nte_bucket_additions SET amount = ?, labor_amount = ?, material_amount = ?, equipment_amount = ? WHERE id = ?",
-                        (total, *amounts, addition_id),
+                    updates = {}
+                    if any(field in data for field in fields):
+                        try:
+                            amounts = [float(data[field]) for field in fields]
+                            if any(not math.isfinite(value) for value in amounts):
+                                raise ValueError()
+                            amounts = [round(value, 2) for value in amounts]
+                        except (KeyError, TypeError, ValueError, OverflowError):
+                            return json_response(self, {"error": "Enter valid Labor, Material, and Equipment amounts."}, 400)
+                        total = round(sum(amounts), 2)
+                        if not math.isfinite(total):
+                            return json_response(self, {"error": "The total addition is too large."}, 400)
+                        if not total:
+                            return json_response(self, {"error": "The total addition must not be zero."}, 400)
+                        updates.update(zip(("amount", *fields), (total, *amounts)))
+                    if "reason" in data:
+                        if not isinstance(data["reason"], str):
+                            return json_response(self, {"error": "Enter the reason as text."}, 400)
+                        updates["reason"] = data["reason"].strip()
+                    if not updates:
+                        return json_response(self, {"error": "Enter amounts or a reason to update."}, 400)
+                    updated = con.execute(
+                        "UPDATE nte_bucket_additions SET " + ", ".join(field + " = ?" for field in updates) +
+                        " WHERE id = ? AND status = 'Pending' AND COALESCE(signed_file, '') = ''",
+                        (*updates.values(), addition_id),
                     )
-                log_activity(actor, "corrected NTE budget addition amounts", "T&M NTE", str(addition["bucket_id"]), {
+                    if not updated.rowcount:
+                        return json_response(self, {"error": "This addition is no longer pending and unsigned. Refresh to review it."}, 409)
+                log_activity(actor, "corrected NTE budget addition", "T&M NTE", str(addition["bucket_id"]), {
                     "addition_id": addition_id,
-                    "before": {field: addition[field] for field in ("amount", *fields)},
-                    "after": dict(zip(("amount", *fields), (total, *amounts))),
+                    "before": {field: addition[field] for field in updates},
+                    "after": updates,
                 })
-                return json_response(self, {"ok": True, "amount": total})
+                return json_response(self, {"ok": True, "amount": updates.get("amount", addition["amount"])})
             if parsed.path.startswith("/api/nte-buckets/"):
                 actor = current_user(self)
                 if not can_edit_permission(actor, "nte_tracking"):
