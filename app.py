@@ -460,7 +460,7 @@ def nte_snapshot_date():
 
 def nte_snapshot_rows(data):
     buckets = data.get("buckets", [])
-    projected_buckets = [b for b in buckets if money((b.get("completion") or {}).get("completion_percent")) > 0]
+    projected_buckets = list(buckets)
     rows = []
     if projected_buckets:
         rows.append({
@@ -469,7 +469,7 @@ def nte_snapshot_rows(data):
             "bucket_id": None,
             "subbucket_id": None,
             "value": sum(money(b.get("estimated_cost_at_completion")) for b in projected_buckets),
-            "notes": "Sales-based forecast for buckets with field completion entered",
+            "notes": "All-bucket sales forecast; 0% or unset completion assumes full current budget",
         })
     for bucket in projected_buckets:
         rows.append({
@@ -627,7 +627,7 @@ def nte_weekly_report_html(project_id):
     total_budget = sum(money(b.get("current_budget")) for b in buckets)
     total_used = sum(nte_reported_budget_used(b) for b in buckets)
     total_remaining = total_budget - total_used
-    projected_buckets = [b for b in buckets if money((b.get("completion") or {}).get("completion_percent")) > 0]
+    projected_buckets = list(buckets)
     total_estimated_at_completion = sum(money(b.get("estimated_cost_at_completion")) for b in projected_buckets)
     total_estimated_variance = sum(money(b.get("current_budget")) for b in projected_buckets) - total_estimated_at_completion if projected_buckets else 0
     total_labor_budget = sum(money(b.get("labor_hours_budget")) for b in buckets)
@@ -669,7 +669,7 @@ def nte_weekly_report_html(project_id):
                   <td>{dollars(sub.get("sales_to_date"))}</td>
                   <td>{dollars(sub.get("remaining"))}</td>
                   <td>
-                    {dollars(sub.get("estimated_cost_at_completion")) if money(bucket_completion.get("completion_percent")) > 0 else "Needs field %"}
+                    {dollars(sub.get("estimated_cost_at_completion"))}
                     <div class="muted">{html_escape(sub.get("estimated_completion_status") or "")}</div>
                   </td>
                   <td>{completion_bar(sub.get("completion_percent"))}<div class="muted">{percent(sub.get("sales_to_date"), sub.get("current_budget")):.1f}% of NTE recorded</div>{labor_text}</td>
@@ -693,9 +693,9 @@ def nte_weekly_report_html(project_id):
                   {completion_bar(bucket_completion.get("completion_percent"))}
                   <div class="muted">{html_escape(bucket_completion.get("report_date") or "No date recorded")}</div>
                   <div class="label" style="margin-top:10px">Estimated Final Sales</div>
-                  <div class="value {'' if money(bucket.get("estimated_cost_at_completion")) <= money(bucket.get("current_budget")) else 'bad'}">{dollars(bucket.get("estimated_cost_at_completion")) if money(bucket_completion.get("completion_percent")) > 0 else "Needs field %"}</div>
+                  <div class="value {'' if money(bucket.get("estimated_cost_at_completion")) <= money(bucket.get("current_budget")) else 'bad'}">{dollars(bucket.get("estimated_cost_at_completion"))}</div>
                   <div class="muted">{html_escape(bucket.get("estimated_completion_status") or "")}</div>
-                  <div class="muted">{'Budget override above recorded sales' if bucket_completion.get('use_full_budget') else 'Estimated remaining sales'}: {dollars(bucket.get("estimated_cost_to_complete")) if money(bucket_completion.get("completion_percent")) > 0 else "-"}</div>
+                  <div class="muted">{'Budget override above recorded sales' if bucket_completion.get('use_full_budget') else 'Estimated remaining sales'}: {dollars(bucket.get("estimated_cost_to_complete"))}</div>
                 </div>
               </div>
               {f'<p><strong>Field completion note:</strong> {html_escape(bucket_completion.get("notes"))}</p>' if bucket_completion.get("notes") else ''}
@@ -923,7 +923,7 @@ def nte_weekly_report_html(project_id):
         <div class="kpi"><div class="label">Avg Field Completion</div><div class="value">{avg_completion:.1f}%</div><div class="muted">Average of main buckets</div></div>
         <div class="kpi"><div class="label">Labor Hours</div><div class="value">{total_labor_used:,.2f} / {total_labor_budget:,.2f}</div><div class="muted">{total_unproductive:,.2f} unproductive hrs flagged</div></div>
       </div>
-      <p>Final sales = recorded sales + current budget x remaining work %. Missing sales values are excluded, not replaced with internal costs. Forecasts are provisional where sales values are missing. Existing 100% full-budget overrides remain in effect. Only buckets with field completion entered are projected.</p>{''.join(bucket_sections) or '<p>No T&M NTE buckets are set up for this project yet.</p>'}
+      <p>Final sales = recorded sales + current budget x remaining work %. Missing sales values are excluded, not replaced with internal costs. Forecasts are provisional where sales values are missing. Existing 100% full-budget overrides remain in effect. Buckets at 0% or without completion entered assume their full current budget; recorded sales are not added again to that assumption.</p>{''.join(bucket_sections) or '<p>No T&M NTE buckets are set up for this project yet.</p>'}
       {panels_section}
       {additions_section}
       {reallocations_section}
@@ -1026,7 +1026,7 @@ def nte_weekly_report_pdf_bytes(project_id):
     total_budget = sum(money(b.get("current_budget")) for b in buckets)
     total_used = sum(nte_reported_budget_used(b) for b in buckets)
     total_remaining = total_budget - total_used
-    projected_buckets = [b for b in buckets if money((b.get("completion") or {}).get("completion_percent")) > 0]
+    projected_buckets = list(buckets)
     total_estimated_at_completion = sum(money(b.get("estimated_cost_at_completion")) for b in projected_buckets)
     total_estimated_variance = sum(money(b.get("current_budget")) for b in projected_buckets) - total_estimated_at_completion if projected_buckets else 0
     total_labor_budget = sum(money(b.get("labor_hours_budget")) for b in buckets)
@@ -1093,7 +1093,7 @@ def nte_weekly_report_pdf_bytes(project_id):
         ("TOPPADDING", (0, 0), (-1, -1), 6),
     ]))
     story.append(summary_table)
-    story.append(Paragraph('Final sales = recorded sales + current budget x remaining work %. Missing sales values are excluded, not replaced with internal costs. Forecasts are provisional where sales values are missing. Existing 100% full-budget overrides remain in effect. Only buckets with field completion entered are projected.', styles["Muted"]))
+    story.append(Paragraph('Final sales = recorded sales + current budget x remaining work %. Missing sales values are excluded, not replaced with internal costs. Forecasts are provisional where sales values are missing. Existing 100% full-budget overrides remain in effect. Buckets at 0% or without completion entered assume their full current budget; recorded sales are not added again to that assumption.', styles["Muted"]))
     story.append(Spacer(1, 0.18 * inch))
 
     if not buckets:
@@ -1105,11 +1105,8 @@ def nte_weekly_report_pdf_bytes(project_id):
             story.append(Paragraph(html_escape(bucket.get("description")), styles["Muted"]))
         story.append(Paragraph(f"Used / Budget: <b>{dollars(bucket.get('sales_to_date'))} / {dollars(bucket.get('current_budget'))}</b> ({pct_text(bucket.get('sales_to_date'), bucket.get('current_budget'))})", styles["Small"]))
         story.append(Paragraph(f"Field Completion: <b>{money(bucket_completion.get('completion_percent')):.1f}%</b> {html_escape(bucket_completion.get('report_date') or '')}", styles["Small"]))
-        if money(bucket_completion.get("completion_percent")) > 0:
-            remaining_label = 'budget override above recorded sales' if bucket_completion.get('use_full_budget') else 'estimated remaining sales'
-            story.append(Paragraph(f"Estimated Final Sales: <b>{dollars(bucket.get('estimated_cost_at_completion'))}</b> ({html_escape(bucket.get('estimated_completion_status') or '')}; {remaining_label} {dollars(bucket.get('estimated_cost_to_complete'))})", styles["Small"]))
-        else:
-            story.append(Paragraph("Estimated Final Sales: <b>Needs field completion percent</b>", styles["Small"]))
+        remaining_label = 'budget override above recorded sales' if bucket_completion.get('use_full_budget') else 'estimated remaining sales'
+        story.append(Paragraph(f"Estimated Final Sales: <b>{dollars(bucket.get('estimated_cost_at_completion'))}</b> ({html_escape(bucket.get('estimated_completion_status') or '')}; {remaining_label} {dollars(bucket.get('estimated_cost_to_complete'))})", styles["Small"]))
         if bucket_completion.get("notes"):
             story.append(Paragraph(f"<b>Field completion note:</b> {html_escape(bucket_completion.get('notes'))}", styles["Small"]))
         rows = [["Sub-Bucket", "Type", "Current Budget", "Sales to Date", "Unused NTE", "Est. Final Sales", "NTE Recorded / Labor Hours"]]
@@ -1119,7 +1116,7 @@ def nte_weekly_report_pdf_bytes(project_id):
                 labor = f"<br/>{money(sub.get('labor_hours_used')):,.2f} / {money(sub.get('labor_hours_budget')):,.2f} labor hrs"
                 if money(sub.get("unproductive_labor_hours")):
                     labor += f"<br/>{money(sub.get('unproductive_labor_hours')):,.2f} unproductive hrs"
-            sub_estimate = dollars(sub.get("estimated_cost_at_completion")) if money(bucket_completion.get("completion_percent")) > 0 else "Needs field %"
+            sub_estimate = dollars(sub.get("estimated_cost_at_completion"))
             rows.append([
                 Paragraph(f"{html_escape(sub.get('name'))}<br/><b>{money(sub.get('completion_percent')):.1f}% complete</b>", styles["Small"]),
                 Paragraph(html_escape(sub.get("cost_type")), styles["Small"]),
@@ -7546,14 +7543,15 @@ def nte_completion_estimate(sales_to_date, current_budget, completion_percent, u
     completion_percent = min(100, max(0, completion_percent))
     override = bool(use_full_budget) and completion_percent == 100
     remaining_sales = current_budget * (1 - completion_percent / 100)
-    estimate = current_budget if override else sales_to_date + remaining_sales
+    budget_assumption = completion_percent == 0
+    estimate = current_budget if override or budget_assumption else sales_to_date + remaining_sales
     return {
         "estimated_final_sales": estimate,
-        "estimated_remaining_sales": max(0, estimate - sales_to_date) if override else remaining_sales,
+        "estimated_remaining_sales": max(0, estimate - sales_to_date) if override or budget_assumption else remaining_sales,
         "estimated_cost_at_completion": estimate,
-        "estimated_cost_to_complete": max(0, estimate - sales_to_date) if override else remaining_sales,
+        "estimated_cost_to_complete": max(0, estimate - sales_to_date) if override or budget_assumption else remaining_sales,
         "estimated_completion_variance": current_budget - estimate,
-        "estimated_completion_status": "Full budget override" if override else (
+        "estimated_completion_status": "Full budget assumed (0% or not entered)" if budget_assumption else "Full budget override" if override else (
             "Projected under budget" if current_budget >= estimate else "Projected over budget"),
     }
 
@@ -7803,8 +7801,6 @@ def nte_summary(project_id, subproject_id=None, change_order_id=None, seed_defau
         bucket["reported_budget_used"] = nte_reported_budget_used(bucket)
         bucket["reported_budget_remaining"] = current_budget - bucket["reported_budget_used"]
         bucket.update(nte_completion_estimate(actual_cost, current_budget, completion_percent, use_full_budget))
-        if not bucket["completion"].get("id") and completion_percent <= 0:
-            bucket["estimated_completion_status"] = "Needs field completion"
         if bucket["missing_sales_count"] and not (use_full_budget and completion_percent == 100):
             bucket["estimated_completion_status"] = f"Provisional: {bucket['missing_sales_count']} lines missing sales value"
         for sub in bucket.get("subbuckets", []):
@@ -7813,8 +7809,6 @@ def nte_summary(project_id, subproject_id=None, change_order_id=None, seed_defau
             sub["completion_percent"] = completion_percent
             sub["use_full_budget"] = use_full_budget
             sub.update(nte_completion_estimate(sub_actual, sub_budget, completion_percent, use_full_budget))
-            if not bucket["completion"].get("id") and completion_percent <= 0:
-                sub["estimated_completion_status"] = "Needs field completion"
             if sub["missing_sales_count"] and not (use_full_budget and completion_percent == 100):
                 sub["estimated_completion_status"] = f"Provisional: {sub['missing_sales_count']} lines missing sales value"
     for panel in panel_deliverables:
@@ -13910,7 +13904,7 @@ HTML = r"""
       const used = buckets.reduce((sum, b) => sum + Number(b.reported_budget_used ?? b.sales_to_date ?? 0), 0);
       const remaining = current - used;
       const unproductiveHours = buckets.reduce((sum, b) => sum + Number(b.unproductive_labor_hours || 0), 0);
-      const projectedBuckets = buckets.filter(b => Number(b.completion?.completion_percent || 0) > 0);
+      const projectedBuckets = buckets;
       const estimatedAtCompletion = projectedBuckets.reduce((sum, b) => sum + Number(b.estimated_cost_at_completion || 0), 0);
       const estimatedVariance = projectedBuckets.reduce((sum,b) => sum + Number(b.current_budget || 0),0) - estimatedAtCompletion;
       const missingSales = buckets.reduce((sum,b) => sum + Number(b.missing_sales_count || 0),0);
@@ -13961,9 +13955,7 @@ HTML = r"""
             <td>${money(bucket.sales_to_date)}${bucket.missing_sales_count ? `<div class="warn">${bucket.missing_sales_count} lines missing sales</div>` : ""}</td>
             <td class="${Number(bucket.remaining || 0) < 0 ? 'bad' : ''}">${money(bucket.remaining)}</td>
             <td>
-              ${Number(bucket.completion?.completion_percent || 0) > 0
-                ? `<strong class="${Number(bucket.estimated_completion_variance || 0) < 0 ? 'bad' : 'good'}">${money(bucket.estimated_cost_at_completion)}</strong><div class="muted">${htmlEscape(bucket.estimated_completion_status || '')}</div><div class="muted">${bucket.completion?.use_full_budget ? 'Budget override above recorded sales' : 'Remaining sales'} ${money(bucket.estimated_cost_to_complete)}</div>`
-                : '<span class="muted">Needs field %</span>'}
+              ${`<strong class="${Number(bucket.estimated_completion_variance || 0) < 0 ? 'bad' : 'good'}">${money(bucket.estimated_cost_at_completion)}</strong><div class="muted">${htmlEscape(bucket.estimated_completion_status || '')}</div><div class="muted">${bucket.completion?.use_full_budget ? 'Budget override above recorded sales' : 'Remaining sales'} ${money(bucket.estimated_cost_to_complete)}</div>`}
             </td>
             <td>${Number(bucket.labor_hours_budget || 0) ? `${Number(bucket.labor_hours_used || 0).toFixed(2)} / ${Number(bucket.labor_hours_budget || 0).toFixed(2)} hrs` : '<span class="muted">-</span>'}</td>
             <td>${Number(bucket.unproductive_labor_hours || 0) ? `${Number(bucket.unproductive_labor_hours || 0).toFixed(2)} hrs` : '<span class="muted">-</span>'}</td>
@@ -13992,9 +13984,7 @@ HTML = r"""
               <td>${money(sub.sales_to_date)}${sub.missing_sales_count ? `<div class="warn">${sub.missing_sales_count} lines missing sales</div>` : ""}</td>
               <td class="${Number(sub.remaining || 0) < 0 ? 'bad' : ''}">${money(sub.remaining)}</td>
               <td>
-                ${Number(bucket.completion?.completion_percent || 0) > 0
-                  ? `<strong class="${Number(sub.estimated_completion_variance || 0) < 0 ? 'bad' : 'good'}">${money(sub.estimated_cost_at_completion)}</strong><div class="muted">${htmlEscape(sub.estimated_completion_status || '')}</div><div class="muted">${sub.use_full_budget ? 'Budget override above recorded sales' : 'Remaining sales'} ${money(sub.estimated_cost_to_complete)}</div>`
-                  : '<span class="muted">Needs field %</span>'}
+                ${`<strong class="${Number(sub.estimated_completion_variance || 0) < 0 ? 'bad' : 'good'}">${money(sub.estimated_cost_at_completion)}</strong><div class="muted">${htmlEscape(sub.estimated_completion_status || '')}</div><div class="muted">${sub.use_full_budget ? 'Budget override above recorded sales' : 'Remaining sales'} ${money(sub.estimated_cost_to_complete)}</div>`}
               </td>
               <td>${sub.cost_type === 'Labor' ? `<input data-nte-sub="${sub.id}" data-field="labor_hours_budget" type="number" step="0.01" value="${Number(sub.labor_hours_budget || 0).toFixed(2)}"><div class="muted">${Number(sub.labor_hours_used || 0).toFixed(2)} used / ${Number(sub.labor_hours_remaining || 0).toFixed(2)} remaining</div>` : '<span class="muted">-</span>'}</td>
               <td>${sub.cost_type === 'Labor' && Number(sub.unproductive_labor_hours || 0) ? `${Number(sub.unproductive_labor_hours || 0).toFixed(2)} hrs` : '<span class="muted">-</span>'}</td>

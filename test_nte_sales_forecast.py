@@ -20,6 +20,13 @@ class SalesForecastTests(unittest.TestCase):
     def test_zero_completion_all_budget_remains(self):
         self.assertEqual(app.nte_completion_estimate(0,1000,0)['estimated_final_sales'],1000)
 
+    def test_zero_completion_uses_full_budget_without_adding_recorded_sales_twice(self):
+        r=app.nte_completion_estimate(200,1000,0)
+        self.assertEqual(r['estimated_final_sales'],1000)
+        self.assertEqual(r['estimated_remaining_sales'],800)
+        self.assertEqual(r['estimated_completion_variance'],0)
+        self.assertIn('Full budget assumed',r['estimated_completion_status'])
+
     def test_finished_work_forecast_equals_sales(self):
         self.assertEqual(app.nte_completion_estimate(200,1000,100)['estimated_final_sales'],200)
 
@@ -65,6 +72,17 @@ class SalesForecastTests(unittest.TestCase):
                 metric=app.nte_snapshot_rows({'buckets':[bucket]})[0]
                 self.assertEqual(metric['metric_key'],'estimated_final_sales_v2_total')
                 self.assertEqual(metric['value'],505)
+                with closing(app.db()) as con, con:
+                    con.execute("INSERT INTO nte_buckets(id,project_id,name,created_at) VALUES (704,901,'Unset completion','2026-10-29'),(706,901,'Zero completion','2026-10-29')")
+                    con.execute("INSERT INTO nte_subbuckets(id,bucket_id,name,cost_type,original_budget,created_at) VALUES (705,704,'Labor','Labor',2000,'2026-10-29'),(707,706,'Material','Material',3000,'2026-10-29')")
+                    con.execute("INSERT INTO nte_completion_updates(project_id,bucket_id,completion_percent,report_date,created_at) VALUES (901,706,0,'2026-10-29','2026-10-29')")
+                summary=app.nte_summary(901,all_targets=True)
+                for b in summary['buckets']:
+                    if b['id'] in (704,706):
+                        self.assertEqual(b['estimated_final_sales'],b['current_budget'])
+                        self.assertIn('Full budget assumed',b['estimated_completion_status'])
+                        self.assertEqual(sum(s['estimated_final_sales'] for s in b['subbuckets']),b['estimated_final_sales'])
+                self.assertEqual(app.nte_snapshot_rows(summary)[0]['value'],5505)
                 gc.collect()
 
 if __name__=='__main__': unittest.main()
