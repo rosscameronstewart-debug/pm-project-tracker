@@ -1,0 +1,25 @@
+Invoice
+Date Invoice #
+10/28/2026 INV569680
+Eagle Automation
+P.O. # Terms Due Date Sales Rep Customer Ship To
+PO HIB-26-0451 Net 30 11/27/2026 Yeates, Scott C
+Qty. Item Description Print Acct/Location Unit Price Amount
+1 Z9-P Z9-P Freewave 900 MHz Radio 1,003.85 1,003.85
+Unenclosed
+Product SMA
+SERIAL#:
+402-66-6987
+1 VALU890-12-N4 Antenna, WaveLink, 902-928 MHz, 235.35 235.35
+12dbi gain, Yagi Antenna
+1 LMR-195-NM-SMAM-36 L195 Cable N(M) x SMA(M) 3ft. 55.97 55.97
+Jumper..P/N: LMR-195-NM-SMAM-3FT
+1 LMR-400-NM-NM-180 Cable, Coax, 15', LMR400 Ultra Flex, 51.52 51.52
+Nmale x Nmale
+Thank you for your business.
+Subtotal 1,346.69
+Shipping Cost (Will Call/Pick-Up) 0.00
+Tax (Sales Tax 8.25%) 111.10
+Total $1,457.79
+Return Policy:
+You have 15 calendar days to return an item.

@@ -6524,6 +6524,57 @@ def parse_amazon_order_invoice(text):
             "order_number": order_number, "total_due": total_due, "item_lines": item_lines}
 
 
+def parse_eagle_automation_invoice(text):
+    """Vanzandt / Eagle invoices: printed item rows plus separate charges."""
+    header = re.search(r"Date\s+Invoice\s*#\s*\n(\d{1,2}/\d{1,2}/\d{2,4})\s+(INV[\w-]+)", text, re.I)
+    if not header:
+        raise RuntimeError("Eagle invoice date or invoice number could not be verified.")
+    order = re.search(r"P\.O\.\s*#\s+Terms[^\n]*\n(?:PO\s+)?([\w-]+)", text, re.I)
+    amount_pattern = r"(-?[\d,]+\.\d{2})"
+    subtotal = re.search(r"^Subtotal\s+\$?" + amount_pattern + r"\s*$", text, re.M | re.I)
+    total = re.search(r"^Total\s+\$?" + amount_pattern + r"\s*$", text, re.M | re.I)
+    if not subtotal or not total:
+        raise RuntimeError("Eagle invoice subtotal or total could not be verified.")
+    item_pattern = re.compile(r"^(-?\d+(?:\.\d+)?)\s+(\S+)\s+(.+?)\s+" + amount_pattern + r"\s+" + amount_pattern + r"\s*$")
+    items = []
+    in_items = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if re.match(r"Qty\.\s+Item\s+Description.*Unit Price\s+Amount", line, re.I):
+            in_items = True
+            continue
+        if not in_items:
+            continue
+        if re.match(r"Thank you\b|Subtotal\b", line, re.I):
+            break
+        match = item_pattern.match(line)
+        if match:
+            qty, code, description, price, amount = match.groups()
+            qty, price, amount = map(parse_money_text, (qty, price, amount))
+            if abs(round(qty * price, 2) - amount) > .02:
+                raise RuntimeError(f"Eagle item {code} quantity and price do not reconcile.")
+            items.append(dict(product_code=code, description=description, qty=qty,
+                              unit_price=price, amount=amount))
+        elif line and items:
+            items[-1]['description'] += ' ' + line
+    if not items or abs(sum(item['amount'] for item in items) - parse_money_text(subtotal.group(1))) > .02:
+        raise RuntimeError("Eagle extracted material lines do not reconcile to the printed subtotal.")
+    for code, label, pattern in (
+        ('Shipping', 'Shipping cost', r"^Shipping Cost[^\n]*?\s+" + amount_pattern + r"\s*$"),
+        ('Sales Tax', 'Sales tax', r"^Tax[^\n]*?\s+" + amount_pattern + r"\s*$"),
+    ):
+        charge = re.search(pattern, text, re.M | re.I)
+        amount = parse_money_text(charge.group(1)) if charge else 0
+        if amount:
+            items.append(dict(product_code=code, description=label, qty=1, unit_price=amount, amount=amount))
+    total_due = parse_money_text(total.group(1))
+    if abs(sum(item['amount'] for item in items) - total_due) > .02:
+        raise RuntimeError("Eagle material, shipping and tax do not reconcile to the invoice total.")
+    return dict(vendor='Vanzandt Controls / Eagle Automation', invoice_number=header.group(2),
+                invoice_date=date_text(header.group(1)), order_number=order.group(1) if order else '',
+                total_due=total_due, item_lines=items)
+
+
 def import_vendor_invoice_pdf(path, project_id, preview_only=False, preview_details=False):
     if preview_details:
         preview_only = True
@@ -6536,7 +6587,15 @@ def import_vendor_invoice_pdf(path, project_id, preview_only=False, preview_deta
     source_file = Path(path).name
     lower = text.lower()
     compact_lower = re.sub(r"\s+", "", lower)
-    if re.search(r'\br\.?\s*j\.?\s*mann\s*(?:&|and)\s*associates\b', lower):
+    if 'eagle automation' in lower and re.search(r'Qty\.\s+Item\s+Description', text, re.I):
+        eagle = parse_eagle_automation_invoice(text)
+        vendor = eagle['vendor']
+        invoice_number = eagle['invoice_number']
+        invoice_date = eagle['invoice_date']
+        order_number = eagle['order_number']
+        total_due = eagle['total_due']
+        item_lines = eagle['item_lines']
+    elif re.search(r'\br\.?\s*j\.?\s*mann\s*(?:&|and)\s*associates\b', lower):
         rj_mann = parse_rj_mann_invoice(text)
         vendor = rj_mann['vendor']
         invoice_number = rj_mann['invoice_number']
