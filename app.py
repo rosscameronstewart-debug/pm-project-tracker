@@ -6903,6 +6903,11 @@ def import_vendor_invoice_pdf(path, project_id, preview_only=False, preview_deta
             text,
             flags=re.IGNORECASE | re.DOTALL,
         )
+        # This export prints account, job and customer order on one row.
+        # The last value is the customer order, not the account number.
+        account_order_row = first_regex([r"ACCOUNT\s*#/NAME\s+JOB\s+NAME\s+CUSTOMER\s+ORDER\s+NO\.\s*\n([^\n]+)"], text, flags=re.IGNORECASE)
+        if account_order_row:
+            order_number = account_order_row.split()[-1]
         total_due = parse_money_text(first_regex([r"TOTAL\s*DUE\s*[-=]*>?\s*([0-9,]+\.[0-9]{2})", r"TOTALDUE\s*\n?\s*([0-9,]+\.[0-9]{2})"], text, flags=re.IGNORECASE))
         if not total_due:
             money_values = [parse_money_text(value) for value in re.findall(r"\b[0-9,]+\.[0-9]{2}\b", text)]
@@ -6910,13 +6915,13 @@ def import_vendor_invoice_pdf(path, project_id, preview_only=False, preview_deta
                 total_due = money_values[-1]
         item_lines = []
         current = None
-        stop_re = re.compile(r"^(TITLE TO|AT POINT|MERCHANDISE|A SERVICE|THIS SALE|CODE:|B -|C -|SALES TAX|SHIPPING CHARGE|TOTAL DUE)\b", re.IGNORECASE)
+        stop_re = re.compile(r"(?:^(TITLE TO|AT POINT|MERCHANDISE|A SERVICE|THIS SALE|CODE:|B -|C -|SALES TAX|SHIPPING CHARGE|TOTAL DUE)\b|\bMERCHANDISE\s+[0-9,]+\.[0-9]{2}\s*$)", re.IGNORECASE)
         for raw_line in text.splitlines():
             line = raw_line.strip()
             if not line:
                 continue
             match = re.match(
-                r"^T\s+([0-9.]+)\s+(.+?)\s+([0-9.]+)\s+([0-9,]+\.[0-9]{2})\s+([A-Za-z])\s+([0-9,]+\.[0-9]{2})$",
+                r"^T\s+([0-9.]+)\s+(.+?)\s+([0-9.]+)\s+([0-9,]+\.[0-9]{2})\s+([A-Za-z])\s+([0-9,]+\.[0-9]{2})(?:\s+[0-9]+(?:\.[0-9]+)?)?$",
                 line,
             )
             if match:
@@ -6937,7 +6942,7 @@ def import_vendor_invoice_pdf(path, project_id, preview_only=False, preview_deta
                 }
                 continue
             match = re.match(
-                r"^T?\s*([0-9.]+)\s+(.+?)\s+([0-9.]+)\s+([0-9,]+\.[0-9]{2})\s+([A-Za-z])\s+([0-9,]+\.[0-9]{2})$",
+                r"^T?\s*([0-9.]+)\s+(.+?)\s+([0-9.]+)\s+([0-9,]+\.[0-9]{2})\s+([A-Za-z])\s+([0-9,]+\.[0-9]{2})(?:\s+[0-9]+(?:\.[0-9]+)?)?$",
                 line,
             )
             if match:
@@ -6963,6 +6968,8 @@ def import_vendor_invoice_pdf(path, project_id, preview_only=False, preview_deta
                 current = None
                 break
             if current and not stop_re.search(line) and not re.search(r"^(INVOICE|QUANTITY|PRODUCT CODE|ORDERED|SOLD TO|SHIP TO|ACCOUNT NO\.|SALES PERSON)\b", line, flags=re.IGNORECASE):
+                if re.fullmatch(r"(?=.*[0-9])[A-Z0-9][A-Z0-9/.-]{2,}", line):
+                    current["product_code"] = current["product_code"].split()[0] + " " + line
                 current["description"] += " " + line
         if current:
             item_lines.append(current)
