@@ -1,0 +1,18 @@
+INVOICE
+Invoice: 933407913 Date: 10/28/2026
+P.O.#: GOGO 260506
+Border States - WIL
+Cust Item Item Material Order Qty Ship Qty Back Ordered Price Per UoM Total Value
+MFG - Description
+______________________________________________________________________
+000030 126296 1 EA 1 66.74 /1 EA 66.74
+CRH - RE108 4X3 RED BUSH IRN CRH
+506 STOCK
+Cust Material #: RE BUSHING 4X3
+______________________________________________________________________
+Cash discount of 0.67 by 12/10/2026 Shipping and Handling $ 0.00
+Total due by 12/25/2026 Total $ 66.74
+State Tax $ 0.000 % 0.00
+Tax Subtotal $ 0.00
+Net Invoice Amount $ 66.74
+ORIGINAL

@@ -6524,6 +6524,53 @@ def parse_amazon_order_invoice(text):
             "order_number": order_number, "total_due": total_due, "item_lines": item_lines}
 
 
+def parse_powermation_invoice(text, tables):
+    """Use named table cells for dates and charges, not flattened positions."""
+    invoice_number = first_regex([r"filename([0-9]+)endfilename"], text)
+    order_number, invoice_dates, summaries = '', set(), []
+    for table in tables:
+        for index, row in enumerate(table[:-1]):
+            labels = [re.sub(r"\s+", " ", str(cell or '')).strip().upper() for cell in row]
+            values = table[index + 1]
+            if 'CUSTOMER PO NO.' in labels and 'INVOICED' in labels:
+                order_number = str(values[labels.index('CUSTOMER PO NO.')] or '').strip()
+                cell = str(values[labels.index('INVOICED')] or '')
+                date = first_regex([r"([0-9]{1,2}/[0-9]{1,2}/[0-9]{4})"], cell)
+                if date:
+                    invoice_dates.add(date_text(date))
+            if 'NET SALES AMOUNT' in labels and 'TOTAL' in labels:
+                summaries.append({label: parse_money_text(values[i]) for i, label in enumerate(labels)
+                                  if label in ('NET SALES AMOUNT', 'FREIGHT', 'SALES TAX', 'PROCESSING FEE', 'TOTAL')})
+    if not invoice_number or len(invoice_dates) != 1 or len(summaries) != 1:
+        raise RuntimeError('Power/mation invoice number, invoiced date or summary could not be verified.')
+    summary = summaries[0]
+    items, current = [], None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith('NET SALES AMOUNT'):
+            break
+        row = re.match(r"^([0-9]+)\s+(\S+)\s+(.+?)\s+([0-9,.]+)\s+([0-9,.]+)\s+([0-9,.]+)\s+([0-9,]+\.[0-9]{2,4})\s+([0-9,]+\.[0-9]{2})$", line)
+        if row:
+            _, code, vendor, ordered, shipped, backordered, price, extension = row.groups()
+            qty, price, extension = map(parse_money_text, (shipped, price, extension))
+            if abs(round(qty * price, 2) - extension) > .02:
+                raise RuntimeError('Power/mation item quantity and price do not reconcile.')
+            current = dict(product_code=code, description=code+' '+vendor, qty=qty, unit_price=price, amount=extension)
+            items.append(current)
+        elif current and line:
+            current['description'] += ' ' + line
+    if not items or abs(sum(r['amount'] for r in items)-summary['NET SALES AMOUNT']) > .02:
+        raise RuntimeError('Power/mation material lines do not reconcile to net sales.')
+    for label, code in (('FREIGHT','Freight'), ('SALES TAX','Sales Tax'), ('PROCESSING FEE','Logistic Service')):
+        charge = summary.get(label, 0)
+        if charge:
+            items.append(dict(product_code=code, description=label.title(), qty=1, unit_price=charge, amount=charge))
+    if abs(sum(r['amount'] for r in items)-summary['TOTAL']) > .02:
+        raise RuntimeError('Power/mation items and charges do not reconcile to the invoice total.')
+    return dict(vendor='Power/mation', invoice_number=invoice_number, invoice_date=next(iter(invoice_dates)),
+                order_number=order_number, total_due=summary['TOTAL'], item_lines=items)
+
+
 def parse_automation_x_invoice(text):
     """Read invoice rows, never the appended sales order or packing slips."""
     text = re.split(r"^(?:Sales Order|Packing Slip)\s*$", text, maxsplit=1, flags=re.M)[0]
@@ -6648,7 +6695,17 @@ def import_vendor_invoice_pdf(path, project_id, preview_only=False, preview_deta
     source_file = Path(path).name
     lower = text.lower()
     compact_lower = re.sub(r"\s+", "", lower)
-    if 'automation-x corporation' in lower and re.search(r'^Invoice\s*\nINV', text, re.M | re.I):
+    if 'powermation.com' in lower or 'power/mation division' in lower:
+        with pdfplumber.open(path) as pdf:
+            tables = [table for page in pdf.pages for table in page.extract_tables()]
+        pm = parse_powermation_invoice(text, tables)
+        vendor = pm['vendor']
+        invoice_number = pm['invoice_number']
+        invoice_date = pm['invoice_date']
+        order_number = pm['order_number']
+        total_due = pm['total_due']
+        item_lines = pm['item_lines']
+    elif 'automation-x corporation' in lower and re.search(r'^Invoice\s*\nINV', text, re.M | re.I):
         # A single upload may bundle orders, packing slips and correspondence.
         # Only pages headed Invoice are purchase evidence for this parser.
         with pdfplumber.open(path) as pdf:
@@ -7017,6 +7074,22 @@ def import_vendor_invoice_pdf(path, project_id, preview_only=False, preview_deta
             line = raw_line.strip()
             if not line:
                 continue
+            # Compact exports put shipped quantity, price basis and extension
+            # on the item row; older exports put those on a Batch Total row.
+            compact = re.match(r"^([0-9]{6})\s+([A-Za-z0-9-]+)\s+([0-9,]+(?:\.[0-9]+)?)\s+([A-Za-z]+)\s+([0-9,]+(?:\.[0-9]+)?)\s+([0-9,]+\.[0-9]{2}-?)\s*/\s*([0-9,]+(?:\.[0-9]+)?)\s+([A-Za-z]+)\s+([0-9,]+\.[0-9]{2}-?)$", line)
+            if compact:
+                if current and parse_money_text(current.get('amount')):
+                    item_lines.append(current)
+                _, material, ordered, unit, shipped, price, per, price_unit, extension = compact.groups()
+                qty, amount = parse_money_text(shipped), parse_money_text(extension)
+                current = dict(product_code=material, description=material, ordered_qty=ordered,
+                               ordered_unit=unit, shipped_unit=unit, qty=qty,
+                               unit_price=amount/qty if qty else 0, amount=amount)
+                continue
+            if current and parse_money_text(current.get('amount')) and (re.fullmatch(r"_+", line) or re.match(r"^(Cash discount|Shipping and Handling|Tax Subtotal|Net Invoice Amount)\b", line, re.I)):
+                item_lines.append(current)
+                current = None
+                continue
             start = re.match(r"^([0-9]{6})\s+([A-Za-z0-9\-]+)\s+([0-9,]+(?:\.[0-9]+)?)$", line)
             if start:
                 if current:
@@ -7055,6 +7128,13 @@ def import_vendor_invoice_pdf(path, project_id, preview_only=False, preview_deta
                 current["description"] += " " + line
         if current and parse_money_text(current.get("amount")):
             item_lines.append(current)
+        for code, label, pattern in (
+            ('Shipping', 'Shipping and handling', r"Shipping and Handling\s+\$\s*([0-9,]+\.[0-9]{2}-?)"),
+            ('Sales Tax', 'Sales tax', r"Tax Subtotal\s+\$\s*([0-9,]+\.[0-9]{2}-?)"),
+        ):
+            charge = parse_money_text(first_regex([pattern], text, flags=re.I))
+            if charge:
+                item_lines.append(dict(product_code=code,description=label,qty=1,unit_price=charge,amount=charge))
     elif "crescent electric" in lower or "crescentelectric.com" in lower:
         vendor = "Crescent Electric"
         invoice_number = first_regex(
